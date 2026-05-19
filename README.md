@@ -1,4 +1,4 @@
-# Eden 🌴
+# Eden
 
 Eden is a standalone groovebox application built around the PreSonus Atom SQ MIDI controller. It turns the controller into a self-contained instrument: step sequencer, drum sampler, synth voices, and FX — all driven from the pads and encoders, no DAW required. The name comes from Atom + Eve, and the aesthetic is straight jungle: palm greens, snakeskin patterns, sunset oranges, deep-canopy purples.
 
@@ -13,57 +13,49 @@ The Atom SQ operates in a native mode that exposes full RGB pad control and an O
 ## Hardware Requirements
 
 - PreSonus Atom SQ (USB, connected before launch)
-- Mac or Linux
+- macOS or Linux
 - Python 3.11+
-
----
-
-## Dependencies
-
-| Package | Purpose |
-|---|---|
-| `mido` | MIDI I/O abstraction |
-| `python-rtmidi` | Low-level MIDI backend for mido |
-| `sounddevice` | Low-latency audio output |
-| `numpy` | Sample buffer manipulation |
-
-Install everything at once:
-
-```
-pip install mido python-rtmidi sounddevice numpy
-```
 
 ---
 
 ## Quick Start
 
-**1. Verify hardware**
-
-Before running anything else, confirm Eden can see your controller:
-
 ```
-python probe.py
+pip install -r requirements.txt
+python eden/app.py
 ```
 
-`probe.py` lists all available MIDI ports. You should see a port with "Atom SQ" in the name. If you don't, check the USB connection and try again.
+The OLED shows **EDEN / BPM 120**. The 16 bottom-row pads are the step sequencer. Press any pad to toggle a step. The playhead advances in real time. Ctrl-C to quit.
 
-**2. Run Eden** _(once v0 is complete)_
+Optional flags:
 
 ```
-python -m eden
+python eden/app.py --bpm 140 --samples /path/to/samples
 ```
 
 ---
 
-## v0 Status
+## Probing / Hardware Tests
 
-The five goals that prove the core tech stack works. None of these require a DAW.
+`probe.py` is a low-level test harness for the Atom SQ protocol. Useful for diagnostics and verifying hardware behaviour without running the full app.
 
-- [ ] Enter native mode on the Atom SQ
-- [ ] Light a pad in an arbitrary RGB color
-- [ ] Write static text to the OLED screen
-- [ ] Play a drum sample on pad press with low latency
-- [ ] Run a 16-step sequencer with visible playhead on pads
+```
+python probe.py list            # show MIDI ports
+python probe.py sniff           # log all incoming MIDI
+python probe.py main_daw_test   # confirm OLED + pad RGB working
+```
+
+---
+
+## v0 Status — Complete
+
+All five goals that prove the core tech stack works, no DAW required.
+
+- [x] Enter native mode on the Atom SQ
+- [x] Light pads in arbitrary RGB colors
+- [x] Write text to the OLED display
+- [x] Play a drum sample on pad press with low latency
+- [x] Run a 16-step sequencer with visible playhead on pads
 
 ---
 
