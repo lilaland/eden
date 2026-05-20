@@ -13,6 +13,7 @@ from eden.theme import (
     PAD_ACTIVE, PAD_PLAYHEAD, PAD_INACTIVE, PAD_SELECTED, PAD_OFF,
     ACCENT_GOLD, ACCENT_CORAL, BG_DARK,
     PAD_DRUM, PAD_SYNTH, PAD_SAMPLE, PAD_NEW_SLOT,
+    PAD_PLAYING, PAD_LOOP_SEL, ARM1_COLOR, ARM2_COLOR,
 )
 from controller_map import (
     OLED_MAIN_LINE1, OLED_MAIN_LINE2,
@@ -66,21 +67,26 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
         for track_idx in range(16):
             pad_idx = track_idx
             track = state.tracks[track_idx]
+            is_selected = track_idx == state.selected_track
 
             if track is None:
                 pads[pad_idx] = PAD_NEW_SLOT if is_selected else PAD_INACTIVE
                 continue
 
-            is_soloed   = track_idx in state.soloed_tracks
-            is_armed    = track_idx in state.armed_tracks
-            is_muted    = track_idx in state.muted_tracks
-            is_selected = track_idx == state.selected_track
+            is_soloed = track_idx in state.soloed_tracks
+            is_muted  = track_idx in state.muted_tracks
+            arm_pos   = (
+                state.armed_tracks.index(track_idx)
+                if track_idx in state.armed_tracks else -1
+            )
 
-            # Priority: soloed > armed > muted > selected+type > type
+            # Priority: soloed > arm2 > arm1 > muted > selected+type > type
             if is_soloed:
                 pads[pad_idx] = (100, 100, 100)
-            elif is_armed:
-                pads[pad_idx] = ACCENT_GOLD
+            elif arm_pos == 1:
+                pads[pad_idx] = ARM2_COLOR
+            elif arm_pos == 0:
+                pads[pad_idx] = ARM1_COLOR
             elif is_muted:
                 pads[pad_idx] = _dim(ACCENT_CORAL)
             else:
@@ -107,16 +113,16 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
                     pads[pad_idx] = PAD_NEW_SLOT if loop_idx == state.selected_loop else PAD_INACTIVE
                     continue
 
-                is_playing = (sel_idx, loop_idx) in state.playing_loops
-                if is_playing:
-                    color: tuple[int, int, int] = PAD_PLAYHEAD
+                is_loop_playing = (sel_idx, loop_idx) in state.playing_loops
+                is_loop_selected = loop_idx == state.selected_loop
+
+                if is_loop_selected:
+                    # Selected loop: gold regardless of playing state
+                    pads[pad_idx] = PAD_LOOP_SEL
+                elif is_loop_playing:
+                    pads[pad_idx] = PAD_PLAYING
                 else:
-                    color = track_color
-
-                if loop_idx == state.selected_loop:
-                    color = _brighten(color)
-
-                pads[pad_idx] = color
+                    pads[pad_idx] = track_color
 
     elif state.mode == Mode.INSTRUMENT:
         armed = state.armed_tracks

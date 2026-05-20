@@ -14,7 +14,10 @@ from eden.state import (
     AppState, Mode, InstrumentSubmode, DrumTrack, SynthTrack, Loop,
     default_state, default_loop, default_track_loops,
 )
-from eden.theme import PAD_INACTIVE, PAD_DRUM, PAD_SYNTH, PAD_PLAYHEAD, ACCENT_GOLD
+from eden.theme import (
+    PAD_INACTIVE, PAD_DRUM, PAD_SYNTH, PAD_PLAYHEAD, ACCENT_GOLD,
+    PAD_PLAYING, PAD_LOOP_SEL, ARM1_COLOR, ARM2_COLOR,
+)
 from eden.render import render_pads, render_oled, render_button_leds
 from controller_map import (
     OLED_MAIN_LINE1, OLED_MAIN_LINE2,
@@ -97,11 +100,19 @@ def test_render_pads_session_selected_track_is_brighter():
     assert sum(selected_pad) > sum(nonselected_pad)
 
 
-def test_render_pads_session_armed_track_gets_gold():
-    """Test 5: Armed track gets ACCENT_GOLD color."""
+def test_render_pads_session_arm1_gets_red():
+    """Test 5: ARM1 track gets ARM1_COLOR (red)."""
     s = dataclasses.replace(default_state(), armed_tracks=(1,))
     pads = render_pads(s)
-    assert pads[1] == ACCENT_GOLD
+    assert pads[1] == ARM1_COLOR
+
+
+def test_render_pads_session_arm2_gets_red_orange():
+    """Test 5b: ARM2 track gets ARM2_COLOR (red-orange)."""
+    s = dataclasses.replace(default_state(), armed_tracks=(0, 1))
+    pads = render_pads(s)
+    assert pads[0] == ARM1_COLOR
+    assert pads[1] == ARM2_COLOR
 
 
 def test_render_pads_session_muted_track_gets_dim_color():
@@ -120,8 +131,8 @@ def test_render_pads_session_empty_loop_is_inactive():
     assert pads[17] == PAD_INACTIVE
 
 
-def test_render_pads_session_playing_loop_is_playhead():
-    """Test 8: Playing loop in top row → PAD_PLAYHEAD at pad 17 (loop 1)."""
+def test_render_pads_session_playing_loop_is_playing_color():
+    """Test 8: Non-selected playing loop in top row → PAD_PLAYING at pad 17 (loop 1)."""
     s = default_state()
     t0 = s.tracks[0]
     steps = tuple(i == 0 for i in range(16))
@@ -133,10 +144,29 @@ def test_render_pads_session_playing_loop_is_playhead():
         s,
         tracks=new_tracks,
         playing_loops=frozenset({(0, 1)}),  # loop 1 playing
-        selected_loop=0,                    # loop 0 selected (different → no brightness boost)
+        selected_loop=0,                    # loop 0 selected (different → not gold)
     )
     pads = render_pads(s)
-    assert pads[17] == PAD_PLAYHEAD  # loop 1 → pad 16+1=17
+    assert pads[17] == PAD_PLAYING  # loop 1 → pad 16+1=17
+
+
+def test_render_pads_session_selected_loop_is_gold():
+    """Test 8b: Selected loop in top row → PAD_LOOP_SEL (gold)."""
+    s = default_state()
+    t0 = s.tracks[0]
+    steps = tuple(i == 0 for i in range(16))
+    loop_with_step = Loop(steps=steps)
+    new_loops = t0.loops[:1] + (loop_with_step,) + t0.loops[2:]
+    new_t0 = dataclasses.replace(t0, loops=new_loops)
+    new_tracks = (new_t0,) + s.tracks[1:]
+    s = dataclasses.replace(
+        s,
+        tracks=new_tracks,
+        playing_loops=frozenset({(0, 1)}),
+        selected_loop=1,  # loop 1 is selected AND playing → should be gold
+    )
+    pads = render_pads(s)
+    assert pads[17] == PAD_LOOP_SEL
 
 
 # ── render_pads — INSTRUMENT single-arm ──────────────────────────────────────
