@@ -13,7 +13,6 @@ from eden.theme import (
     PAD_ACTIVE, PAD_PLAYHEAD, PAD_INACTIVE, PAD_SELECTED, PAD_OFF,
     ACCENT_GOLD, ACCENT_CORAL, BG_DARK,
     PAD_DRUM, PAD_SYNTH, PAD_SAMPLE, PAD_NEW_SLOT,
-    PAD_PLAYING, PAD_LOOP_SEL, ARM1_COLOR, ARM2_COLOR,
 )
 from controller_map import (
     OLED_MAIN_LINE1, OLED_MAIN_LINE2,
@@ -67,26 +66,21 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
         for track_idx in range(16):
             pad_idx = track_idx
             track = state.tracks[track_idx]
-            is_selected = track_idx == state.selected_track
 
             if track is None:
                 pads[pad_idx] = PAD_NEW_SLOT if is_selected else PAD_INACTIVE
                 continue
 
-            is_soloed = track_idx in state.soloed_tracks
-            is_muted  = track_idx in state.muted_tracks
-            arm_pos   = (
-                state.armed_tracks.index(track_idx)
-                if track_idx in state.armed_tracks else -1
-            )
+            is_soloed   = track_idx in state.soloed_tracks
+            is_armed    = track_idx in state.armed_tracks
+            is_muted    = track_idx in state.muted_tracks
+            is_selected = track_idx == state.selected_track
 
-            # Priority: soloed > arm2 > arm1 > muted > selected+type > type
+            # Priority: soloed > armed > muted > selected+type > type
             if is_soloed:
                 pads[pad_idx] = (100, 100, 100)
-            elif arm_pos == 1:
-                pads[pad_idx] = ARM2_COLOR
-            elif arm_pos == 0:
-                pads[pad_idx] = ARM1_COLOR
+            elif is_armed:
+                pads[pad_idx] = ACCENT_GOLD
             elif is_muted:
                 pads[pad_idx] = _dim(ACCENT_CORAL)
             else:
@@ -113,16 +107,16 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
                     pads[pad_idx] = PAD_NEW_SLOT if loop_idx == state.selected_loop else PAD_INACTIVE
                     continue
 
-                is_loop_playing = (sel_idx, loop_idx) in state.playing_loops
-                is_loop_selected = loop_idx == state.selected_loop
-
-                if is_loop_selected:
-                    # Selected loop: gold regardless of playing state
-                    pads[pad_idx] = PAD_LOOP_SEL
-                elif is_loop_playing:
-                    pads[pad_idx] = PAD_PLAYING
+                is_playing = (sel_idx, loop_idx) in state.playing_loops
+                if is_playing:
+                    color: tuple[int, int, int] = PAD_PLAYHEAD
                 else:
-                    pads[pad_idx] = track_color
+                    color = track_color
+
+                if loop_idx == state.selected_loop:
+                    color = _brighten(color)
+
+                pads[pad_idx] = color
 
     elif state.mode == Mode.INSTRUMENT:
         armed = state.armed_tracks
@@ -197,48 +191,41 @@ def render_oled(state: AppState) -> dict[int, str]:
 
     if state.mode == Mode.SESSION:
         sel_track = state.tracks[state.selected_track]
+        track_name = sel_track.name if sel_track is not None else "EMPTY"
 
-        if sel_track is None:
-            # Empty slot selected: show instrument type picker
-            _set(OLED_MAIN_LINE1, "NEW INSTRUMENT")
-            _set(OLED_MAIN_LINE2, f"SLOT {state.selected_track + 1}")
-            _set(OLED_BTN1_TITLE, "DRUMS")
-            _set(OLED_BTN2_TITLE, "")
-            _set(OLED_BTN3_TITLE, "")
-            _set(OLED_BTN4_TITLE, "")
-            _set(OLED_BTN5_TITLE, "")
-        else:
-            track_name = sel_track.name
-
+        # Determine loop_count from selected track's selected loop
+        loop_count = 0
+        if sel_track is not None:
             loop = sel_track.loops[state.selected_loop]
             loop_count = loop.loop_count
-            loop_count_str = "inf" if loop_count == 0 else f"{loop_count}x"
 
-            _set(OLED_MAIN_LINE1, track_name)
-            _set(OLED_MAIN_LINE2, f"LOOP {loop_count_str}")
-            _set(OLED_BTN1_TITLE, "MUTE")
-            _set(OLED_BTN2_TITLE, "SOLO")
-            _set(OLED_BTN3_TITLE, f"LOOP x{loop_count_str}")
+        loop_count_str = "inf" if loop_count == 0 else f"{loop_count}x"
 
-            # SK4: ARM1 — shows armed track name + loop, or "ARM1" if not armed
-            if state.armed_tracks:
-                t0 = state.armed_tracks[0]
-                t0_track = state.tracks[t0]
-                t0_name = t0_track.name[:4] if t0_track is not None else f"T{t0}"
-                _set(OLED_BTN4_TITLE, f"{t0_name}:{state.selected_loop}")
-            else:
-                _set(OLED_BTN4_TITLE, "ARM1")
+        _set(OLED_MAIN_LINE1, track_name)
+        _set(OLED_MAIN_LINE2, f"LOOP {loop_count_str}")
+        _set(OLED_BTN1_TITLE, "MUTE")
+        _set(OLED_BTN2_TITLE, "SOLO")
+        _set(OLED_BTN3_TITLE, f"LOOP x{loop_count_str}")
 
-            # SK5: ARM2 — shows arm2 track info, ARM PADS offer, or "ARM2"
-            if state.arm_pads_offer_loop is not None:
-                _set(OLED_BTN5_TITLE, "ARM PADS")
-            elif len(state.armed_tracks) >= 2:
-                t1 = state.armed_tracks[1]
-                t1_track = state.tracks[t1]
-                t1_name = t1_track.name[:4] if t1_track is not None else f"T{t1}"
-                _set(OLED_BTN5_TITLE, f"{t1_name}:{state.selected_loop}")
-            else:
-                _set(OLED_BTN5_TITLE, "ARM2")
+        # SK4: ARM1 — shows armed track name + loop, or "ARM1" if not armed
+        if state.armed_tracks:
+            t0 = state.armed_tracks[0]
+            t0_track = state.tracks[t0]
+            t0_name = t0_track.name[:4] if t0_track is not None else f"T{t0}"
+            _set(OLED_BTN4_TITLE, f"{t0_name}:{state.selected_loop}")
+        else:
+            _set(OLED_BTN4_TITLE, "ARM1")
+
+        # SK5: ARM2 — shows arm2 track info, ARM PADS offer, or "ARM2"
+        if state.arm_pads_offer_loop is not None:
+            _set(OLED_BTN5_TITLE, "ARM PADS")
+        elif len(state.armed_tracks) >= 2:
+            t1 = state.armed_tracks[1]
+            t1_track = state.tracks[t1]
+            t1_name = t1_track.name[:4] if t1_track is not None else f"T{t1}"
+            _set(OLED_BTN5_TITLE, f"{t1_name}:{state.selected_loop}")
+        else:
+            _set(OLED_BTN5_TITLE, "ARM2")
 
     elif state.mode == Mode.INSTRUMENT:
         armed = state.armed_tracks

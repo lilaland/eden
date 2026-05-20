@@ -18,11 +18,3 @@ PAD_DRUM     = (0, 70, 60)    # jungle teal — drum track type color (same as P
 PAD_SYNTH    = (90, 20, 50)   # hibiscus pink — synth track type color
 PAD_SAMPLE   = (120, 30, 20)  # deep coral — sample track type color (same as ACCENT_CORAL)
 PAD_NEW_SLOT = (0, 100, 0)    # bright green — empty slot selected, ready to arm/create
-
-# Session view loop states
-PAD_PLAYING  = (80, 0, 120)   # electric violet — loop currently playing in session
-PAD_LOOP_SEL = (110, 80, 0)   # warm gold — selected loop slot (same as ACCENT_GOLD)
-
-# Arm indicator colors
-ARM1_COLOR   = (120, 0, 0)    # bright red — ARM1 track
-ARM2_COLOR   = (120, 40, 0)   # red-orange — ARM2 track

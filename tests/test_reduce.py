@@ -205,29 +205,14 @@ def test_session_pad_bottom_row_selects_track_15():
     assert result.selected_track == 15
 
 
-def test_session_pad_bottom_row_selects_empty_slot():
-    """Pressing an empty track slot selects it (green highlight); does not auto-create."""
+def test_session_pad_bottom_row_creates_instrument_for_empty_slot():
+    """Pressing an empty track slot creates a new DrumTrack at that slot."""
     state = default_state()
     assert state.tracks[2] is None
     result = reduce(state, PadPressed(pad_index=2, velocity=100))
-    assert result.tracks[2] is None        # no auto-creation
-    assert result.selected_track == 2      # slot is selected
-
-
-def test_session_sk1_creates_drum_for_empty_slot():
-    """SK1 (DRUMS) creates a DrumTrack when the selected track slot is empty."""
-    state = dataclasses.replace(default_state(), selected_track=2)
-    assert state.tracks[2] is None
-    result = reduce(state, SoftkeyPressed(key=0))
+    from eden.state import DrumTrack
     assert isinstance(result.tracks[2], DrumTrack)
-
-
-def test_session_sk1_mute_when_track_exists():
-    """SK1 still mutes the selected track when a track is present."""
-    state = default_state()  # track 0 is DrumTrack
-    assert state.tracks[0] is not None
-    result = reduce(state, SoftkeyPressed(key=0))
-    assert 0 in result.muted_tracks
+    assert result.selected_track == 2
 
 
 def test_session_pad_top_row_adds_to_playing():
@@ -568,34 +553,6 @@ def test_instrument_sk4_back_returns_to_session():
     state = _armed_instrument()
     result = reduce(state, SoftkeyPressed(key=3))
     assert result.mode is Mode.SESSION
-
-
-def test_instrument_sk4_back_starts_nonempty_loop():
-    """SK4 (BACK) auto-adds the armed track's non-empty loop to playing_loops."""
-    state = _step_on(_armed_instrument(armed=(0,)), track_idx=0, loop_idx=1, step=0)
-    # Loop 1 of track 0 now has a step; it should be auto-started on BACK
-    assert (0, 1) not in state.playing_loops
-    result = reduce(state, SoftkeyPressed(key=3))
-    assert result.mode is Mode.SESSION
-    assert (0, 1) in result.playing_loops
-
-
-def test_instrument_sk4_back_does_not_start_empty_loop():
-    """SK4 (BACK) leaves empty loops out of playing_loops."""
-    state = _armed_instrument(armed=(0,))  # loop 1 is empty
-    result = reduce(state, SoftkeyPressed(key=3))
-    assert (0, 1) not in result.playing_loops
-
-
-def test_instrument_sk4_back_dual_arm_starts_both_nonempty():
-    """SK4 (BACK) auto-starts non-empty loops for all armed tracks in dual-arm."""
-    state = _armed_instrument(armed=(0, 1))
-    state = _step_on(state, track_idx=0, loop_idx=1, step=0)
-    state = _step_on(state, track_idx=1, loop_idx=1, step=2)
-    result = reduce(state, SoftkeyPressed(key=3))
-    assert result.mode is Mode.SESSION
-    assert (0, 1) in result.playing_loops
-    assert (1, 1) in result.playing_loops
 
 
 def test_instrument_sk5_clear_without_shift_is_noop():
