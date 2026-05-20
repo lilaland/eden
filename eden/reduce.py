@@ -327,16 +327,26 @@ def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
     loop_idx = state.selected_loop
 
     if len(state.armed_tracks) == 1:
-        # Single-arm: 32-step grid.
-        # Bottom row (0-15) = steps 0-15; top row (16-31) = steps 16-31.
         step = pad
-        return _toggle_step(state, state.armed_tracks[0], loop_idx, step)
+        new_state = _toggle_step(state, state.armed_tracks[0], loop_idx, step)
     else:
-        # Dual-arm: each row of 16 pads maps to one armed track.
-        # Bottom row → armed_tracks[0]; top row → armed_tracks[1].
         step = pad % 16
         track_idx = state.armed_tracks[0] if pad < 16 else state.armed_tracks[1]
-        return _toggle_step(state, track_idx, loop_idx, step)
+        new_state = _toggle_step(state, track_idx, loop_idx, step)
+
+    # Auto-start any armed loop that just became non-empty.
+    new_playing = set(new_state.playing_loops)
+    changed = False
+    for track_idx in new_state.armed_tracks:
+        key = (track_idx, loop_idx)
+        if key not in new_playing:
+            track = new_state.tracks[track_idx]
+            if track is not None and not track.loops[loop_idx].is_empty:
+                new_playing.add(key)
+                changed = True
+    if changed:
+        new_state = dataclasses.replace(new_state, playing_loops=frozenset(new_playing))
+    return new_state
 
 
 def _toggle_step(

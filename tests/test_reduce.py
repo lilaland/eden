@@ -555,6 +555,40 @@ def test_instrument_sk4_back_returns_to_session():
     assert result.mode is Mode.SESSION
 
 
+def test_instrument_pad_press_starts_loop_on_first_step():
+    """Toggling the first step on an empty loop immediately adds it to playing_loops."""
+    state = _armed_instrument(armed=(0,))  # loop 1 is empty, not playing
+    assert (0, 1) not in state.playing_loops
+    result = reduce(state, PadPressed(pad_index=0, velocity=100))
+    assert (0, 1) in result.playing_loops
+
+
+def test_instrument_pad_press_does_not_double_add_already_playing():
+    """Toggling a step on an already-playing loop leaves playing_loops unchanged."""
+    state = _step_on(_armed_instrument(armed=(0,)), track_idx=0, loop_idx=1, step=0)
+    state = dataclasses.replace(state, playing_loops=frozenset({(0, 1)}))
+    result = reduce(state, PadPressed(pad_index=2, velocity=100))
+    assert result.playing_loops == frozenset({(0, 1)})
+
+
+def test_instrument_pad_press_empty_after_toggle_does_not_start():
+    """Toggling a step OFF that leaves the loop empty does not add it to playing_loops."""
+    # Start with one step ON, then toggle it OFF
+    state = _step_on(_armed_instrument(armed=(0,)), track_idx=0, loop_idx=1, step=0)
+    assert (0, 1) not in state.playing_loops
+    result = reduce(state, PadPressed(pad_index=0, velocity=100))  # toggles step 0 OFF
+    assert (0, 1) not in result.playing_loops
+
+
+def test_instrument_pad_press_dual_arm_starts_both():
+    """First step on each row in dual-arm starts both loops."""
+    state = _armed_instrument(armed=(0, 1))
+    result = reduce(state, PadPressed(pad_index=0, velocity=100))   # step on track 0
+    assert (0, 1) in result.playing_loops
+    result2 = reduce(result, PadPressed(pad_index=16, velocity=100))  # step on track 1
+    assert (1, 1) in result2.playing_loops
+
+
 def test_instrument_sk5_clear_without_shift_is_noop():
     """SK5 (CLEAR) without shift held does nothing."""
     state = _step_on(_armed_instrument(), track_idx=0, loop_idx=1, step=4)
