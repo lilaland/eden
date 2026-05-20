@@ -205,14 +205,29 @@ def test_session_pad_bottom_row_selects_track_15():
     assert result.selected_track == 15
 
 
-def test_session_pad_bottom_row_creates_instrument_for_empty_slot():
-    """Pressing an empty track slot creates a new DrumTrack at that slot."""
+def test_session_pad_bottom_row_selects_empty_slot():
+    """Pressing an empty track slot selects it (green highlight); does not auto-create."""
     state = default_state()
     assert state.tracks[2] is None
     result = reduce(state, PadPressed(pad_index=2, velocity=100))
-    from eden.state import DrumTrack
+    assert result.tracks[2] is None        # no auto-creation
+    assert result.selected_track == 2      # slot is selected
+
+
+def test_session_sk1_creates_drum_for_empty_slot():
+    """SK1 (DRUMS) creates a DrumTrack when the selected track slot is empty."""
+    state = dataclasses.replace(default_state(), selected_track=2)
+    assert state.tracks[2] is None
+    result = reduce(state, SoftkeyPressed(key=0))
     assert isinstance(result.tracks[2], DrumTrack)
-    assert result.selected_track == 2
+
+
+def test_session_sk1_mute_when_track_exists():
+    """SK1 still mutes the selected track when a track is present."""
+    state = default_state()  # track 0 is DrumTrack
+    assert state.tracks[0] is not None
+    result = reduce(state, SoftkeyPressed(key=0))
+    assert 0 in result.muted_tracks
 
 
 def test_session_pad_top_row_adds_to_playing():

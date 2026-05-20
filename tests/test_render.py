@@ -275,6 +275,15 @@ def test_render_oled_session_loop_count_zero_shows_inf():
     assert "inf" in oled[OLED_MAIN_LINE2]
 
 
+def test_render_oled_session_empty_slot_shows_new_instrument_menu():
+    """Test 22b: Empty slot selected → MAIN_LINE1 = 'NEW INSTRUMENT', BTN1 = 'DRUMS'."""
+    s = dataclasses.replace(default_state(), selected_track=2)
+    assert s.tracks[2] is None
+    oled = render_oled(s)
+    assert oled[OLED_MAIN_LINE1] == "NEW INSTRUMENT"
+    assert oled[OLED_BTN1_TITLE] == "DRUMS"
+
+
 # ── render_button_leds ────────────────────────────────────────────────────────
 
 

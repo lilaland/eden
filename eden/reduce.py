@@ -150,18 +150,7 @@ def _reduce_session(state: AppState, event: Event) -> AppState:
 def _session_pad_pressed(state: AppState, event: PadPressed) -> AppState:
     pad = event.pad_index
     if pad < 16:
-        # Bottom row: select track; create DrumTrack if slot is empty
-        track = state.tracks[pad]
-        if track is None:
-            name, sample = _TRACK_DEFAULTS[pad]
-            new_track = DrumTrack(name=name, sample_name=sample, loops=default_track_loops())
-            new_tracks = state.tracks[:pad] + (new_track,) + state.tracks[pad + 1:]
-            return dataclasses.replace(
-                state,
-                tracks=new_tracks,
-                selected_track=pad,
-                arm_pads_offer_loop=None,
-            )
+        # Bottom row: select track (green highlight if empty; type menu shown on OLED)
         return dataclasses.replace(
             state,
             selected_track=pad,
@@ -223,7 +212,12 @@ def _session_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
             instrument_submode=InstrumentSubmode.PADS,
             arm_pads_offer_loop=None,
         )
-    if event.key == 0:  # SK1: MUTE toggle
+    if event.key == 0:  # SK1: MUTE (existing track) / DRUMS (empty slot)
+        if state.tracks[t] is None:
+            name, sample = _TRACK_DEFAULTS[t]
+            new_track = DrumTrack(name=name, sample_name=sample, loops=default_track_loops())
+            new_tracks = state.tracks[:t] + (new_track,) + state.tracks[t + 1:]
+            return dataclasses.replace(state, tracks=new_tracks)
         new_muted = (
             state.muted_tracks - {t}
             if t in state.muted_tracks
