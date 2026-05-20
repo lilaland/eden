@@ -555,6 +555,34 @@ def test_instrument_sk4_back_returns_to_session():
     assert result.mode is Mode.SESSION
 
 
+def test_instrument_sk4_back_starts_nonempty_loop():
+    """SK4 (BACK) auto-adds the armed track's non-empty loop to playing_loops."""
+    state = _step_on(_armed_instrument(armed=(0,)), track_idx=0, loop_idx=1, step=0)
+    # Loop 1 of track 0 now has a step; it should be auto-started on BACK
+    assert (0, 1) not in state.playing_loops
+    result = reduce(state, SoftkeyPressed(key=3))
+    assert result.mode is Mode.SESSION
+    assert (0, 1) in result.playing_loops
+
+
+def test_instrument_sk4_back_does_not_start_empty_loop():
+    """SK4 (BACK) leaves empty loops out of playing_loops."""
+    state = _armed_instrument(armed=(0,))  # loop 1 is empty
+    result = reduce(state, SoftkeyPressed(key=3))
+    assert (0, 1) not in result.playing_loops
+
+
+def test_instrument_sk4_back_dual_arm_starts_both_nonempty():
+    """SK4 (BACK) auto-starts non-empty loops for all armed tracks in dual-arm."""
+    state = _armed_instrument(armed=(0, 1))
+    state = _step_on(state, track_idx=0, loop_idx=1, step=0)
+    state = _step_on(state, track_idx=1, loop_idx=1, step=2)
+    result = reduce(state, SoftkeyPressed(key=3))
+    assert result.mode is Mode.SESSION
+    assert (0, 1) in result.playing_loops
+    assert (1, 1) in result.playing_loops
+
+
 def test_instrument_sk5_clear_without_shift_is_noop():
     """SK5 (CLEAR) without shift held does nothing."""
     state = _step_on(_armed_instrument(), track_idx=0, loop_idx=1, step=4)
