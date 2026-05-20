@@ -7,10 +7,13 @@ achieve sub-millisecond tick accuracy without accumulating drift.
 
 from __future__ import annotations
 
+import queue
 import sys
 import time
 import threading
 from typing import Callable, List, Optional
+
+from eden.events import ClockTicked
 
 
 # ---------------------------------------------------------------------------
@@ -49,10 +52,13 @@ class SequencerClock:
         bpm: float = 120.0,
         steps: int = 16,
         ppq: int = 4,
+        event_queue: queue.SimpleQueue | None = None,
     ) -> None:
         self._bpm: float = float(bpm)
         self._steps: int = int(steps)
         self._ppq: int = int(ppq)
+
+        self._event_queue: queue.SimpleQueue | None = event_queue
 
         self._callbacks: List[Callable[[int], None]] = []
         self._running: bool = False
@@ -152,6 +158,9 @@ class SequencerClock:
                 except Exception as exc:
                     # Don't crash the clock on a bad callback.
                     print(f"[clock] callback error: {exc}", file=sys.stderr)
+
+            if self._event_queue:
+                self._event_queue.put(ClockTicked())
 
             step = (step + 1) % self._steps
 

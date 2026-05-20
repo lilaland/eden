@@ -13,3 +13,8 @@ PAD_OFF      = (0, 0, 0)      # pad off
 ACCENT_GOLD  = (110, 80, 0)   # warm gold — transport buttons, highlights
 ACCENT_CORAL = (120, 30, 20)  # coral/salmon — record arm, alert states
 BG_DARK      = (5, 0, 10)     # near-black purple — off-state variation
+
+PAD_DRUM     = (0, 70, 60)    # jungle teal — drum track type color (same as PAD_SELECTED)
+PAD_SYNTH    = (90, 20, 50)   # hibiscus pink — synth track type color
+PAD_SAMPLE   = (120, 30, 20)  # deep coral — sample track type color (same as ACCENT_CORAL)
+PAD_NEW_SLOT = (0, 100, 0)    # bright green — empty slot selected, ready to arm/create

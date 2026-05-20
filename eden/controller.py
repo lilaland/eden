@@ -12,6 +12,7 @@ PORT ARCHITECTURE (confirmed 2026-05-18 via Studio One proxy sniff):
 from __future__ import annotations
 
 import os
+import queue
 import sys
 import threading
 import time
@@ -45,6 +46,18 @@ from controller_map import (
     NATIVE_LED_METRO,
     SYSEX_HEADER,
     SYSEX_CMD_DISPLAY_TEXT,
+    SOFT_KEY_CHANNEL,
+    SOFT_KEY_CC,
+    BTN_SHIFT,
+)
+from eden.events import (
+    PadPressed,
+    PadReleased,
+    EncoderTurned,
+    TransportPressed,
+    ModeButtonPressed,
+    ShiftChanged,
+    SoftkeyPressed,
 )
 
 # ─── Native-mode transport CC table (PROTOCOL.md §8) ─────────────────────────
@@ -75,7 +88,7 @@ _ENC_CC_TO_NUM: dict[int, int] = {v: k for k, v in ENC_CC.items()}
 
 
 class AtomSQ:
-    def __init__(self, port_hint: str = "atm sq") -> None:
+    def __init__(self, port_hint: str = "atm sq", event_queue: queue.SimpleQueue | None = None) -> None:
         """
         Open MIDI I/O for the Atom SQ.
 
@@ -83,6 +96,10 @@ class AtomSQ:
           self._out      — ATM SQ main port (standard MIDI output, rarely used)
           self._ctrl_out — ATM SQ Control port (ALL native-mode output: LEDs, OLED, init)
         Input comes from ATM SQ main port only.
+
+        event_queue: optional queue.SimpleQueue to receive Event dataclass instances
+                     alongside the existing callback system. Both dispatch paths are
+                     active simultaneously when provided.
         """
         hint = port_hint.lower()
         all_outs = [p for p in mido.get_output_names() if hint in p.lower()]
@@ -106,11 +123,15 @@ class AtomSQ:
         self._native_mode: bool = False
         self._enc_last: dict[int, int | None] = {n: None for n in range(1, 10)}
 
+        self._event_queue: queue.SimpleQueue | None = event_queue
+
         self._cb_pad_press:   Callable[[int, int], None] | None = None
         self._cb_pad_release: Callable[[int], None] | None = None
         self._cb_enc_delta:   Callable[[int, int], None] | None = None
         self._cb_mode_btn:    Callable[[str, bool], None] | None = None
         self._cb_transport:   Callable[[str, bool], None] | None = None
+        self._cb_shift:       Callable[[bool], None] | None = None
+        self._cb_softkey:     Callable[[int], None] | None = None
 
         self._listener_thread: threading.Thread | None = None
         self._listening: bool = False
@@ -257,6 +278,14 @@ class AtomSQ:
         """callback(button_name: str, pressed: bool)"""
         self._cb_transport = callback
 
+    def on_shift(self, callback: Callable[[bool], None]) -> None:
+        """callback(held: bool) — True on press, False on release"""
+        self._cb_shift = callback
+
+    def on_softkey(self, callback: Callable[[int], None]) -> None:
+        """callback(key_index: int) — key_index 0-4 (SK1-SK5)"""
+        self._cb_softkey = callback
+
     # ─── Listener thread ──────────────────────────────────────────────────────
 
     def start_listening(self) -> None:
@@ -289,9 +318,13 @@ class AtomSQ:
         if msg.channel == 0 and msg.type in ("note_on", "note_off") and 36 <= msg.note <= 67:
             pad_idx = msg.note - 36
             if msg.type == "note_on" and msg.velocity > 0:
+                if self._event_queue:
+                    self._event_queue.put(PadPressed(pad_index=pad_idx, velocity=msg.velocity))
                 if self._cb_pad_press:
                     self._cb_pad_press(pad_idx, msg.velocity)
             else:
+                if self._event_queue:
+                    self._event_queue.put(PadReleased(pad_index=pad_idx))
                 if self._cb_pad_release:
                     self._cb_pad_release(pad_idx)
             return
@@ -302,17 +335,24 @@ class AtomSQ:
             if pad_idx is None:
                 return
             if msg.velocity > 0:
+                if self._event_queue:
+                    self._event_queue.put(PadPressed(pad_index=pad_idx, velocity=msg.velocity))
                 if self._cb_pad_press:
                     self._cb_pad_press(pad_idx, msg.velocity)
             else:
+                if self._event_queue:
+                    self._event_queue.put(PadReleased(pad_index=pad_idx))
                 if self._cb_pad_release:
                     self._cb_pad_release(pad_idx)
             return
 
         if msg.type == "note_off" and msg.channel == PAD_CHANNEL:
             pad_idx = PAD_NOTE_TO_INDEX.get(msg.note)
-            if pad_idx is not None and self._cb_pad_release:
-                self._cb_pad_release(pad_idx)
+            if pad_idx is not None:
+                if self._event_queue:
+                    self._event_queue.put(PadReleased(pad_index=pad_idx))
+                if self._cb_pad_release:
+                    self._cb_pad_release(pad_idx)
             return
 
         if msg.type == "control_change" and msg.channel == ENC_CHANNEL:
@@ -321,31 +361,69 @@ class AtomSQ:
             if cc in _ENC_CC_TO_NUM:
                 enc_num = _ENC_CC_TO_NUM[cc]
                 delta = self._decode_encoder_delta(enc_num, value)
-                if delta != 0 and self._cb_enc_delta:
-                    self._cb_enc_delta(enc_num, delta)
+                if delta != 0:
+                    if self._event_queue:
+                        self._event_queue.put(EncoderTurned(encoder=enc_num, delta=delta))
+                    if self._cb_enc_delta:
+                        self._cb_enc_delta(enc_num, delta)
                 return
 
             if cc == ENC9_TURN_CC and not self._native_mode:
                 delta = self._decode_encoder_delta(9, value)
-                if delta != 0 and self._cb_enc_delta:
-                    self._cb_enc_delta(9, delta)
+                if delta != 0:
+                    if self._event_queue:
+                        self._event_queue.put(EncoderTurned(encoder=9, delta=delta))
+                    if self._cb_enc_delta:
+                        self._cb_enc_delta(9, delta)
                 return
 
             if cc == ENC9_NATIVE_CC and self._native_mode:
                 delta = value if value <= 63 else value - 128
-                if delta != 0 and self._cb_enc_delta:
-                    self._cb_enc_delta(9, delta)
+                if delta != 0:
+                    if self._event_queue:
+                        self._event_queue.put(EncoderTurned(encoder=9, delta=delta))
+                    if self._cb_enc_delta:
+                        self._cb_enc_delta(9, delta)
                 return
 
             transport_table = _NATIVE_TRANSPORT_CC if self._native_mode else _STD_TRANSPORT_CC
             if cc in transport_table:
+                name = transport_table[cc]
+                pressed = (value == 127)
+                if self._event_queue:
+                    self._event_queue.put(TransportPressed(button=name, pressed=pressed))
                 if self._cb_transport:
-                    self._cb_transport(transport_table[cc], value == 127)
+                    self._cb_transport(name, pressed)
+                return
+
+            # SHIFT button: CC 31, channel 0 (BTN_CHANNEL == ENC_CHANNEL == 0).  [SNIFF+JB]
+            if cc == BTN_SHIFT:
+                held = (value == 127)
+                if self._event_queue:
+                    self._event_queue.put(ShiftChanged(held=held))
+                if self._cb_shift:
+                    self._cb_shift(held)
                 return
 
             if cc in _MODE_BTN_CC:
+                name = _MODE_BTN_CC[cc]
+                pressed = (value == 127)
+                if self._event_queue:
+                    self._event_queue.put(ModeButtonPressed(button=name, pressed=pressed))
                 if self._cb_mode_btn:
-                    self._cb_mode_btn(_MODE_BTN_CC[cc], value == 127)
+                    self._cb_mode_btn(name, pressed)
+                return
+
+        # Screen soft keys: channel 2, CC 24-28, left→right (SK1-SK5).  [SNIFF x2]
+        # Value 127 = pressed; these keys do not send a separate release message.  # UNVERIFIED: no separate release confirmed on hardware
+        if msg.type == "control_change" and msg.channel == SOFT_KEY_CHANNEL:
+            if msg.control in SOFT_KEY_CC:
+                key_idx = SOFT_KEY_CC.index(msg.control)
+                if msg.value == 127:  # pressed only (soft keys don't have separate release)
+                    if self._event_queue:
+                        self._event_queue.put(SoftkeyPressed(key=key_idx))
+                    if self._cb_softkey:
+                        self._cb_softkey(key_idx)
                 return
 
     def _decode_encoder_delta(self, enc_num: int, value: int) -> int:

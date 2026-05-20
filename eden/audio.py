@@ -26,6 +26,37 @@ import sounddevice as sd
 import soundfile as sf
 
 # ---------------------------------------------------------------------------
+# StateRef — atomic state reference
+# ---------------------------------------------------------------------------
+
+
+class StateRef:
+    """
+    Thread-safe atomic reference to the current AppState.
+
+    Writes are serialized by a lock; reads are lock-free in Python
+    because object reference assignment is atomic in CPython.
+    The audio callback reads self._state directly (no lock) — this is
+    safe under CPython's GIL. On other Python implementations this
+    would need a proper atomic, but Eden targets CPython.
+
+    Deliberately does NOT import AppState (avoids circular deps with eden.state).
+    Operates as a generic container typed Any.
+    """
+
+    def __init__(self, initial_state) -> None:
+        self._state = initial_state
+        self._lock = threading.Lock()
+
+    def get(self):
+        return self._state  # lock-free read (CPython GIL guarantees atomicity)
+
+    def set(self, new_state) -> None:
+        with self._lock:
+            self._state = new_state
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -200,6 +231,67 @@ class SamplePlayer:
         # Soft clip to prevent digital distortion when many voices overlap.
         np.clip(mix[:frames], -1.0, 1.0, out=mix[:frames])
         outdata[:] = mix[:frames]
+
+
+# ---------------------------------------------------------------------------
+# StepScheduler — reads state, enqueues triggers
+# ---------------------------------------------------------------------------
+
+
+class StepScheduler:
+    """
+    Reads AppState on each clock tick, determines which samples to play
+    at the current playhead position, and enqueues them into SamplePlayer's
+    lock-free trigger queue.
+
+    Runs on the clock thread (via ClockTicked event or direct callback).
+    Never called from the audio thread.
+    """
+
+    def __init__(self, player: SamplePlayer, state_ref: StateRef) -> None:
+        self._player = player
+        self._state_ref = state_ref
+
+    def on_tick(self) -> None:
+        """
+        Call on every clock tick (after reducer has updated state).
+        Reads current state via StateRef, triggers all active steps at playhead.
+        """
+        state = self._state_ref.get()
+        if not state.is_playing:
+            return
+
+        playhead = state.playhead
+        muted = state.muted_tracks
+        soloed = state.soloed_tracks
+
+        # If any track is soloed, only soloed tracks sound
+        effective_muted = muted
+        if soloed:
+            effective_muted = frozenset(
+                i for i in range(len(state.tracks)) if i not in soloed
+            )
+
+        for track_idx, track in enumerate(state.tracks):
+            if track is None:
+                continue
+            if track_idx in effective_muted:
+                continue
+
+            # Only DrumTrack is implemented — SynthTrack/SampleTrack are M3
+            # Import check via hasattr instead of isinstance to avoid state import
+            if not hasattr(track, 'sample_name'):
+                continue  # SynthTrack/SampleTrack — skip silently
+
+            # Find which loops are playing for this track
+            for loop_idx, loop in enumerate(track.loops):
+                if (track_idx, loop_idx) not in state.playing_loops:
+                    continue
+                if playhead >= len(loop.steps):
+                    continue
+                if loop.steps[playhead]:
+                    self._player.trigger(track.sample_name, 1.0)
+                    break  # one trigger per track per tick (first matching loop)
 
 
 # ---------------------------------------------------------------------------

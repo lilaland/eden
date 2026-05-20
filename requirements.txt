@@ -3,3 +3,4 @@ python-rtmidi>=1.5.0
 sounddevice>=0.4.6
 soundfile>=0.12.1
 numpy>=1.24.0
+# pygame>=2.0.0  # optional debug UI — install separately after: brew install sdl2 sdl2_image sdl2_mixer sdl2_ttf
