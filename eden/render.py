@@ -13,6 +13,7 @@ from eden.theme import (
     PAD_ACTIVE, PAD_PLAYHEAD, PAD_INACTIVE, PAD_SELECTED, PAD_OFF,
     ACCENT_GOLD, ACCENT_CORAL, BG_DARK,
     PAD_DRUM, PAD_SYNTH, PAD_SAMPLE, PAD_NEW_SLOT,
+    PAD_PINK, PAD_ARMED,
 )
 from controller_map import (
     OLED_MAIN_LINE1, OLED_MAIN_LINE2,
@@ -49,6 +50,11 @@ def _dim(color: tuple[int, int, int], divisor: float = 3.0) -> tuple[int, int, i
     return tuple(int(c / divisor) for c in color)  # type: ignore[return-value]
 
 
+def _pulse(color: tuple[int, int, int], playhead: int) -> tuple[int, int, int]:
+    """Alternate between full and dim every 2 steps to create a playing-loop pulse."""
+    return color if (playhead % 4) < 2 else _dim(color)
+
+
 # ── Public rendering functions ────────────────────────────────────────────────
 
 
@@ -62,61 +68,56 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
 
     if state.mode == Mode.SESSION:
         # ── Bottom row (pads 0-15): 16 instrument track slots ────────────────
-        # Track i → pad i  (matches v0 step-editor row; user-confirmed layout)
         for track_idx in range(16):
             pad_idx = track_idx
             track = state.tracks[track_idx]
+            is_selected = track_idx == state.selected_track
 
             if track is None:
                 pads[pad_idx] = PAD_NEW_SLOT if is_selected else PAD_INACTIVE
                 continue
 
-            is_soloed   = track_idx in state.soloed_tracks
-            is_armed    = track_idx in state.armed_tracks
-            is_muted    = track_idx in state.muted_tracks
-            is_selected = track_idx == state.selected_track
+            is_armed  = track_idx in state.armed_tracks
+            is_soloed = track_idx in state.soloed_tracks
+            is_muted  = track_idx in state.muted_tracks
 
-            # Priority: soloed > armed > muted > selected+type > type
-            if is_soloed:
+            # Priority: armed > soloed > selected > muted > type color
+            if is_armed:
+                pads[pad_idx] = PAD_ARMED
+            elif is_soloed:
                 pads[pad_idx] = (100, 100, 100)
-            elif is_armed:
-                pads[pad_idx] = ACCENT_GOLD
+            elif is_selected:
+                pads[pad_idx] = PAD_PINK
             elif is_muted:
                 pads[pad_idx] = _dim(ACCENT_CORAL)
             else:
-                color = _track_color(track)
-                if is_selected:
-                    color = _brighten(color)
-                pads[pad_idx] = color
+                pads[pad_idx] = _dim(_track_color(track))
 
         # ── Top row (pads 16-31): loop slots of selected track ───────────────
-        # Loop j → pad j+16
         sel_idx = state.selected_track
         sel_track = state.tracks[sel_idx] if sel_idx is not None else None
 
-        if sel_track is None:
-            # top row stays PAD_INACTIVE
-            pass
-        else:
+        if sel_track is not None:
             track_color = _track_color(sel_track)
             for loop_idx in range(16):
                 pad_idx = loop_idx + 16
                 loop: Loop = sel_track.loops[loop_idx]
+                is_sel_loop = loop_idx == state.selected_loop
 
                 if loop.is_empty:
-                    pads[pad_idx] = PAD_NEW_SLOT if loop_idx == state.selected_loop else PAD_INACTIVE
+                    pads[pad_idx] = PAD_NEW_SLOT if is_sel_loop else PAD_INACTIVE
                     continue
 
-                is_playing = (sel_idx, loop_idx) in state.playing_loops
-                if is_playing:
-                    color: tuple[int, int, int] = PAD_PLAYHEAD
+                is_loop_playing = (sel_idx, loop_idx) in state.playing_loops
+
+                if is_sel_loop and is_loop_playing:
+                    pads[pad_idx] = _pulse(PAD_PINK, state.playhead)
+                elif is_sel_loop:
+                    pads[pad_idx] = PAD_PINK
+                elif is_loop_playing:
+                    pads[pad_idx] = _pulse(track_color, state.playhead)
                 else:
-                    color = track_color
-
-                if loop_idx == state.selected_loop:
-                    color = _brighten(color)
-
-                pads[pad_idx] = color
+                    pads[pad_idx] = _dim(track_color)
 
     elif state.mode == Mode.INSTRUMENT:
         armed = state.armed_tracks

@@ -14,7 +14,10 @@ from eden.state import (
     AppState, Mode, InstrumentSubmode, DrumTrack, SynthTrack, Loop,
     default_state, default_loop, default_track_loops,
 )
-from eden.theme import PAD_INACTIVE, PAD_DRUM, PAD_SYNTH, PAD_PLAYHEAD, ACCENT_GOLD
+from eden.theme import (
+    PAD_INACTIVE, PAD_DRUM, PAD_SYNTH, PAD_PLAYHEAD, ACCENT_GOLD,
+    PAD_PINK, PAD_ARMED, PAD_NEW_SLOT,
+)
 from eden.render import render_pads, render_oled, render_button_leds
 from controller_map import (
     OLED_MAIN_LINE1, OLED_MAIN_LINE2,
@@ -77,15 +80,11 @@ def test_render_pads_session_empty_slot_is_inactive():
     assert pads[2] == PAD_INACTIVE
 
 
-def test_render_pads_session_drum_track_gets_drum_color():
-    """Test 3: Track 0 (DrumTrack) at pad 0 has PAD_DRUM or brighter variant."""
-    s = default_state()
-    # Track 0 is selected so it will be brightened; confirm it is not PAD_INACTIVE
+def test_render_pads_session_selected_track_is_pink():
+    """Test 3: Selected track with content → PAD_PINK."""
+    s = default_state()  # track 0 selected, has content
     pads = render_pads(s)
-    assert pads[0] != PAD_INACTIVE
-    # The color must be derived from PAD_DRUM (each channel >= PAD_DRUM channel)
-    for ch_result, ch_base in zip(pads[0], PAD_DRUM):
-        assert ch_result >= ch_base
+    assert pads[0] == PAD_PINK
 
 
 def test_render_pads_session_selected_track_is_brighter():
@@ -97,11 +96,11 @@ def test_render_pads_session_selected_track_is_brighter():
     assert sum(selected_pad) > sum(nonselected_pad)
 
 
-def test_render_pads_session_armed_track_gets_gold():
-    """Test 5: Armed track gets ACCENT_GOLD color."""
+def test_render_pads_session_armed_track_is_red():
+    """Test 5: Armed track gets PAD_ARMED (red)."""
     s = dataclasses.replace(default_state(), armed_tracks=(1,))
     pads = render_pads(s)
-    assert pads[1] == ACCENT_GOLD
+    assert pads[1] == PAD_ARMED
 
 
 def test_render_pads_session_muted_track_gets_dim_color():
@@ -120,8 +119,8 @@ def test_render_pads_session_empty_loop_is_inactive():
     assert pads[17] == PAD_INACTIVE
 
 
-def test_render_pads_session_playing_loop_is_playhead():
-    """Test 8: Playing loop in top row → PAD_PLAYHEAD at pad 17 (loop 1)."""
+def test_render_pads_session_playing_loop_pulses_type_color():
+    """Test 8: Non-selected playing loop pulses in track type color."""
     s = default_state()
     t0 = s.tracks[0]
     steps = tuple(i == 0 for i in range(16))
@@ -129,14 +128,65 @@ def test_render_pads_session_playing_loop_is_playhead():
     new_loops = t0.loops[:1] + (loop_with_step,) + t0.loops[2:]
     new_t0 = dataclasses.replace(t0, loops=new_loops)
     new_tracks = (new_t0,) + s.tracks[1:]
+    # playhead=0 → pulse on (% 4 < 2) → full track color
     s = dataclasses.replace(
         s,
         tracks=new_tracks,
-        playing_loops=frozenset({(0, 1)}),  # loop 1 playing
-        selected_loop=0,                    # loop 0 selected (different → no brightness boost)
+        playing_loops=frozenset({(0, 1)}),
+        selected_loop=0,  # loop 0 selected, loop 1 is the playing one
+        playhead=0,
     )
     pads = render_pads(s)
-    assert pads[17] == PAD_PLAYHEAD  # loop 1 → pad 16+1=17
+    assert pads[17] == PAD_DRUM  # pulse-on phase = full drum color
+
+    # playhead=2 → pulse off (% 4 >= 2) → dim track color
+    s2 = dataclasses.replace(s, playhead=2)
+    pads2 = render_pads(s2)
+    assert pads2[17] == tuple(int(c / 3) for c in PAD_DRUM)
+
+
+def test_render_pads_session_selected_loop_not_playing_is_solid_pink():
+    """Test 8b: Selected loop with content, not playing → solid PAD_PINK."""
+    s = default_state()
+    # Loop 0 selected; remove it from playing_loops so it's selected-but-not-playing
+    s = dataclasses.replace(s, playing_loops=frozenset())
+    pads = render_pads(s)
+    assert pads[16] == PAD_PINK
+
+
+def test_render_pads_session_selected_loop_playing_pulses_pink():
+    """Test 8b2: Selected loop that is also playing → pulses PAD_PINK."""
+    s = default_state()
+    # Loop 0 selected and playing; playhead=0 → pulse on → full PAD_PINK
+    s = dataclasses.replace(s, playing_loops=frozenset({(0, 0)}), playhead=0)
+    pads = render_pads(s)
+    assert pads[16] == PAD_PINK  # pulse-on phase
+
+    # playhead=2 → pulse off → dim PAD_PINK
+    s2 = dataclasses.replace(s, playhead=2)
+    pads2 = render_pads(s2)
+    assert pads2[16] == tuple(int(c / 3) for c in PAD_PINK)
+
+
+def test_render_pads_session_selected_empty_track_is_green():
+    """Test 8c: Selected empty track slot → PAD_NEW_SLOT (green)."""
+    s = dataclasses.replace(default_state(), selected_track=2)  # track 2 is None
+    pads = render_pads(s)
+    assert pads[2] == PAD_NEW_SLOT
+
+
+def test_render_pads_session_selected_empty_loop_is_green():
+    """Test 8d: Selected empty loop slot → PAD_NEW_SLOT (green)."""
+    s = dataclasses.replace(default_state(), selected_loop=1)  # loop 1 is empty
+    pads = render_pads(s)
+    assert pads[17] == PAD_NEW_SLOT  # loop 1 → pad 17
+
+
+def test_render_pads_session_unselected_track_is_dim():
+    """Test 8e: Non-selected, non-armed track → dim type color."""
+    s = default_state()  # track 0 selected; track 1 is unselected drum
+    pads = render_pads(s)
+    assert pads[1] == tuple(int(c / 3) for c in PAD_DRUM)
 
 
 # ── render_pads — INSTRUMENT single-arm ──────────────────────────────────────

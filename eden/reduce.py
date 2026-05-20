@@ -150,7 +150,7 @@ def _reduce_session(state: AppState, event: Event) -> AppState:
 def _session_pad_pressed(state: AppState, event: PadPressed) -> AppState:
     pad = event.pad_index
     if pad < 16:
-        # Bottom row: select track; create DrumTrack if slot is empty
+        # Bottom row: select track; auto-select loop 0; create DrumTrack if slot is empty
         track = state.tracks[pad]
         if track is None:
             name, sample = _TRACK_DEFAULTS[pad]
@@ -160,11 +160,13 @@ def _session_pad_pressed(state: AppState, event: PadPressed) -> AppState:
                 state,
                 tracks=new_tracks,
                 selected_track=pad,
+                selected_loop=0,
                 arm_pads_offer_loop=None,
             )
         return dataclasses.replace(
             state,
             selected_track=pad,
+            selected_loop=0,
             arm_pads_offer_loop=None,
         )
     else:
