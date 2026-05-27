@@ -262,10 +262,10 @@ class StepScheduler:
             return
 
         playhead = state.playhead
+        offsets = dict(state.loop_measure_offsets)
         muted = state.muted_tracks
         soloed = state.soloed_tracks
 
-        # If any track is soloed, only soloed tracks sound
         effective_muted = muted
         if soloed:
             effective_muted = frozenset(
@@ -283,15 +283,16 @@ class StepScheduler:
             if not hasattr(track, 'sample_name'):
                 continue  # SynthTrack/SampleTrack — skip silently
 
-            # Find which loops are playing for this track
             for loop_idx, loop in enumerate(track.loops):
                 if (track_idx, loop_idx) not in state.playing_loops:
                     continue
-                if playhead >= len(loop.steps):
+                measure_offset = offsets.get((track_idx, loop_idx), 0)
+                effective_step = playhead + measure_offset * 16
+                if effective_step >= len(loop.steps):
                     continue
-                if loop.steps[playhead]:
+                if loop.steps[effective_step]:
                     self._player.trigger(track.sample_name, 1.0)
-                    break  # one trigger per track per tick (first matching loop)
+                    break
 
 
 # ---------------------------------------------------------------------------

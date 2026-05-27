@@ -38,7 +38,7 @@ from eden.clock import SequencerClock
 from eden.reduce import reduce
 from eden.render import render_pads, render_oled, render_button_leds
 from eden.state import default_state, AppState
-from eden.events import ClockTicked, SoftkeyPressed
+from eden.events import ClockTicked, SoftkeyPressed, TouchbarMoved
 from eden.theme import ACCENT_GOLD
 
 try:

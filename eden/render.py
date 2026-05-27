@@ -121,52 +121,67 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
 
     elif state.mode == Mode.INSTRUMENT:
         armed = state.armed_tracks
-
-        if len(armed) == 0:
-            # No-arm fallback: all PAD_INACTIVE (already default)
-            pass
+        if not armed:
+            pass  # all PAD_INACTIVE
 
         elif len(armed) == 1:
-            # Single-arm: 32-step pattern across both rows
             track_idx = armed[0]
             track = state.tracks[track_idx]
             if track is not None:
-                loop: Loop = track.loops[state.selected_loop]
+                loop = track.loops[state.selected_loop]
                 color = _track_color(track)
-                step_count = loop.step_count  # 16 or 32
-                for pad_idx in range(32):
-                    # bottom row = steps 0-15, top row = steps 16-31
-                    step_idx = pad_idx
-                    if step_idx >= step_count:
-                        pads[pad_idx] = PAD_INACTIVE
-                        continue
-                    if step_idx == state.playhead:
-                        pads[pad_idx] = PAD_PLAYHEAD
-                    elif loop.steps[step_idx]:
-                        pads[pad_idx] = color
-                    else:
-                        pads[pad_idx] = PAD_INACTIVE
+                view_m = state.instrument_view_measure
+                # Check if this loop is playing and get its current measure
+                key = (track_idx, state.selected_loop)
+                playing_measure = dict(state.loop_measure_offsets).get(key, 0)
+                is_playing_loop = key in state.playing_loops
 
-        elif len(armed) >= 2:
-            # Dual-arm: bottom row = armed_tracks[0] (steps 0-15),
-            #            top row  = armed_tracks[1] (steps 0-15)
+                for row in range(2):
+                    measure = view_m + row
+                    for col in range(16):
+                        pad_idx = row * 16 + col
+                        global_step = measure * 16 + col
+                        if global_step >= loop.step_count:
+                            pads[pad_idx] = PAD_INACTIVE
+                            continue
+                        is_playhead = (
+                            is_playing_loop
+                            and playing_measure == measure
+                            and col == state.playhead
+                        )
+                        if is_playhead:
+                            pads[pad_idx] = PAD_PLAYHEAD
+                        elif loop.steps[global_step]:
+                            pads[pad_idx] = color
+                        else:
+                            pads[pad_idx] = PAD_INACTIVE
+
+        else:  # dual-arm
+            offsets = dict(state.loop_measure_offsets)
+            view_m = state.instrument_view_measure
             for row, track_idx in enumerate(armed[:2]):
                 track = state.tracks[track_idx]
                 if track is None:
                     continue
                 loop = track.loops[state.selected_loop]
                 color = _track_color(track)
-                # Clamp step count to 16 for dual-arm rows
-                step_count = min(loop.step_count, 16)
-                for step_idx in range(16):
-                    # row 0 → pads 0-15 (bottom), row 1 → pads 16-31 (top)
-                    pad_idx = step_idx + (row * 16)
-                    if step_idx >= step_count:
+                key = (track_idx, state.selected_loop)
+                playing_measure = offsets.get(key, 0)
+                is_playing_loop = key in state.playing_loops
+                for col in range(16):
+                    pad_idx = row * 16 + col
+                    global_step = view_m * 16 + col
+                    if global_step >= loop.step_count:
                         pads[pad_idx] = PAD_INACTIVE
                         continue
-                    if step_idx == state.playhead:
+                    is_playhead = (
+                        is_playing_loop
+                        and playing_measure == view_m
+                        and col == state.playhead
+                    )
+                    if is_playhead:
                         pads[pad_idx] = PAD_PLAYHEAD
-                    elif loop.steps[step_idx]:
+                    elif loop.steps[global_step]:
                         pads[pad_idx] = color
                     else:
                         pads[pad_idx] = PAD_INACTIVE
@@ -254,29 +269,25 @@ def render_oled(state: AppState) -> dict[int, str]:
             n1 = t1.name if t1 is not None else "EMPTY"
             main_line1 = f"{n0}+{n1}"
 
-        # loop_count from first armed track's selected loop
-        loop_count = 0
+        # Current view position and total measures
+        max_measures = 1
         if armed:
-            track = state.tracks[armed[0]]
-            if track is not None:
-                loop = track.loops[state.selected_loop]
-                loop_count = loop.loop_count
+            for idx in armed:
+                tr = state.tracks[idx]
+                if tr is not None:
+                    max_measures = max(max_measures, tr.loops[state.selected_loop].step_count // 16)
+        view_m = state.instrument_view_measure
+        main_line2 = f"M{view_m + 1}/{max_measures} L{state.selected_loop + 1}"
 
-        loop_count_str = "inf" if loop_count == 0 else f"{loop_count}x"
-        main_line2 = f"LOOP {state.selected_loop + 1} [{loop_count_str}]"
-
-        # SK2: EXTEND/SHRINK based on current loop's step count
-        step_count = 16
-        if state.armed_tracks:
-            t0 = state.tracks[state.armed_tracks[0]]
-            if t0 is not None:
-                step_count = t0.loops[state.selected_loop].step_count
-        sk2_label = "SHRINK" if step_count == 32 else "EXTEND"
+        # SK1: STEPS
+        steps_label = "STEPS*" if state.instrument_active_ctrl == "STEPS" else "STEPS"
+        # SK2: MEASURES
+        meas_label = "MEAS*" if state.instrument_active_ctrl == "MEASURES" else f"MEAS {max_measures}"
 
         _set(OLED_MAIN_LINE1, main_line1)
         _set(OLED_MAIN_LINE2, main_line2)
-        _set(OLED_BTN1_TITLE, "STEPS")
-        _set(OLED_BTN2_TITLE, sk2_label)
+        _set(OLED_BTN1_TITLE, steps_label)
+        _set(OLED_BTN2_TITLE, meas_label)
         _set(OLED_BTN3_TITLE, "PADS")
         _set(OLED_BTN4_TITLE, "< BACK")
         _set(OLED_BTN5_TITLE, "CLEAR")

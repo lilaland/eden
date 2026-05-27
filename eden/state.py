@@ -84,6 +84,10 @@ class AppState:
     plays_remaining: tuple[tuple[tuple[int, int], int], ...] = ()
     # ((track_idx, loop_idx), remaining) — only set for loops with loop_count > 0
     arm_pads_offer_loop: Optional[int] = None  # set by Shift+empty-loop in session view
+    loop_measure_offsets: tuple[tuple[tuple[int, int], int], ...] = ()
+    # ((track_idx, loop_idx), current_measure_index) — only for playing multi-measure loops
+    instrument_view_measure: int = 0   # which measure page the pad grid shows
+    instrument_active_ctrl: str = ""   # "" | "STEPS" | "MEASURES"
 
 
 # ── Factory functions ─────────────────────────────────────────────────────────

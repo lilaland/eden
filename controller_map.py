@@ -52,6 +52,7 @@ BTN_STOP  = 85   # CC 0x55
 BTN_REC   = 87   # CC 0x57
 BTN_METRO = 89   # CC 0x59
 BTN_A     = 64   # CC 0x40
+TOUCHBAR_PITCHWHEEL_CHANNEL = 15  # pitchwheel on ch 15: -8192=left end, +8191=right end  [SNIFF]
 
 BTN_LEFT  = 102  # CC 0x66
 BTN_UP    = 103  # CC 0x67

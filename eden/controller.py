@@ -51,6 +51,7 @@ from controller_map import (
     SOFT_KEY_CHANNEL,
     SOFT_KEY_CC,
     BTN_SHIFT,
+    TOUCHBAR_PITCHWHEEL_CHANNEL,
 )
 from eden.events import (
     PadPressed,
@@ -60,6 +61,7 @@ from eden.events import (
     ModeButtonPressed,
     ShiftChanged,
     SoftkeyPressed,
+    TouchbarMoved,
 )
 
 # ─── Native-mode transport CC table (PROTOCOL.md §8) ─────────────────────────
@@ -314,6 +316,12 @@ class AtomSQ:
     def _dispatch_midi(self, msg: mido.Message) -> None:
         if not hasattr(msg, "channel"):
             return  # sysex, clock, active-sense — no channel attribute
+
+        if msg.type == "pitchwheel" and msg.channel == TOUCHBAR_PITCHWHEEL_CHANNEL:
+            position = (msg.pitch + 8192) / 16383.0
+            if self._event_queue:
+                self._event_queue.put(TouchbarMoved(position=position))
+            return
 
         if _DEBUG_MIDI and msg.type == "control_change":
             print(f"[MIDI] cc ch={msg.channel} ctrl={msg.control} val={msg.value}")

@@ -25,6 +25,7 @@ from eden.events import (
     PadReleased,
     ShiftChanged,
     SoftkeyPressed,
+    TouchbarMoved,
     TransportPressed,
 )
 
@@ -73,42 +74,55 @@ def reduce(state: AppState, event: Event) -> AppState:
 def _on_clock_ticked(state: AppState) -> AppState:
     if not state.is_playing:
         return state
-    # In single-arm INSTRUMENT, wrap at the actual loop's step count (16 or 32).
-    if state.mode == Mode.INSTRUMENT and len(state.armed_tracks) == 1:
-        track = state.tracks[state.armed_tracks[0]]
-        max_steps = track.loops[state.selected_loop].step_count if track is not None else 16
-    else:
-        max_steps = 16
-    new_playhead = (state.playhead + 1) % max_steps
+    new_playhead = (state.playhead + 1) % 16
     state = dataclasses.replace(state, playhead=new_playhead)
-    # On wrap, decrement plays_remaining and stop any finished loops.
     if new_playhead == 0:
         state = _handle_loop_wrap(state)
     return state
 
 
 def _handle_loop_wrap(state: AppState) -> AppState:
-    """Decrement plays_remaining on wrap; remove loops whose count hits zero."""
+    """Advance measure offsets on each 16-step wrap; decrement plays_remaining only on full loop completion."""
     remaining = dict(state.plays_remaining)
+    offsets = dict(state.loop_measure_offsets)
     loops_to_stop: set[tuple[int, int]] = set()
-    for (track_idx, loop_idx) in state.playing_loops:
+
+    for key in state.playing_loops:
+        track_idx, loop_idx = key
         track = state.tracks[track_idx]
         if track is None:
-            loops_to_stop.add((track_idx, loop_idx))
+            loops_to_stop.add(key)
             continue
-        key = (track_idx, loop_idx)
+
+        loop = track.loops[loop_idx]
+        measure_count = loop.step_count // 16
+
+        if measure_count > 1:
+            current = offsets.get(key, 0)
+            nxt = (current + 1) % measure_count
+            offsets[key] = nxt
+            if nxt != 0:
+                continue  # mid-loop, don't count a play yet
+
+        # 1-measure loop OR just completed all measures → count one play
         if key not in remaining:
-            continue  # not tracking plays (infinite loop)
+            continue  # infinite loop
         count = remaining[key] - 1
         if count <= 0:
             loops_to_stop.add(key)
             del remaining[key]
+            offsets.pop(key, None)
         else:
             remaining[key] = count
+
+    for key in loops_to_stop:
+        offsets.pop(key, None)
+
     return dataclasses.replace(
         state,
         playing_loops=state.playing_loops - loops_to_stop,
         plays_remaining=tuple(remaining.items()),
+        loop_measure_offsets=tuple(offsets.items()),
     )
 
 
@@ -191,19 +205,23 @@ def _session_pad_pressed(state: AppState, event: PadPressed) -> AppState:
             return base
 
         pair = (state.selected_track, loop_idx)
+        offsets = dict(state.loop_measure_offsets)
         if pair in state.playing_loops:
             new_playing = state.playing_loops - {pair}
             new_remaining = tuple(e for e in state.plays_remaining if e[0] != pair)
+            offsets.pop(pair, None)
         else:
             new_playing = state.playing_loops | {pair}
             lc = track.loops[loop_idx].loop_count
             new_remaining = (
                 state.plays_remaining + ((pair, lc),) if lc > 0 else state.plays_remaining
             )
+            offsets[pair] = 0  # initialize measure offset
         return dataclasses.replace(
             base,
             playing_loops=new_playing,
             plays_remaining=new_remaining,
+            loop_measure_offsets=tuple(offsets.items()),
         )
 
 
@@ -213,7 +231,7 @@ def _session_transport(state: AppState, event: TransportPressed) -> AppState:
     if event.button == "PLAY":
         return dataclasses.replace(state, is_playing=True)
     if event.button == "STOP":
-        return dataclasses.replace(state, is_playing=False, playhead=0)
+        return dataclasses.replace(state, is_playing=False, playhead=0, loop_measure_offsets=())
     return state
 
 
@@ -325,19 +343,50 @@ def _reduce_instrument(state: AppState, event: Event) -> AppState:
         return _instrument_transport(state, event)
     if isinstance(event, SoftkeyPressed):
         return _instrument_softkey(state, event)
+    if isinstance(event, EncoderTurned):
+        return _instrument_encoder(state, event)
+    if isinstance(event, TouchbarMoved):
+        return _instrument_touchbar(state, event)
     return state
+
+
+def _ensure_loop_length(state: AppState, track_idx: int, loop_idx: int, min_steps: int) -> AppState:
+    """Extend a DrumTrack loop to at least min_steps (in 16-step increments)."""
+    track = state.tracks[track_idx]
+    if track is None or not isinstance(track, DrumTrack):
+        return state
+    loop = track.loops[loop_idx]
+    if loop.step_count >= min_steps:
+        return state
+    new_length = ((min_steps - 1) // 16 + 1) * 16
+    extra = tuple(False for _ in range(new_length - loop.step_count))
+    new_steps = loop.steps + extra
+    new_loop = dataclasses.replace(loop, steps=new_steps)
+    new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+    new_track = dataclasses.replace(track, loops=new_loops)
+    new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+    return dataclasses.replace(state, tracks=new_tracks)
 
 
 def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
     pad = event.pad_index
     loop_idx = state.selected_loop
+    view_m = state.instrument_view_measure
 
     if len(state.armed_tracks) == 1:
         affected_track = state.armed_tracks[0]
-        new_state = _toggle_step(state, affected_track, loop_idx, pad)
+        # step = view_measure*16 + pad (pad 0-15 = bottom row, 16-31 = top row)
+        step_idx = view_m * 16 + pad
+        state = _ensure_loop_length(state, affected_track, loop_idx, step_idx + 1)
+        new_state = _toggle_step(state, affected_track, loop_idx, step_idx)
     else:
-        affected_track = state.armed_tracks[0] if pad < 16 else state.armed_tracks[1]
-        new_state = _toggle_step(state, affected_track, loop_idx, pad % 16)
+        # dual-arm: bottom row → arm1, top row → arm2; both at view_measure
+        row = pad // 16
+        step_in_row = pad % 16
+        affected_track = state.armed_tracks[row] if row < len(state.armed_tracks) else state.armed_tracks[0]
+        step_idx = view_m * 16 + step_in_row
+        state = _ensure_loop_length(state, affected_track, loop_idx, step_idx + 1)
+        new_state = _toggle_step(state, affected_track, loop_idx, step_idx)
 
     # Auto-start any armed loop that just became non-empty.
     new_playing = set(new_state.playing_loops)
@@ -352,7 +401,6 @@ def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
     if changed:
         new_state = dataclasses.replace(new_state, playing_loops=frozenset(new_playing))
 
-    # Remove track if all loops became empty (toggle off last step).
     return _drop_fully_empty_tracks(new_state, (affected_track,))
 
 
@@ -384,39 +432,59 @@ def _instrument_transport(state: AppState, event: TransportPressed) -> AppState:
     if event.button == "PLAY":
         return dataclasses.replace(state, is_playing=True)
     if event.button == "STOP":
-        return dataclasses.replace(state, is_playing=False, playhead=0)
+        return dataclasses.replace(state, is_playing=False, playhead=0, loop_measure_offsets=())
     return state
 
 
 def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
-    if event.key == 0:  # SK1: STEPS — currently active submode; no-op
-        return state
-    if event.key == 1:  # SK2: EXTEND/SHRINK — toggle selected loop step count 16↔32
-        return _toggle_step_count(state)
+    if event.key == 0:  # SK1: STEPS — activate jogwheel (single-arm only)
+        if len(state.armed_tracks) > 1:
+            return state  # disabled in dual-arm
+        new_ctrl = "" if state.instrument_active_ctrl == "STEPS" else "STEPS"
+        return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+    if event.key == 1:  # SK2: MEASURES — activate jogwheel for measure count
+        new_ctrl = "" if state.instrument_active_ctrl == "MEASURES" else "MEASURES"
+        return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
     if event.key == 2:  # SK3: PADS — placeholder
         return state
-    if event.key == 3:  # SK4: BACK — GC any empty armed tracks, then return to SESSION
+    if event.key == 3:  # SK4: BACK — GC empty armed tracks, return to SESSION
         state = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
-        return dataclasses.replace(state, mode=Mode.SESSION)
-    if event.key == 4:  # SK5: CLEAR — only executes with shift held
+        return dataclasses.replace(state, mode=Mode.SESSION, instrument_active_ctrl="")
+    if event.key == 4:  # SK5: CLEAR — shift only
         if state.shift_held:
             return _clear_armed_loops(state)
         return state
     return state
 
 
-def _toggle_step_count(state: AppState) -> AppState:
-    """Toggle the selected loop's step count between 16 and 32 for all armed DrumTracks."""
+def _max_arm_measures(state: AppState) -> int:
+    """Return the highest measure count across all armed loops."""
+    m = 1
+    for idx in state.armed_tracks:
+        track = state.tracks[idx]
+        if track is not None:
+            m = max(m, track.loops[state.selected_loop].step_count // 16)
+    return m
+
+
+def _adjust_measures(state: AppState, delta: int) -> AppState:
+    """Add or remove one measure (16 steps) from all armed DrumTrack loops. delta sign only matters."""
+    step = 1 if delta > 0 else -1
     new_state = state
     for track_idx in state.armed_tracks:
         track = new_state.tracks[track_idx]
         if track is None or not isinstance(track, DrumTrack):
             continue
         loop = track.loops[new_state.selected_loop]
-        if loop.step_count == 16:
-            new_steps = loop.steps + tuple(False for _ in range(16))
+        current_measures = loop.step_count // 16
+        new_measures = max(1, min(8, current_measures + step))
+        if new_measures == current_measures:
+            continue
+        if new_measures > current_measures:
+            added = tuple(False for _ in range((new_measures - current_measures) * 16))
+            new_steps = loop.steps + added
         else:
-            new_steps = loop.steps[:16]
+            new_steps = loop.steps[:new_measures * 16]
         new_loop = dataclasses.replace(loop, steps=new_steps)
         new_loops = (
             track.loops[:new_state.selected_loop]
@@ -430,7 +498,25 @@ def _toggle_step_count(state: AppState) -> AppState:
             + new_state.tracks[track_idx + 1:]
         )
         new_state = dataclasses.replace(new_state, tracks=new_tracks)
-    return new_state
+    # Clamp view_measure to new max
+    max_m = _max_arm_measures(new_state)
+    view = min(new_state.instrument_view_measure, max(0, max_m - 1))
+    return dataclasses.replace(new_state, instrument_view_measure=view)
+
+
+def _instrument_encoder(state: AppState, event: EncoderTurned) -> AppState:
+    if event.encoder != 9:
+        return state
+    if state.instrument_active_ctrl == "MEASURES":
+        return _adjust_measures(state, event.delta)
+    # "STEPS" active: scaffold only, no resize for M1/M2
+    return state
+
+
+def _instrument_touchbar(state: AppState, event: TouchbarMoved) -> AppState:
+    max_m = _max_arm_measures(state)
+    view = max(0, min(max_m - 1, int(event.position * max_m)))
+    return dataclasses.replace(state, instrument_view_measure=view)
 
 
 def _drop_fully_empty_tracks(
@@ -460,6 +546,9 @@ def _drop_fully_empty_tracks(
     if not dropped:
         return state
     new_mode = Mode.SESSION if not new_armed else state.mode
+    new_offsets = tuple(
+        (k, v) for k, v in state.loop_measure_offsets if k[0] not in dropped
+    )
     return dataclasses.replace(
         state,
         tracks=tuple(tracks),
@@ -468,6 +557,7 @@ def _drop_fully_empty_tracks(
         muted_tracks=state.muted_tracks - dropped,
         soloed_tracks=state.soloed_tracks - dropped,
         mode=new_mode,
+        loop_measure_offsets=new_offsets,
     )
 
 

@@ -51,3 +51,8 @@ class ShiftChanged(Event):
 @dataclass(frozen=True)
 class SoftkeyPressed(Event):
     key: int  # 0-4 (SK1=0 through SK5=4)
+
+
+@dataclass(frozen=True)
+class TouchbarMoved(Event):
+    position: float  # 0.0 = left end, 1.0 = right end (pitchwheel -8192 → +8191)

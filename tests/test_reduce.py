@@ -26,6 +26,7 @@ from eden.events import (
     ModeButtonPressed,
     PadPressed,
     SoftkeyPressed,
+    TouchbarMoved,
     TransportPressed,
     ShiftChanged,
 )
@@ -111,22 +112,25 @@ def test_clock_wraps_at_16_in_single_arm_instrument_with_16step_loop():
     assert result.playhead == 0  # wraps at 16, not 32
 
 
-def test_clock_wraps_at_32_in_single_arm_instrument():
-    """Playhead wraps 31→0 in single-arm INSTRUMENT when the loop is 32-step."""
-    base = _armed_instrument(armed=(0,))
-    track = base.tracks[0]
-    assert isinstance(track, DrumTrack)
-    long_loop = default_loop(32)
-    new_loops = track.loops[:1] + (long_loop,) + track.loops[2:]  # replace loop 1 (selected)
-    new_track = dataclasses.replace(track, loops=new_loops)
+def test_clock_always_wraps_at_16_for_multi_measure_loop():
+    """Global playhead always wraps at 16 even when a playing loop has >16 steps."""
+    state = default_state()
+    # Make track 0 loop 0 a 32-step loop and put it in playing_loops
+    t0 = state.tracks[0]
+    long_loop = Loop(steps=tuple(i % 2 == 0 for i in range(32)))
+    new_loops = (long_loop,) + t0.loops[1:]
+    t0_new = dataclasses.replace(t0, loops=new_loops)
     state = dataclasses.replace(
-        base,
-        tracks=(new_track,) + base.tracks[1:],
+        state,
+        tracks=(t0_new,) + state.tracks[1:],
         is_playing=True,
-        playhead=31,
+        playhead=15,
     )
     result = reduce(state, ClockTicked())
-    assert result.playhead == 0
+    assert result.playhead == 0  # wraps at 16, not 32
+    # Measure offset for (0,0) advances to 1 on wrap
+    offsets = dict(result.loop_measure_offsets)
+    assert offsets.get((0, 0), 0) == 1
 
 
 # ── ShiftChanged ──────────────────────────────────────────────────────────────
@@ -700,33 +704,109 @@ def test_dual_arm_track2_all_empty_stays_armed():
     assert after_toggle.mode is Mode.INSTRUMENT
 
 
-# ── Instrument SK2: EXTEND / SHRINK ──────────────────────────────────────────
+# ── Instrument SK2: MEASURES ──────────────────────────────────────────────────
 
 
-def test_instrument_sk2_extends_loop_from_16_to_32():
-    """SK2 (EXTEND) doubles the selected loop from 16 to 32 steps."""
+def test_instrument_sk2_activates_measures_ctrl():
+    """SK2 toggles instrument_active_ctrl to 'MEASURES'."""
     state = _armed_instrument(armed=(0,))
+    result = reduce(state, SoftkeyPressed(key=1))
+    assert result.instrument_active_ctrl == "MEASURES"
+    # Pressing again deactivates
+    result2 = reduce(result, SoftkeyPressed(key=1))
+    assert result2.instrument_active_ctrl == ""
+
+
+def test_instrument_measures_jogwheel_adds_measure():
+    """Jogwheel right while MEASURES active adds a 16-step measure."""
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="MEASURES")
     assert state.tracks[0].loops[1].step_count == 16
-    result = reduce(state, SoftkeyPressed(key=1))
+    result = reduce(state, EncoderTurned(encoder=9, delta=1))
     assert result.tracks[0].loops[1].step_count == 32
-    assert len(result.tracks[0].loops[1].steps) == 32
 
 
-def test_instrument_sk2_shrinks_loop_from_32_to_16():
-    """SK2 (SHRINK) halves the selected loop from 32 to 16 steps."""
+def test_instrument_measures_jogwheel_removes_measure():
+    """Jogwheel left while MEASURES active removes the last measure."""
     state = _armed_instrument(armed=(0,))
-    extended = reduce(state, SoftkeyPressed(key=1))
-    assert extended.tracks[0].loops[1].step_count == 32
-    shrunk = reduce(extended, SoftkeyPressed(key=1))
-    assert shrunk.tracks[0].loops[1].step_count == 16
+    state = dataclasses.replace(state, instrument_active_ctrl="MEASURES")
+    # First extend to 32 steps
+    state = reduce(state, EncoderTurned(encoder=9, delta=1))
+    assert state.tracks[0].loops[1].step_count == 32
+    # Then shrink back
+    result = reduce(state, EncoderTurned(encoder=9, delta=-1))
+    assert result.tracks[0].loops[1].step_count == 16
 
 
-def test_instrument_sk2_extend_applies_to_both_armed_tracks():
-    """SK2 extends the selected loop for all armed DrumTracks simultaneously."""
+def test_instrument_measures_min_is_1():
+    """Measure count cannot go below 1."""
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="MEASURES")
+    result = reduce(state, EncoderTurned(encoder=9, delta=-5))
+    assert result.tracks[0].loops[1].step_count == 16  # stays at 1 measure
+
+
+def test_instrument_measures_max_is_8():
+    """Measure count caps at 8 (128 steps)."""
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="MEASURES")
+    # Each call adds 1 measure; apply 10 times to confirm we cap at 8
+    for _ in range(10):
+        state = reduce(state, EncoderTurned(encoder=9, delta=1))
+    assert state.tracks[0].loops[1].step_count == 128
+
+
+def test_instrument_measures_applies_to_both_armed_tracks():
+    """MEASURES jogwheel extends both armed tracks simultaneously."""
     state = _armed_instrument(armed=(0, 1))
-    result = reduce(state, SoftkeyPressed(key=1))
+    state = dataclasses.replace(state, instrument_active_ctrl="MEASURES")
+    result = reduce(state, EncoderTurned(encoder=9, delta=1))
     assert result.tracks[0].loops[1].step_count == 32
     assert result.tracks[1].loops[1].step_count == 32
+
+
+def test_instrument_sk1_disabled_in_dual_arm():
+    """SK1/STEPS is disabled (no-op) when two tracks are armed."""
+    state = _armed_instrument(armed=(0, 1))
+    result = reduce(state, SoftkeyPressed(key=0))
+    assert result.instrument_active_ctrl == ""
+
+
+def test_instrument_touchbar_sets_view_measure():
+    """TouchbarMoved updates instrument_view_measure proportionally."""
+    state = _armed_instrument(armed=(0,))
+    # Extend to 4 measures
+    state = dataclasses.replace(state, instrument_active_ctrl="MEASURES")
+    for _ in range(3):
+        state = reduce(state, EncoderTurned(encoder=9, delta=1))
+    assert state.tracks[0].loops[1].step_count == 64  # 4 measures
+    state = dataclasses.replace(state, instrument_active_ctrl="")
+    # TouchbarMoved at 0.75 → should select measure 3 (of 4)
+    result = reduce(state, TouchbarMoved(position=0.75))
+    assert result.instrument_view_measure == 3
+
+
+def test_instrument_pad_uses_view_measure():
+    """Pad press in INSTRUMENT mode uses instrument_view_measure to offset step index."""
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="MEASURES")
+    state = reduce(state, EncoderTurned(encoder=9, delta=1))  # extend to 32 steps
+    state = dataclasses.replace(state, instrument_active_ctrl="", instrument_view_measure=1)
+    # Press pad 0 with view_measure=1 → should toggle step 16 (not step 0)
+    result = reduce(state, PadPressed(pad_index=0, velocity=100))
+    assert result.tracks[0].loops[1].steps[16] is True
+    assert result.tracks[0].loops[1].steps[0] is False
+
+
+def test_instrument_pad_auto_extends_loop_when_editing_beyond_length():
+    """Pressing a pad beyond the current loop length auto-extends it."""
+    state = _armed_instrument(armed=(0,))
+    # Loop 1 has 16 steps. Set view_measure=1 and press pad 0 → step 16.
+    state = dataclasses.replace(state, instrument_view_measure=1)
+    result = reduce(state, PadPressed(pad_index=0, velocity=100))
+    # Loop should have been extended to 32 steps
+    assert result.tracks[0].loops[1].step_count == 32
+    assert result.tracks[0].loops[1].steps[16] is True
 
 
 # ── Garbage collection of empty tracks ───────────────────────────────────────
