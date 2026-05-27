@@ -18,6 +18,8 @@ import threading
 import time
 from typing import Callable
 
+_DEBUG_MIDI = os.environ.get("DEBUG_MIDI", "").lower() in ("1", "true", "yes")
+
 import mido
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -312,6 +314,9 @@ class AtomSQ:
     def _dispatch_midi(self, msg: mido.Message) -> None:
         if not hasattr(msg, "channel"):
             return  # sysex, clock, active-sense — no channel attribute
+
+        if _DEBUG_MIDI and msg.type == "control_change":
+            print(f"[MIDI] cc ch={msg.channel} ctrl={msg.control} val={msg.value}")
 
         # Blocks-mode pad presses: channel 0, notes 36-67 (linear chromatic).
         # Confirmed in both standard mode and native mode via hardware sniff.

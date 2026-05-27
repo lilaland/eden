@@ -38,7 +38,7 @@ from eden.clock import SequencerClock
 from eden.reduce import reduce
 from eden.render import render_pads, render_oled, render_button_leds
 from eden.state import default_state, AppState
-from eden.events import ClockTicked
+from eden.events import ClockTicked, SoftkeyPressed
 from eden.theme import ACCENT_GOLD
 
 try:
@@ -116,6 +116,9 @@ class EdenApp:
                 continue
 
             new_state = reduce(self._state, event)
+
+            if isinstance(event, SoftkeyPressed):
+                print(f"[EVENT] SoftkeyPressed key={event.key}  armed={new_state.armed_tracks}  mode={new_state.mode.name}")
 
             if new_state is not self._state:
                 self._state = new_state

@@ -71,13 +71,14 @@ BTN_USER    = 35   # CC 0x23
 BTN_BACK    = 42   # CC 0x2A
 BTN_FORWARD = 43   # CC 0x2B
 
-# ─── Screen soft keys (standard MIDI mode) ────────────────────────────────────
-# 5 soft keys on channel 2 (MIDI ch 3), CC 24–28, left→right order.         [SNIFF x2]
-# JamesB-VS defines 6 OLED button slots; device has 5 physical keys.
-# Physical order: SK1=CC24, SK2=CC25, SK3=CC26, SK4=CC27, SK5=CC28.
+# ─── Screen soft keys (native mode, hardware-verified 2026-05-27) ────────────
+# 6 soft keys on channel 0 (MIDI ch 1), CC 36–41, left→right order.         [SNIFF]
+# Physical order: SK1=CC36, SK2=CC37, SK3=CC38, SK4=CC39, SK5=CC40, SK6=CC41.
+# Press = value 127, release = value 0 (both sent; only press is dispatched).
+# Previous values (ch 2, CC 24–28) were wrong — not verified against hardware.
 
-SOFT_KEY_CHANNEL = 2
-SOFT_KEY_CC = [24, 25, 26, 27, 28]
+SOFT_KEY_CHANNEL = 0
+SOFT_KEY_CC = [36, 37, 38, 39, 40, 41]
 
 # ─── Native-mode protocol ─────────────────────────────────────────────────────
 

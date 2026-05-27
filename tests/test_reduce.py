@@ -644,11 +644,9 @@ def test_instrument_sk5_clear_dual_arm_clears_both_tracks():
     assert all(s is False for s in result.tracks[1].loops[1].steps)
 
 
-def test_clear_removes_track_when_all_loops_empty():
-    """Clearing the only non-empty loop removes the track and returns to SESSION."""
-    # Build a track with steps ONLY in loop 1 (the selected loop), no starter patterns.
+def test_clear_armed_track_persists_until_back():
+    """CLEAR empties the steps but the armed slot stays alive until BACK is pressed."""
     state = _armed_instrument(armed=(0,))
-    # Blank out loop 0's starter pattern so only loop 1 has steps.
     t0 = state.tracks[0]
     blank_loop0 = default_loop(16)
     new_loops = (blank_loop0,) + t0.loops[1:]
@@ -656,25 +654,50 @@ def test_clear_removes_track_when_all_loops_empty():
     state = dataclasses.replace(state, tracks=(new_t0,) + state.tracks[1:])
     state = _step_on(state, track_idx=0, loop_idx=1, step=3)
     state = dataclasses.replace(state, shift_held=True)
-    result = reduce(state, SoftkeyPressed(key=4))  # SK5 CLEAR
-    assert result.tracks[0] is None
-    assert result.mode is Mode.SESSION
-    assert all(p[0] != 0 for p in result.playing_loops)
+    after_clear = reduce(state, SoftkeyPressed(key=4))  # SK5 CLEAR
+    # Steps cleared, but track and mode persist.
+    assert all(s is False for s in after_clear.tracks[0].loops[1].steps)
+    assert after_clear.tracks[0] is not None
+    assert after_clear.mode is Mode.INSTRUMENT
+    # BACK now GCs the empty armed track.
+    after_back = reduce(after_clear, SoftkeyPressed(key=3))
+    assert after_back.tracks[0] is None
+    assert after_back.mode is Mode.SESSION
 
 
-def test_pad_toggle_removes_track_when_all_loops_empty():
-    """Toggling off the last step drops the track and returns to SESSION."""
+def test_pad_toggle_armed_track_persists_until_back():
+    """Toggling off the last step keeps the armed slot alive; BACK GCs it."""
     state = _armed_instrument(armed=(0,))
     t0 = state.tracks[0]
     blank_loop0 = default_loop(16)
     new_loops = (blank_loop0,) + t0.loops[1:]
     new_t0 = dataclasses.replace(t0, loops=new_loops)
     state = dataclasses.replace(state, tracks=(new_t0,) + state.tracks[1:])
-    # Add exactly one step to loop 1 then toggle it off.
     state = _step_on(state, track_idx=0, loop_idx=1, step=2)
-    result = reduce(state, PadPressed(pad_index=2, velocity=100))  # toggles step 2 OFF
-    assert result.tracks[0] is None
-    assert result.mode is Mode.SESSION
+    after_toggle = reduce(state, PadPressed(pad_index=2, velocity=100))  # step off
+    assert after_toggle.tracks[0] is not None
+    assert after_toggle.mode is Mode.INSTRUMENT
+    after_back = reduce(after_toggle, SoftkeyPressed(key=3))
+    assert after_back.tracks[0] is None
+    assert after_back.mode is Mode.SESSION
+
+
+def test_dual_arm_track2_all_empty_stays_armed():
+    """Removing all steps from arm2 does NOT disarm it — dual editing persists."""
+    state = _armed_instrument(armed=(0, 1))
+    # Blank every loop of track 1 so it has zero content anywhere.
+    t1 = state.tracks[1]
+    blank_loops = tuple(default_loop(16) for _ in range(16))
+    t1_blank = dataclasses.replace(t1, loops=blank_loops)
+    state = dataclasses.replace(state, tracks=(state.tracks[0], t1_blank) + state.tracks[2:])
+    # Add one step to the selected loop, then toggle it back off.
+    state = _step_on(state, track_idx=1, loop_idx=1, step=5)
+    # In dual-arm INSTRUMENT: top-row pad (pad >= 16) → armed_tracks[1], step = pad % 16
+    after_toggle = reduce(state, PadPressed(pad_index=16 + 5, velocity=100))
+    # Track 1 is now fully empty but must stay alive (still armed).
+    assert after_toggle.armed_tracks == (0, 1)
+    assert after_toggle.tracks[1] is not None
+    assert after_toggle.mode is Mode.INSTRUMENT
 
 
 # ── Instrument SK2: EXTEND / SHRINK ──────────────────────────────────────────
@@ -704,6 +727,77 @@ def test_instrument_sk2_extend_applies_to_both_armed_tracks():
     result = reduce(state, SoftkeyPressed(key=1))
     assert result.tracks[0].loops[1].step_count == 32
     assert result.tracks[1].loops[1].step_count == 32
+
+
+# ── Garbage collection of empty tracks ───────────────────────────────────────
+
+
+def test_session_pad_switch_gcs_empty_track():
+    """Pressing a different bottom pad nulls out the previous selected track if all its loops are empty."""
+    s = default_state()
+    # Track 2 is None; press pad 2 to create it (all-empty DrumTrack).
+    s = reduce(s, PadPressed(pad_index=2, velocity=100))
+    assert s.tracks[2] is not None
+    assert s.selected_track == 2
+    # Now press pad 0 — track 2 has no steps, so it should be GC'd back to None.
+    s = reduce(s, PadPressed(pad_index=0, velocity=100))
+    assert s.tracks[2] is None
+
+
+def test_session_pad_switch_preserves_nonempty_track():
+    """Switching pads does NOT GC a track that has content."""
+    s = default_state()  # track 0 has a kick pattern
+    s = reduce(s, PadPressed(pad_index=1, velocity=100))
+    assert s.tracks[0] is not None
+
+
+def test_session_pad_same_pad_no_gc():
+    """Re-pressing the same pad does not GC the current track."""
+    s = default_state()
+    s = reduce(s, PadPressed(pad_index=0, velocity=100))
+    assert s.tracks[0] is not None
+
+
+def test_session_pad_switch_gcs_muted_empty_track():
+    """GC of an empty track also removes it from muted_tracks."""
+    s = default_state()
+    s = reduce(s, PadPressed(pad_index=2, velocity=100))  # create empty track 2
+    s = dataclasses.replace(s, muted_tracks=frozenset({2}))
+    s = reduce(s, PadPressed(pad_index=0, velocity=100))  # switch away → GC track 2
+    assert s.tracks[2] is None
+    assert 2 not in s.muted_tracks
+
+
+def test_instrument_back_gcs_empty_armed_track():
+    """BACK from INSTRUMENT nulls the armed slot when no steps were added."""
+    s = default_state()
+    # Create an empty track at slot 2 and enter INSTRUMENT on it.
+    s = reduce(s, PadPressed(pad_index=2, velocity=100))
+    s = reduce(s, ModeButtonPressed(button="INST", pressed=True))
+    assert s.mode is Mode.INSTRUMENT
+    assert s.tracks[2] is not None
+    # Press BACK without adding any steps → track 2 should be GC'd.
+    s = reduce(s, SoftkeyPressed(key=3))
+    assert s.mode is Mode.SESSION
+    assert s.tracks[2] is None
+
+
+def test_instrument_back_preserves_nonempty_armed_track():
+    """BACK from INSTRUMENT keeps the armed track when it has content."""
+    s = _armed_instrument(armed=(0,))
+    s = reduce(s, PadPressed(pad_index=0, velocity=100))  # add a step
+    s = reduce(s, SoftkeyPressed(key=3))                  # BACK
+    assert s.tracks[0] is not None
+
+
+def test_song_button_from_instrument_gcs_empty_armed_track():
+    """SONG button from INSTRUMENT also GCs empty armed tracks."""
+    s = default_state()
+    s = reduce(s, PadPressed(pad_index=2, velocity=100))
+    s = reduce(s, ModeButtonPressed(button="INST", pressed=True))
+    s = reduce(s, ModeButtonPressed(button="SONG", pressed=True))
+    assert s.mode is Mode.SESSION
+    assert s.tracks[2] is None
 
 
 # ── Immutability ──────────────────────────────────────────────────────────────

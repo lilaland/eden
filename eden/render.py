@@ -203,9 +203,18 @@ def render_oled(state: AppState) -> dict[int, str]:
         loop_count_str = "inf" if loop_count == 0 else f"{loop_count}x"
 
         _set(OLED_MAIN_LINE1, track_name)
-        _set(OLED_MAIN_LINE2, f"LOOP {loop_count_str}")
-        _set(OLED_BTN1_TITLE, "MUTE")
-        _set(OLED_BTN2_TITLE, "SOLO")
+
+        if state.armed_tracks:
+            names = []
+            for idx in state.armed_tracks[:2]:
+                t = state.tracks[idx]
+                names.append(t.name if t is not None else f"T{idx + 1}")
+            _set(OLED_MAIN_LINE2, "ARM: " + "+".join(names))
+        else:
+            _set(OLED_MAIN_LINE2, f"LOOP {loop_count_str}")
+
+        _set(OLED_BTN1_TITLE, "UNMUTE" if state.selected_track in state.muted_tracks else "MUTE")
+        _set(OLED_BTN2_TITLE, "UNSOLO" if state.selected_track in state.soloed_tracks else "SOLO")
         _set(OLED_BTN3_TITLE, f"LOOP x{loop_count_str}")
 
         # SK4: ARM1 — name + slot/loop when armed, else label

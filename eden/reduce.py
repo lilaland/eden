@@ -127,6 +127,7 @@ def _on_mode_button(state: AppState, event: ModeButtonPressed) -> AppState:
             instrument_submode=InstrumentSubmode.STEPS,
         )
     if event.button == "SONG":
+        state = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
         return dataclasses.replace(state, mode=Mode.SESSION)
     # EDIT, USER, BACK, FORWARD — no-op for M1/M2
     return state
@@ -150,7 +151,10 @@ def _reduce_session(state: AppState, event: Event) -> AppState:
 def _session_pad_pressed(state: AppState, event: PadPressed) -> AppState:
     pad = event.pad_index
     if pad < 16:
-        # Bottom row: select track; auto-select loop 0; create DrumTrack if slot is empty
+        # Bottom row: select track; auto-select loop 0; create DrumTrack if slot is empty.
+        # GC the previously selected track if it has no content and we're moving away from it.
+        if pad != state.selected_track:
+            state = _drop_fully_empty_tracks(state, (state.selected_track,))
         track = state.tracks[pad]
         if track is None:
             name, sample = _TRACK_DEFAULTS[pad]
@@ -391,7 +395,8 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
         return _toggle_step_count(state)
     if event.key == 2:  # SK3: PADS — placeholder
         return state
-    if event.key == 3:  # SK4: BACK — return to SESSION
+    if event.key == 3:  # SK4: BACK — GC any empty armed tracks, then return to SESSION
+        state = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
         return dataclasses.replace(state, mode=Mode.SESSION)
     if event.key == 4:  # SK5: CLEAR — only executes with shift held
         if state.shift_held:
@@ -428,22 +433,31 @@ def _toggle_step_count(state: AppState) -> AppState:
     return new_state
 
 
-def _drop_fully_empty_tracks(state: AppState, track_indices: tuple[int, ...]) -> AppState:
-    """Remove tracks whose every loop is empty: clears the slot, armed list, playing loops.
-    Returns to SESSION if no armed tracks remain."""
+def _drop_fully_empty_tracks(
+    state: AppState, track_indices: tuple[int, ...], *, skip_armed: bool = True
+) -> AppState:
+    """Remove tracks whose every loop is empty: clears the slot, armed/muted/soloed sets, playing loops.
+    Returns to SESSION if no armed tracks remain.
+
+    skip_armed=True (default): armed tracks are never GC'd — they persist until the caller
+    explicitly sets skip_armed=False (used only at mode-switch-to-SESSION boundaries).
+    """
+    protected = set(state.armed_tracks) if skip_armed else set()
     tracks = list(state.tracks)
     new_armed = list(state.armed_tracks)
     new_playing = set(state.playing_loops)
-    changed = False
+    dropped: set[int] = set()
     for idx in track_indices:
+        if idx in protected:
+            continue
         track = tracks[idx]
         if track is not None and all(loop.is_empty for loop in track.loops):
             tracks[idx] = None
             if idx in new_armed:
                 new_armed.remove(idx)
             new_playing = {p for p in new_playing if p[0] != idx}
-            changed = True
-    if not changed:
+            dropped.add(idx)
+    if not dropped:
         return state
     new_mode = Mode.SESSION if not new_armed else state.mode
     return dataclasses.replace(
@@ -451,6 +465,8 @@ def _drop_fully_empty_tracks(state: AppState, track_indices: tuple[int, ...]) ->
         tracks=tuple(tracks),
         armed_tracks=tuple(new_armed),
         playing_loops=frozenset(new_playing),
+        muted_tracks=state.muted_tracks - dropped,
+        soloed_tracks=state.soloed_tracks - dropped,
         mode=new_mode,
     )
 

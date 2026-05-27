@@ -260,9 +260,29 @@ def test_render_oled_session_main_line1_track_name():
 
 
 def test_render_oled_session_btn1_is_mute():
-    """Test 17: SESSION mode BTN1_TITLE = 'MUTE'."""
+    """Test 17: SESSION mode BTN1_TITLE = 'MUTE' when selected track is not muted."""
     oled = render_oled(default_state())
     assert oled[OLED_BTN1_TITLE] == "MUTE"
+
+
+def test_render_oled_session_btn1_is_unmute_when_muted():
+    """BTN1_TITLE = 'UNMUTE' when selected track is muted."""
+    s = dataclasses.replace(default_state(), muted_tracks=frozenset({0}))
+    oled = render_oled(s)
+    assert oled[OLED_BTN1_TITLE] == "UNMUTE"
+
+
+def test_render_oled_session_btn2_is_unsolo_when_soloed():
+    """BTN2_TITLE = 'UNSOLO' when selected track is soloed."""
+    s = dataclasses.replace(default_state(), soloed_tracks=frozenset({0}))
+    oled = render_oled(s)
+    assert oled[OLED_BTN2_TITLE] == "UNSOLO"
+
+
+def test_render_oled_session_btn2_is_solo_when_not_soloed():
+    """BTN2_TITLE = 'SOLO' when selected track is not soloed."""
+    oled = render_oled(default_state())
+    assert oled[OLED_BTN2_TITLE] == "SOLO"
 
 
 def test_render_oled_session_btn4_is_arm1_when_unarmed():
@@ -316,6 +336,28 @@ def test_render_oled_session_loop_count_zero_shows_inf():
     # default state has loop_count=0 on all loops
     oled = render_oled(default_state())
     assert "inf" in oled[OLED_MAIN_LINE2]
+
+
+def test_render_oled_session_arm1_updates_main_line2():
+    """ARM1 set → MAIN_LINE2 shows ARM: <name> for immediate OLED feedback."""
+    s = dataclasses.replace(default_state(), armed_tracks=(0,))
+    oled = render_oled(s)
+    assert "ARM" in oled[OLED_MAIN_LINE2]
+    assert "KICK" in oled[OLED_MAIN_LINE2]
+
+
+def test_render_oled_session_arm2_updates_main_line2():
+    """ARM1+ARM2 set → MAIN_LINE2 shows ARM: <name1>+<name2>."""
+    s = dataclasses.replace(default_state(), armed_tracks=(0, 1))
+    oled = render_oled(s)
+    assert "KICK" in oled[OLED_MAIN_LINE2]
+    assert "SNARE" in oled[OLED_MAIN_LINE2]
+
+
+def test_render_oled_session_no_arm_shows_loop():
+    """No arms → MAIN_LINE2 shows loop info (not arm info)."""
+    oled = render_oled(default_state())
+    assert "LOOP" in oled[OLED_MAIN_LINE2]
 
 
 # ── render_button_leds ────────────────────────────────────────────────────────
