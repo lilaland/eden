@@ -208,23 +208,25 @@ def render_oled(state: AppState) -> dict[int, str]:
         _set(OLED_BTN2_TITLE, "SOLO")
         _set(OLED_BTN3_TITLE, f"LOOP x{loop_count_str}")
 
-        # SK4: ARM1 — shows armed track name + loop, or "ARM1" if not armed
+        # SK4: ARM1 — name + slot/loop when armed, else label
         if state.armed_tracks:
             t0 = state.armed_tracks[0]
             t0_track = state.tracks[t0]
-            t0_name = t0_track.name[:4] if t0_track is not None else f"T{t0}"
-            _set(OLED_BTN4_TITLE, f"{t0_name}:{state.selected_loop}")
+            t0_name = t0_track.name if t0_track is not None else f"T{t0 + 1}"
+            _set(OLED_BTN4_TITLE, t0_name)
+            _set(OLED_BTN4_VALUE, f"S{t0 + 1} L{state.selected_loop + 1}")
         else:
             _set(OLED_BTN4_TITLE, "ARM1")
 
-        # SK5: ARM2 — shows arm2 track info, ARM PADS offer, or "ARM2"
+        # SK5: ARM2 — name + slot/loop when armed, ARM PADS offer, or label
         if state.arm_pads_offer_loop is not None:
             _set(OLED_BTN5_TITLE, "ARM PADS")
         elif len(state.armed_tracks) >= 2:
             t1 = state.armed_tracks[1]
             t1_track = state.tracks[t1]
-            t1_name = t1_track.name[:4] if t1_track is not None else f"T{t1}"
-            _set(OLED_BTN5_TITLE, f"{t1_name}:{state.selected_loop}")
+            t1_name = t1_track.name if t1_track is not None else f"T{t1 + 1}"
+            _set(OLED_BTN5_TITLE, t1_name)
+            _set(OLED_BTN5_VALUE, f"S{t1 + 1} L{state.selected_loop + 1}")
         else:
             _set(OLED_BTN5_TITLE, "ARM2")
 

@@ -364,33 +364,60 @@ def test_sk3_cycles_loop_count_full_sequence():
     assert s5.tracks[0].loops[0].loop_count == 0
 
 
-def test_sk4_arms_single_and_enters_instrument():
-    """SK4 arms selected track, switches mode to INSTRUMENT, sets single-arm."""
+def test_sk4_sets_arm1_stays_in_session():
+    """SK4 sets arm1 to selected track and stays in SESSION."""
     state = dataclasses.replace(default_state(), selected_track=1)
     result = reduce(state, SoftkeyPressed(key=3))
     assert result.armed_tracks == (1,)
-    assert result.mode is Mode.INSTRUMENT
-    assert result.instrument_submode is InstrumentSubmode.STEPS
+    assert result.mode is Mode.SESSION
 
 
-def test_sk5_arms_two_tracks_and_enters_instrument():
-    """SK5 adds tracks one at a time; two presses arms 2 tracks and enters INSTRUMENT."""
-    state = dataclasses.replace(default_state(), selected_track=0)
-    # First press on track 0
-    s1 = reduce(state, SoftkeyPressed(key=4))
-    assert s1.armed_tracks == (0,)
-    assert s1.mode is Mode.SESSION  # still waiting for second
-
-    # Move to track 1, second press
-    s1 = dataclasses.replace(s1, selected_track=1)
-    s2 = reduce(s1, SoftkeyPressed(key=4))
-    assert s2.armed_tracks == (0, 1)
-    assert s2.mode is Mode.INSTRUMENT
-    assert s2.instrument_submode is InstrumentSubmode.STEPS
+def test_sk4_replaces_arm1_with_different_track():
+    """SK4 on a different track replaces arm1."""
+    state = dataclasses.replace(default_state(), selected_track=2, armed_tracks=(0,))
+    result = reduce(state, SoftkeyPressed(key=3))
+    assert result.armed_tracks == (2,)
+    assert result.mode is Mode.SESSION
 
 
-def test_sk5_ignores_already_armed_track():
-    """SK5 is a no-op when selected track is already arm1 (not arm2)."""
+def test_sk4_replaces_arm1_preserves_arm2():
+    """SK4 replacing arm1 keeps arm2 if arm2 differs from the new arm1."""
+    state = dataclasses.replace(default_state(), selected_track=2, armed_tracks=(0, 1))
+    result = reduce(state, SoftkeyPressed(key=3))
+    assert result.armed_tracks == (2, 1)
+
+
+def test_sk4_replaces_arm1_drops_arm2_if_conflict():
+    """SK4 replacing arm1 drops arm2 when new arm1 == arm2."""
+    state = dataclasses.replace(default_state(), selected_track=1, armed_tracks=(0, 1))
+    result = reduce(state, SoftkeyPressed(key=3))
+    assert result.armed_tracks == (1,)
+
+
+def test_sk5_requires_arm1_first():
+    """SK5 is a no-op when no arm1 is set."""
+    state = dataclasses.replace(default_state(), selected_track=1, armed_tracks=())
+    result = reduce(state, SoftkeyPressed(key=4))
+    assert result.armed_tracks == ()
+
+
+def test_sk5_sets_arm2_stays_in_session():
+    """SK5 sets arm2 and stays in SESSION."""
+    state = dataclasses.replace(default_state(), selected_track=1, armed_tracks=(0,))
+    result = reduce(state, SoftkeyPressed(key=4))
+    assert result.armed_tracks == (0, 1)
+    assert result.mode is Mode.SESSION
+
+
+def test_sk5_replaces_arm2_with_different_track():
+    """SK5 on a new track replaces arm2."""
+    state = dataclasses.replace(default_state(), selected_track=2, armed_tracks=(0, 1))
+    result = reduce(state, SoftkeyPressed(key=4))
+    assert result.armed_tracks == (0, 2)
+
+
+def test_sk5_ignores_arm1_track():
+    """SK5 is a no-op when selected track is already arm1."""
     state = dataclasses.replace(default_state(), selected_track=0, armed_tracks=(0,))
     result = reduce(state, SoftkeyPressed(key=4))
     assert result.armed_tracks == (0,)
@@ -615,6 +642,39 @@ def test_instrument_sk5_clear_dual_arm_clears_both_tracks():
     result = reduce(state, SoftkeyPressed(key=4))
     assert all(s is False for s in result.tracks[0].loops[1].steps)
     assert all(s is False for s in result.tracks[1].loops[1].steps)
+
+
+def test_clear_removes_track_when_all_loops_empty():
+    """Clearing the only non-empty loop removes the track and returns to SESSION."""
+    # Build a track with steps ONLY in loop 1 (the selected loop), no starter patterns.
+    state = _armed_instrument(armed=(0,))
+    # Blank out loop 0's starter pattern so only loop 1 has steps.
+    t0 = state.tracks[0]
+    blank_loop0 = default_loop(16)
+    new_loops = (blank_loop0,) + t0.loops[1:]
+    new_t0 = dataclasses.replace(t0, loops=new_loops)
+    state = dataclasses.replace(state, tracks=(new_t0,) + state.tracks[1:])
+    state = _step_on(state, track_idx=0, loop_idx=1, step=3)
+    state = dataclasses.replace(state, shift_held=True)
+    result = reduce(state, SoftkeyPressed(key=4))  # SK5 CLEAR
+    assert result.tracks[0] is None
+    assert result.mode is Mode.SESSION
+    assert all(p[0] != 0 for p in result.playing_loops)
+
+
+def test_pad_toggle_removes_track_when_all_loops_empty():
+    """Toggling off the last step drops the track and returns to SESSION."""
+    state = _armed_instrument(armed=(0,))
+    t0 = state.tracks[0]
+    blank_loop0 = default_loop(16)
+    new_loops = (blank_loop0,) + t0.loops[1:]
+    new_t0 = dataclasses.replace(t0, loops=new_loops)
+    state = dataclasses.replace(state, tracks=(new_t0,) + state.tracks[1:])
+    # Add exactly one step to loop 1 then toggle it off.
+    state = _step_on(state, track_idx=0, loop_idx=1, step=2)
+    result = reduce(state, PadPressed(pad_index=2, velocity=100))  # toggles step 2 OFF
+    assert result.tracks[0] is None
+    assert result.mode is Mode.SESSION
 
 
 # ── Instrument SK2: EXTEND / SHRINK ──────────────────────────────────────────

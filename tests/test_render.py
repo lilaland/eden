@@ -23,6 +23,7 @@ from controller_map import (
     OLED_MAIN_LINE1, OLED_MAIN_LINE2,
     OLED_BTN1_TITLE, OLED_BTN2_TITLE, OLED_BTN3_TITLE,
     OLED_BTN4_TITLE, OLED_BTN5_TITLE,
+    OLED_BTN4_VALUE, OLED_BTN5_VALUE,
     NATIVE_LED_PLAY, NATIVE_LED_STOP, NATIVE_LED_INST, NATIVE_LED_SONG,
 )
 
@@ -264,10 +265,32 @@ def test_render_oled_session_btn1_is_mute():
     assert oled[OLED_BTN1_TITLE] == "MUTE"
 
 
-def test_render_oled_session_btn4_is_arm1():
-    """Test 18: SESSION mode BTN4_TITLE = 'ARM1'."""
+def test_render_oled_session_btn4_is_arm1_when_unarmed():
+    """Test 18: SESSION mode BTN4_TITLE = 'ARM1' when nothing armed."""
     oled = render_oled(default_state())
     assert oled[OLED_BTN4_TITLE] == "ARM1"
+
+
+def test_render_oled_session_arm1_shows_name_slot_loop():
+    """ARM1 set: BTN4_TITLE = track name, BTN4_VALUE = 'S{slot} L{loop}'."""
+    s = dataclasses.replace(default_state(), armed_tracks=(0,), selected_loop=2)
+    oled = render_oled(s)
+    assert oled[OLED_BTN4_TITLE] == "KICK"
+    assert oled[OLED_BTN4_VALUE] == "S1 L3"
+
+
+def test_render_oled_session_arm2_shows_name_slot_loop():
+    """ARM2 set: BTN5_TITLE = track name, BTN5_VALUE = 'S{slot} L{loop}'."""
+    s = dataclasses.replace(default_state(), armed_tracks=(0, 1), selected_loop=0)
+    oled = render_oled(s)
+    assert oled[OLED_BTN5_TITLE] == "SNARE"
+    assert oled[OLED_BTN5_VALUE] == "S2 L1"
+
+
+def test_render_oled_session_btn5_is_arm2_when_unarmed():
+    """BTN5_TITLE = 'ARM2' when no arm2 is set."""
+    oled = render_oled(default_state())
+    assert oled[OLED_BTN5_TITLE] == "ARM2"
 
 
 def test_render_oled_instrument_single_arm_main_line1():

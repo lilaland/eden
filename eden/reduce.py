@@ -272,36 +272,36 @@ def _cycle_loop_count(state: AppState) -> AppState:
 
 
 def _arm_single(state: AppState) -> AppState:
-    """Arm selected track as arm1; disarm if it is already arm1."""
+    """Set arm1 to selected track and stay in SESSION.
+
+    - Same track as current arm1 → disarm both slots.
+    - Different track → replace arm1; keep arm2 only if it differs from new arm1.
+    """
     t = state.selected_track
     if state.armed_tracks and state.armed_tracks[0] == t:
-        # Tap again to disarm — clear all arms, stay in SESSION
         return dataclasses.replace(state, armed_tracks=())
-    return dataclasses.replace(
-        state,
-        armed_tracks=(t,),
-        mode=Mode.INSTRUMENT,
-        instrument_submode=InstrumentSubmode.STEPS,
-    )
+    arm2 = state.armed_tracks[1] if len(state.armed_tracks) >= 2 else None
+    new_armed = (t, arm2) if (arm2 is not None and arm2 != t) else (t,)
+    return dataclasses.replace(state, armed_tracks=new_armed)
 
 
 def _arm_dual(state: AppState) -> AppState:
-    """Add selected_track as arm2; disarm arm2 if it is already arm2."""
+    """Set arm2 to selected track and stay in SESSION.
+
+    - No arm1 set → no-op (arm1 must come first).
+    - Selected track == arm1 → no-op (can't arm same track twice).
+    - Selected track == current arm2 → disarm arm2 only.
+    - Otherwise → set/replace arm2.
+    """
     t = state.selected_track
-    # Tap again to disarm arm2
+    if not state.armed_tracks:
+        return state  # arm1 must be set first
+    arm1 = state.armed_tracks[0]
+    if t == arm1:
+        return state  # can't be both arm1 and arm2
     if len(state.armed_tracks) >= 2 and state.armed_tracks[1] == t:
-        return dataclasses.replace(state, armed_tracks=state.armed_tracks[:1])
-    if t in state.armed_tracks:
-        return state  # already arm1 — no-op
-    new_armed = state.armed_tracks + (t,)
-    if len(new_armed) >= 2:
-        return dataclasses.replace(
-            state,
-            armed_tracks=new_armed[:2],
-            mode=Mode.INSTRUMENT,
-            instrument_submode=InstrumentSubmode.STEPS,
-        )
-    return dataclasses.replace(state, armed_tracks=new_armed)
+        return dataclasses.replace(state, armed_tracks=(arm1,))
+    return dataclasses.replace(state, armed_tracks=(arm1, t))
 
 
 def _session_encoder(state: AppState, event: EncoderTurned) -> AppState:
@@ -329,12 +329,11 @@ def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
     loop_idx = state.selected_loop
 
     if len(state.armed_tracks) == 1:
-        step = pad
-        new_state = _toggle_step(state, state.armed_tracks[0], loop_idx, step)
+        affected_track = state.armed_tracks[0]
+        new_state = _toggle_step(state, affected_track, loop_idx, pad)
     else:
-        step = pad % 16
-        track_idx = state.armed_tracks[0] if pad < 16 else state.armed_tracks[1]
-        new_state = _toggle_step(state, track_idx, loop_idx, step)
+        affected_track = state.armed_tracks[0] if pad < 16 else state.armed_tracks[1]
+        new_state = _toggle_step(state, affected_track, loop_idx, pad % 16)
 
     # Auto-start any armed loop that just became non-empty.
     new_playing = set(new_state.playing_loops)
@@ -348,7 +347,9 @@ def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
                 changed = True
     if changed:
         new_state = dataclasses.replace(new_state, playing_loops=frozenset(new_playing))
-    return new_state
+
+    # Remove track if all loops became empty (toggle off last step).
+    return _drop_fully_empty_tracks(new_state, (affected_track,))
 
 
 def _toggle_step(
@@ -427,6 +428,33 @@ def _toggle_step_count(state: AppState) -> AppState:
     return new_state
 
 
+def _drop_fully_empty_tracks(state: AppState, track_indices: tuple[int, ...]) -> AppState:
+    """Remove tracks whose every loop is empty: clears the slot, armed list, playing loops.
+    Returns to SESSION if no armed tracks remain."""
+    tracks = list(state.tracks)
+    new_armed = list(state.armed_tracks)
+    new_playing = set(state.playing_loops)
+    changed = False
+    for idx in track_indices:
+        track = tracks[idx]
+        if track is not None and all(loop.is_empty for loop in track.loops):
+            tracks[idx] = None
+            if idx in new_armed:
+                new_armed.remove(idx)
+            new_playing = {p for p in new_playing if p[0] != idx}
+            changed = True
+    if not changed:
+        return state
+    new_mode = Mode.SESSION if not new_armed else state.mode
+    return dataclasses.replace(
+        state,
+        tracks=tuple(tracks),
+        armed_tracks=tuple(new_armed),
+        playing_loops=frozenset(new_playing),
+        mode=new_mode,
+    )
+
+
 def _clear_armed_loops(state: AppState) -> AppState:
     """Clear all steps in selected_loop for every armed DrumTrack. Pure."""
     new_state = state
@@ -449,4 +477,4 @@ def _clear_armed_loops(state: AppState) -> AppState:
             + new_state.tracks[track_idx + 1:]
         )
         new_state = dataclasses.replace(new_state, tracks=new_tracks)
-    return new_state
+    return _drop_fully_empty_tracks(new_state, state.armed_tracks)
