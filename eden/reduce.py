@@ -27,6 +27,7 @@ from eden.events import (
     ModeButtonPressed,
     PadPressed,
     PadReleased,
+    SessionLoaded,
     ShiftChanged,
     SoftkeyPressed,
     SongSlotPressed,
@@ -52,8 +53,10 @@ def reduce(state: AppState, event: Event) -> AppState:
         return _on_metronome(state, event)
     if isinstance(event, TapTempoPressed):
         return _on_tap_tempo(state, event)
+    if isinstance(event, SessionLoaded):
+        return _on_session_loaded(state, event)
     if isinstance(event, SongSlotPressed):
-        return _on_song_slot(state, event)
+        return state  # handled entirely by app layer (requires file I/O)
     # Metronome+jog intercepts encoder before mode dispatch.
     if isinstance(event, EncoderTurned) and state.metronome_held and event.encoder == 9:
         new_bpm = max(20.0, min(300.0, state.tempo_bpm + event.delta))
@@ -126,11 +129,55 @@ def _handle_loop_wrap(state: AppState) -> AppState:
     for key in loops_to_stop:
         offsets.pop(key, None)
 
+    # Advance finishing loops (old session, playing out in background).
+    fin_remaining = dict(state.finishing_plays_remaining)
+    fin_offsets = dict(state.finishing_loop_measure_offsets)
+    fin_to_stop: set[tuple[int, int]] = set()
+
+    for key in state.finishing_loops:
+        track_idx, loop_idx = key
+        if not state.finishing_tracks or track_idx >= len(state.finishing_tracks):
+            fin_to_stop.add(key)
+            continue
+        track = state.finishing_tracks[track_idx]
+        if track is None:
+            fin_to_stop.add(key)
+            continue
+        loop = track.loops[loop_idx]
+
+        if loop.step_size > 16:
+            cycle_count = max(1, (loop.step_count + 31) // 32) if loop.steps_per_bar > 32 else loop.bars
+        else:
+            cycle_count = loop.bars
+
+        if cycle_count > 1:
+            current = fin_offsets.get(key, 0)
+            nxt = (current + 1) % cycle_count
+            fin_offsets[key] = nxt
+            if nxt != 0:
+                continue  # mid-loop, not done yet
+
+        if key not in fin_remaining:
+            fin_to_stop.add(key)
+            continue
+        count = fin_remaining[key] - 1
+        if count <= 0:
+            fin_to_stop.add(key)
+            del fin_remaining[key]
+            fin_offsets.pop(key, None)
+        else:
+            fin_remaining[key] = count
+
+    new_fin_loops = state.finishing_loops - fin_to_stop
     return dataclasses.replace(
         state,
         playing_loops=state.playing_loops - loops_to_stop,
         plays_remaining=tuple(remaining.items()),
         loop_measure_offsets=tuple(offsets.items()),
+        finishing_loops=new_fin_loops,
+        finishing_tracks=state.finishing_tracks if new_fin_loops else (),
+        finishing_plays_remaining=tuple(fin_remaining.items()),
+        finishing_loop_measure_offsets=tuple(fin_offsets.items()),
     )
 
 
@@ -138,30 +185,46 @@ _TAP_MAX_TAPS = 8
 _TAP_TIMEOUT = 2.0  # seconds — gap larger than this resets tap history
 
 
-def _on_song_slot(state: AppState, event: SongSlotPressed) -> AppState:
-    if not event.pressed:
-        return state
-    slot = event.slot
-    if slot == state.active_session_slot and state.pending_session_slot is None:
-        return state  # already on this slot, no pending transition
-    if state.shift_held:
-        # Immediate cut: clear all playing loops; app layer loads the session.
+def _on_session_loaded(state: AppState, event: SessionLoaded) -> AppState:
+    """Apply a newly loaded session, optionally preserving old loops as finishing."""
+    base = dict(
+        tracks=event.tracks,
+        tempo_bpm=event.tempo_bpm,
+        swing=event.swing,
+        active_loops=event.active_loops,
+        playing_loops=event.active_loops,
+        muted_tracks=event.muted_tracks,
+        soloed_tracks=event.soloed_tracks,
+        active_session_slot=event.slot,
+        plays_remaining=(),
+        loop_measure_offsets=(),
+        armed_tracks=(),
+        instrument_view_measure=0,
+        instrument_active_ctrl="",
+        new_slot_active_ctrl="",
+        saved_armed_tracks=None,
+    )
+    if event.immediate or not state.playing_loops:
         return dataclasses.replace(
             state,
-            pending_session_slot=slot,
-            playing_loops=frozenset(),
-            plays_remaining=(),
-            loop_measure_offsets=(),
+            **base,
+            finishing_loops=frozenset(),
+            finishing_tracks=(),
+            finishing_plays_remaining=(),
+            finishing_loop_measure_offsets=(),
         )
-    # Graceful: mark infinite playing loops to finish after their current cycle.
-    remaining = dict(state.plays_remaining)
+    # Graceful: keep old loops finishing in background.
+    old_remaining = dict(state.plays_remaining)
     for key in state.playing_loops:
-        if key not in remaining:  # loop_count == 0 (infinite)
-            remaining[key] = 1
+        if key not in old_remaining:  # infinite loop — give one more cycle
+            old_remaining[key] = 1
     return dataclasses.replace(
         state,
-        pending_session_slot=slot,
-        plays_remaining=tuple(remaining.items()),
+        **base,
+        finishing_loops=state.playing_loops,
+        finishing_tracks=state.tracks,
+        finishing_plays_remaining=tuple(old_remaining.items()),
+        finishing_loop_measure_offsets=state.loop_measure_offsets,
     )
 
 

@@ -39,7 +39,8 @@ from eden.clock import SequencerClock
 from eden.reduce import reduce
 from eden.render import render_pads, render_oled, render_button_leds
 from eden.state import default_state, AppState
-from eden.events import ClockTicked, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
+from eden.events import ClockTicked, SessionLoaded, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
+from eden.state import Mode
 import eden.sessions as sessions
 
 # UNVERIFIED: pad LED addressing — pad_index → note offset confirmed in v0 probe.py
@@ -122,6 +123,13 @@ class EdenApp:
             if isinstance(event, SoftkeyPressed) and event.key == 3 and self._state.metronome_held:
                 event = TapTempoPressed(timestamp=time.time())
 
+            # A-H slot press: SESSION mode only → immediate display switch.
+            if isinstance(event, SongSlotPressed) and event.pressed:
+                if (self._state.mode == Mode.SESSION and
+                        event.slot != self._state.active_session_slot):
+                    self._switch_session(event.slot, immediate=self._state.shift_held)
+                continue  # don't dispatch to reducer
+
             new_state = reduce(self._state, event)
 
             if new_state is not self._state:
@@ -135,10 +143,6 @@ class EdenApp:
             # REC press → save current session to active slot.
             if isinstance(event, TransportPressed) and event.button == "REC" and event.pressed:
                 self._save_session(self._state.active_session_slot)
-
-            # Pending session: load when playing_loops drains to empty.
-            if self._state.pending_session_slot is not None and not self._state.playing_loops:
-                self._load_session(self._state.pending_session_slot)
 
             # Schedule audio AFTER state swap so scheduler sees updated playhead.
             if isinstance(event, ClockTicked):
@@ -164,27 +168,46 @@ class EdenApp:
         except OSError as e:
             print(f"[session] save failed: {e}", file=sys.stderr)
 
-    def _load_session(self, slot: int) -> None:
+    def _switch_session(self, slot: int, immediate: bool) -> None:
+        """Dispatch a SessionLoaded event to transition to a new session slot."""
         path = self._session_paths[slot]
-        if not path or not os.path.exists(path):
-            # Empty slot — just switch the active slot index.
-            self._state = dataclasses.replace(
-                self._state, active_session_slot=slot, pending_session_slot=None
+        if path and os.path.exists(path):
+            try:
+                data = sessions.load_file(path)
+            except (OSError, ValueError) as e:
+                print(f"[session] load failed: {e}", file=sys.stderr)
+                return
+            patch = sessions.session_to_state_patch(data, slot)
+            ev = SessionLoaded(
+                slot=slot,
+                tracks=patch["tracks"],
+                tempo_bpm=patch["tempo_bpm"],
+                swing=patch["swing"],
+                active_loops=patch["active_loops"],
+                muted_tracks=patch["muted_tracks"],
+                soloed_tracks=patch["soloed_tracks"],
+                immediate=immediate,
             )
-            self._state_ref.set(self._state)
+        else:
+            # Empty slot — switch display, keep no tracks.
+            ev = SessionLoaded(
+                slot=slot,
+                tracks=tuple(None for _ in range(16)),
+                tempo_bpm=self._state.tempo_bpm,
+                swing=self._state.swing,
+                active_loops=frozenset(),
+                muted_tracks=frozenset(),
+                soloed_tracks=frozenset(),
+                immediate=True,
+            )
+        new_state = reduce(self._state, ev)
+        if new_state is not self._state:
+            old_bpm = self._state.tempo_bpm
+            self._state = new_state
+            self._state_ref.set(new_state)
             self._flush_render()
-            return
-        try:
-            data = sessions.load_file(path)
-        except (OSError, ValueError) as e:
-            print(f"[session] load failed: {e}", file=sys.stderr)
-            self._state = dataclasses.replace(self._state, pending_session_slot=None)
-            return
-        patch = sessions.session_to_state_patch(data, slot)
-        self._state = dataclasses.replace(self._state, **patch)
-        self._state_ref.set(self._state)
-        self._clock.set_bpm(self._state.tempo_bpm)
-        self._flush_render()
+            if new_state.tempo_bpm != old_bpm:
+                self._clock.set_bpm(new_state.tempo_bpm)
 
     def _try_load_slot(self, slot: int, initial: bool = False) -> None:
         """Load a session file into state if the path exists. No-op if missing."""

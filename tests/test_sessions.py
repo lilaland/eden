@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from eden.state import default_state, AppState, DrumTrack, Loop, default_loop
-from eden.events import SongSlotPressed, TransportPressed, ShiftChanged
+from eden.events import SessionLoaded, TransportPressed, ShiftChanged
 from eden.reduce import reduce
 import eden.sessions as sessions
 
@@ -134,50 +134,67 @@ def test_slot_from_letter():
     assert sessions.slot_from_letter("Z") is None
 
 
-# ── SongSlotPressed reducer ───────────────────────────────────────────────────
+# ── SessionLoaded reducer ─────────────────────────────────────────────────────
 
-def test_song_slot_press_sets_pending():
-    s = reduce(default_state(), SongSlotPressed(slot=2, pressed=True))
-    assert s.pending_session_slot == 2
+def _session_loaded_event(slot: int = 2, immediate: bool = False) -> SessionLoaded:
+    """Build a minimal SessionLoaded event for testing."""
+    s = default_state()
+    return SessionLoaded(
+        slot=slot,
+        tracks=s.tracks,
+        tempo_bpm=130.0,
+        swing=0.0,
+        active_loops=frozenset({(0, 0)}),
+        muted_tracks=frozenset(),
+        soloed_tracks=frozenset(),
+        immediate=immediate,
+    )
 
 
-def test_song_slot_release_no_op():
-    s = dataclasses.replace(default_state(), pending_session_slot=2)
-    s2 = reduce(s, SongSlotPressed(slot=2, pressed=False))
-    assert s2.pending_session_slot == 2  # unchanged
-
-
-def test_song_slot_same_slot_no_op():
+def test_session_loaded_switches_slot():
     s = default_state()  # active_session_slot=0
-    s2 = reduce(s, SongSlotPressed(slot=0, pressed=True))
-    assert s2.pending_session_slot is None
+    s2 = reduce(s, _session_loaded_event(slot=2))
+    assert s2.active_session_slot == 2
 
 
-def test_song_slot_graceful_marks_infinite_loops():
+def test_session_loaded_applies_new_tempo():
+    s = default_state()
+    s2 = reduce(s, _session_loaded_event(slot=2))
+    assert s2.tempo_bpm == 130.0
+
+
+def test_session_loaded_graceful_marks_infinite_loops():
+    """Graceful switch: infinite playing loops moved to finishing_loops with plays=1."""
     s = default_state()  # playing_loops = {(0,0),(1,0)}, both infinite
-    s2 = reduce(s, SongSlotPressed(slot=1, pressed=True))
-    remaining = dict(s2.plays_remaining)
+    s2 = reduce(s, _session_loaded_event(slot=1, immediate=False))
+    assert (0, 0) in s2.finishing_loops
+    assert (1, 0) in s2.finishing_loops
+    remaining = dict(s2.finishing_plays_remaining)
     assert remaining.get((0, 0)) == 1
     assert remaining.get((1, 0)) == 1
 
 
-def test_song_slot_graceful_preserves_finite_plays():
-    s = dataclasses.replace(
-        default_state(),
-        plays_remaining=(((0, 0), 3),),
-    )
-    s2 = reduce(s, SongSlotPressed(slot=1, pressed=True))
-    remaining = dict(s2.plays_remaining)
-    assert remaining[(0, 0)] == 3  # finite loop unchanged
-    assert remaining[(1, 0)] == 1  # infinite loop gets 1 more play
+def test_session_loaded_graceful_preserves_tracks_snapshot():
+    """finishing_tracks should snapshot the old tracks for audio."""
+    s = default_state()
+    s2 = reduce(s, _session_loaded_event(slot=1, immediate=False))
+    assert s2.finishing_tracks == s.tracks
 
 
-def test_song_slot_shift_immediate_cut():
-    s = dataclasses.replace(default_state(), shift_held=True)
-    s2 = reduce(s, SongSlotPressed(slot=2, pressed=True))
-    assert s2.pending_session_slot == 2
-    assert s2.playing_loops == frozenset()
-    assert s2.plays_remaining == ()
+def test_session_loaded_immediate_clears_finishing():
+    """Immediate (Shift) switch: no finishing loops at all."""
+    s = default_state()
+    s2 = reduce(s, _session_loaded_event(slot=2, immediate=True))
+    assert s2.finishing_loops == frozenset()
+    assert s2.finishing_tracks == ()
+
+
+def test_session_loaded_sets_playing_loops_from_active():
+    """New session's active_loops become playing_loops."""
+    s = default_state()
+    ev = _session_loaded_event(slot=2)
+    s2 = reduce(s, ev)
+    assert s2.playing_loops == ev.active_loops
 
 
 # ── Shift+REC sets active_loops ───────────────────────────────────────────────

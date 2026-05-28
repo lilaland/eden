@@ -105,8 +105,12 @@ class AppState:
     tap_times: tuple[float, ...] = ()  # recent Shift+Metronome tap timestamps
     # Session management (M2)
     active_session_slot: int = 0            # 0-7 → A-H, which slot is currently loaded
-    pending_session_slot: Optional[int] = None  # set on A-H press; app layer loads when playing_loops empty
     active_loops: frozenset[tuple[int, int]] = frozenset()  # loops that auto-start on session load
+    # Graceful session transition: old loops finish while new session is already displayed
+    finishing_loops: frozenset[tuple[int, int]] = frozenset()
+    finishing_tracks: tuple = ()            # tuple[Optional[Track], ...] snapshot of prev session
+    finishing_plays_remaining: tuple[tuple[tuple[int, int], int], ...] = ()
+    finishing_loop_measure_offsets: tuple[tuple[tuple[int, int], int], ...] = ()
 
 
 # ── Factory functions ─────────────────────────────────────────────────────────

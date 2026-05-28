@@ -272,25 +272,28 @@ class StepScheduler:
                 i for i in range(len(state.tracks)) if i not in soloed
             )
 
-        for track_idx, track in enumerate(state.tracks):
+        self._trigger_loops(state.playing_loops, state.tracks, offsets, playhead, effective_muted)
+
+        # Finishing loops: old-session loops playing out during graceful transition.
+        if state.finishing_loops and state.finishing_tracks:
+            fin_offsets = dict(state.finishing_loop_measure_offsets)
+            self._trigger_loops(
+                state.finishing_loops, state.finishing_tracks, fin_offsets, playhead, effective_muted
+            )
+
+    def _trigger_loops(self, loops, tracks, offsets, playhead, muted) -> None:
+        for track_idx, track in enumerate(tracks):
             if track is None:
                 continue
-            if track_idx in effective_muted:
+            if track_idx in muted:
                 continue
-
-            # Only DrumTrack is implemented — SynthTrack/SampleTrack are M3
-            # Import check via hasattr instead of isinstance to avoid state import
             if not hasattr(track, 'sample_name'):
-                continue  # SynthTrack/SampleTrack — skip silently
+                continue  # SynthTrack/SampleTrack — M3
 
             for loop_idx, loop in enumerate(track.loops):
                 key = (track_idx, loop_idx)
-                if key not in state.playing_loops:
+                if key not in loops:
                     continue
-                # Bresenham timing: distribute spb steps evenly over 32 ticks.
-                # step_in_bar = playhead * spb // 32 gives a new step index each
-                # time the value changes — no silence, no double-fires.
-                # Exception: spb > 32 (SIZE=32, numer>4) uses 32-step pages.
                 spb = loop.steps_per_bar
                 if spb > 32:
                     step_in_bar = playhead
@@ -298,7 +301,7 @@ class StepScheduler:
                 else:
                     step_in_bar = playhead * spb // 32
                     if step_in_bar == (playhead - 1) * spb // 32:
-                        continue  # same step as last tick — skip
+                        continue
                     stride = spb
                 offset = offsets.get(key, 0)
                 effective_step = step_in_bar + offset * stride

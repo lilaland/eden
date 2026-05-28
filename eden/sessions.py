@@ -130,7 +130,6 @@ def session_to_state_patch(data: dict, slot: int) -> dict:
         "soloed_tracks": soloed,
         # Reset runtime state on load
         "active_session_slot": slot,
-        "pending_session_slot": None,
         "playhead": 0,
         "plays_remaining": (),
         "loop_measure_offsets": (),

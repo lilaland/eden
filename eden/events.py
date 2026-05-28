@@ -76,5 +76,18 @@ class SongSlotPressed(Event):
 
 
 @dataclass(frozen=True)
+class SessionLoaded(Event):
+    """Emitted by app layer after reading a session file; reducer applies the switch."""
+    slot: int
+    tracks: tuple         # tuple[Optional[Track], ...] — new session
+    tempo_bpm: float
+    swing: float
+    active_loops: frozenset   # frozenset[tuple[int, int]]
+    muted_tracks: frozenset   # frozenset[int]
+    soloed_tracks: frozenset  # frozenset[int]
+    immediate: bool           # True = shift (cut now), False = graceful (finish loops)
+
+
+@dataclass(frozen=True)
 class TapTempoPressed(Event):
     timestamp: float  # time.time() at moment of tap

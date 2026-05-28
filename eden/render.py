@@ -311,9 +311,15 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
         slot_letter = sessions.slot_letter(state.active_session_slot)
         _set(OLED_MAIN_LINE1, f"[{slot_letter}] {track_name}")
 
-        if state.pending_session_slot is not None:
-            target = sessions.slot_letter(state.pending_session_slot)
-            _set(OLED_MAIN_LINE2, f"SWITCH->{target}...")
+        if state.finishing_loops:
+            seen: list[str] = []
+            for track_idx, _ in sorted(state.finishing_loops):
+                if track_idx < len(state.finishing_tracks):
+                    ft = state.finishing_tracks[track_idx]
+                    nm = ft.name if ft is not None else f"T{track_idx + 1}"
+                    if nm not in seen:
+                        seen.append(nm)
+            _set(OLED_MAIN_LINE2, "+".join(seen[:3]) + " out")
         elif state.armed_tracks:
             names = []
             for idx in state.armed_tracks[:2]:
