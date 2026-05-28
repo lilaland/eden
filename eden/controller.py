@@ -58,6 +58,7 @@ from eden.events import (
     PadReleased,
     EncoderTurned,
     MetronomePressed,
+    PlusMinusPressed,
     SongSlotPressed,
     TransportPressed,
     ModeButtonPressed,
@@ -328,6 +329,14 @@ class AtomSQ:
 
         if _DEBUG_MIDI and msg.type == "control_change":
             print(f"[MIDI] cc ch={msg.channel} ctrl={msg.control} val={msg.value}")
+
+        # +/- buttons: channel 0, notes 0-1.  [SNIFF: note=0 → "-", note=1 → "+"]
+        if msg.channel == 0 and msg.type in ("note_on", "note_off") and msg.note in (0, 1):
+            button = "-" if msg.note == 0 else "+"
+            pressed = msg.type == "note_on" and msg.velocity > 0
+            if self._event_queue:
+                self._event_queue.put(PlusMinusPressed(button=button, pressed=pressed))
+            return
 
         # Blocks-mode pad presses: channel 0, notes 36-67 (linear chromatic).
         # Confirmed in both standard mode and native mode via hardware sniff.

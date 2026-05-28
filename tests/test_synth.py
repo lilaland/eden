@@ -150,16 +150,38 @@ def _armed_synth_state():
 
 
 def test_synth_step_toggle_on():
+    # Top row (pad 16) = step 0 in STEPS mode
     s = _armed_synth_state()
-    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    s2 = reduce(s, PadPressed(pad_index=16, velocity=100))
     assert s2.tracks[0].loops[0].steps[0].on is True
 
 
 def test_synth_step_toggle_off():
     s = _armed_synth_state()
-    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
-    s3 = reduce(s2, PadPressed(pad_index=0, velocity=100))
+    s2 = reduce(s, PadPressed(pad_index=16, velocity=100))
+    s3 = reduce(s2, PadPressed(pad_index=16, velocity=100))
     assert s3.tracks[0].loops[0].steps[0].on is False
+
+
+def test_synth_bottom_row_sets_pitch():
+    # Bottom row (pad 0-15) sets pitch on cursor step (default cursor=0)
+    s = _armed_synth_state()
+    # First turn step 0 on via top row so we can check its pitch
+    s2 = reduce(s, PadPressed(pad_index=16, velocity=100))
+    # Now press bottom row pad 0: should set pitch for step_cursor (0)
+    s3 = reduce(s2, PadPressed(pad_index=0, velocity=100))
+    assert s3.tracks[0].loops[0].steps[0].on is True
+    # Pitch should be degree_to_pitch(60, "chromatic", 0) = 60
+    from eden.scales import degree_to_pitch
+    expected = degree_to_pitch(60, "chromatic", 0)
+    assert s3.tracks[0].loops[0].steps[0].pitch == expected
+
+
+def test_synth_bottom_row_advances_cursor():
+    s = _armed_synth_state()
+    assert s.step_cursor == 0
+    s2 = reduce(s, PadPressed(pad_index=5, velocity=100))  # bottom row
+    assert s2.step_cursor == 1  # cursor advanced
 
 
 # ── Synth encoder controls in INSTRUMENT mode ─────────────────────────────────

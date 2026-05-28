@@ -77,6 +77,8 @@ class SynthTrack:
     filter_res: float = 0.2        # 0.0–0.99
     volume: float = 0.8
     max_voices: int = 8
+    root_note: int = 60            # MIDI root pitch (default C4)
+    scale: str = "chromatic"       # key in scales.SCALES
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,9 @@ class AppState:
     saved_armed_tracks: Optional[tuple[int, ...]] = None  # restored on exit from new-slot INSTRUMENT
     metronome_held: bool = False
     tap_times: tuple[float, ...] = ()  # recent Shift+Metronome tap timestamps
+    # Synth step/keyboard editor state (ephemeral, not persisted)
+    step_cursor: int = 0            # absolute step index of the highlighted step
+    pitch_window_offset: int = 0    # first scale degree shown in the pitch row
     # Session management (M2)
     active_session_slot: int = 0            # 0-7 → A-H, which slot is currently loaded
     active_loops: frozenset[tuple[int, int]] = frozenset()  # loops that auto-start on session load

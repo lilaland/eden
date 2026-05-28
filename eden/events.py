@@ -91,3 +91,9 @@ class SessionLoaded(Event):
 @dataclass(frozen=True)
 class TapTempoPressed(Event):
     timestamp: float  # time.time() at moment of tap
+
+
+@dataclass(frozen=True)
+class PlusMinusPressed(Event):
+    button: str   # "+" | "-"
+    pressed: bool

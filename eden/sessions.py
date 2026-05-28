@@ -116,6 +116,8 @@ def _track_to_dict(track) -> Optional[dict]:
             "filter_res": track.filter_res,
             "volume": track.volume,
             "max_voices": track.max_voices,
+            "root_note": track.root_note,
+            "scale": track.scale,
             "loops": [_loop_to_dict(lp) for lp in track.loops],
         }
     return None
@@ -148,6 +150,8 @@ def _dict_to_track(d: Optional[dict]):
             filter_res=d.get("filter_res", 0.2),
             volume=d.get("volume", 0.8),
             max_voices=d.get("max_voices", 8),
+            root_note=d.get("root_note", 60),
+            scale=d.get("scale", "chromatic"),
         )
     return None
 

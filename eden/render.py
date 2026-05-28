@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import eden.catalog as catalog
 import eden.sessions as sessions
+from eden.scales import degree_to_pitch, pitch_to_degree, pitch_name, SCALE_SHORT, is_root
 from eden.state import (
     AppState, Mode, InstrumentSubmode, Loop, DrumTrack, SynthTrack, SampleTrack, Track,
 )
@@ -139,73 +140,126 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
             track_idx = armed[0]
             track = state.tracks[track_idx]
             if track is not None:
-                loop = track.loops[state.selected_loop]
                 color = _track_color(track)
                 view_m = state.instrument_view_measure
-                key = (track_idx, state.selected_loop)
-                playing_measure = dict(state.loop_measure_offsets).get(key, 0)
-                is_playing_loop = key in state.playing_loops
-                steps_per_bar = loop.steps_per_bar
 
-                if loop.step_size > 16:
-                    # Interleaved view: each page shows 32 steps (2 rows × 16 cols).
-                    # For spb <= 32: page = bar, page_size = spb.
-                    # For spb > 32: page_size = 32 (bars span multiple pages).
-                    # Bresenham timing (spb <= 32): step_in_bar fires spb times
-                    # evenly over 32 ticks — no silence, no playhead past last step.
-                    page_size = steps_per_bar if steps_per_bar <= 32 else 32
-                    page_offset = view_m * page_size
-                    if steps_per_bar > 32:
-                        step_in_bar = state.playhead
+                # ── SynthTrack: dual-row layout ───────────────────────────────
+                if isinstance(track, SynthTrack):
+                    if state.instrument_submode == InstrumentSubmode.PADS:
+                        # PADS mode: all 32 pads = scale degrees (keyboard)
+                        for pad_idx in range(32):
+                            degree = state.pitch_window_offset + pad_idx
+                            pitch = degree_to_pitch(track.root_note, track.scale, degree)
+                            if is_root(track.root_note, pitch):
+                                pads[pad_idx] = _dim(ACCENT_GOLD)
+                            else:
+                                pads[pad_idx] = _dim(color)
+                    else:
+                        # STEPS mode: top row = steps, bottom row = pitch window
+                        loop = track.loops[state.selected_loop]
+                        key = (track_idx, state.selected_loop)
+                        playing_measure = dict(state.loop_measure_offsets).get(key, 0)
+                        is_playing_loop = key in state.playing_loops
+                        spb = loop.steps_per_bar
+                        step_in_bar = state.playhead * spb // 32
+                        global_firing_step = step_in_bar + playing_measure * spb
+                        ph_step = global_firing_step  # absolute playhead step
+
+                        # Top row (pads 16-31): step grid for current page
+                        for col in range(16):
+                            pad_idx = col + 16
+                            step_idx = view_m * 16 + col
+                            if step_idx >= loop.step_count:
+                                pads[pad_idx] = PAD_OFF
+                                continue
+                            is_cursor = step_idx == state.step_cursor
+                            is_ph = is_playing_loop and ph_step == step_idx
+                            step_on = loop.steps[step_idx].on
+                            if is_ph:
+                                pads[pad_idx] = PAD_PLAYHEAD
+                            elif is_cursor and step_on:
+                                pads[pad_idx] = _brighten(PAD_PINK)
+                            elif is_cursor:
+                                pads[pad_idx] = PAD_PINK
+                            elif step_on:
+                                pads[pad_idx] = color
+                            else:
+                                pads[pad_idx] = PAD_INACTIVE
+
+                        # Bottom row (pads 0-15): pitch window
+                        # Find which degree matches the cursor step's pitch
+                        cursor_step = loop.steps[state.step_cursor] if state.step_cursor < loop.step_count else None
+                        cursor_pitch = cursor_step.pitch if (cursor_step and cursor_step.on) else None
+                        for pad_idx in range(16):
+                            degree = state.pitch_window_offset + pad_idx
+                            pitch = degree_to_pitch(track.root_note, track.scale, degree)
+                            if cursor_pitch is not None and pitch == cursor_pitch:
+                                pads[pad_idx] = color  # highlight active pitch
+                            elif is_root(track.root_note, pitch):
+                                pads[pad_idx] = _dim(ACCENT_GOLD)
+                            else:
+                                pads[pad_idx] = _dim(PAD_INACTIVE)
+
+                else:
+                    # ── DrumTrack / drum-style step grid ─────────────────────
+                    loop = track.loops[state.selected_loop]
+                    key = (track_idx, state.selected_loop)
+                    playing_measure = dict(state.loop_measure_offsets).get(key, 0)
+                    is_playing_loop = key in state.playing_loops
+                    steps_per_bar = loop.steps_per_bar
+
+                    if loop.step_size > 16:
+                        page_size = steps_per_bar if steps_per_bar <= 32 else 32
+                        page_offset = view_m * page_size
+                        if steps_per_bar > 32:
+                            step_in_bar = state.playhead
+                        else:
+                            step_in_bar = state.playhead * steps_per_bar // 32
+                        ph_col = step_in_bar // 2
+                        ph_row = step_in_bar % 2
+                        for row in range(2):
+                            for col in range(16):
+                                pad_idx = row * 16 + col
+                                step = page_offset + col * 2 + row
+                                if step >= loop.step_count:
+                                    pads[pad_idx] = PAD_OFF
+                                    continue
+                                is_playhead = (
+                                    is_playing_loop
+                                    and playing_measure == view_m
+                                    and col == ph_col
+                                    and row == ph_row
+                                )
+                                if is_playhead:
+                                    pads[pad_idx] = PAD_PLAYHEAD
+                                elif loop.steps[step].on:
+                                    pads[pad_idx] = color
+                                else:
+                                    pads[pad_idx] = PAD_INACTIVE
                     else:
                         step_in_bar = state.playhead * steps_per_bar // 32
-                    ph_col = step_in_bar // 2
-                    ph_row = step_in_bar % 2
-                    for row in range(2):
-                        for col in range(16):
-                            pad_idx = row * 16 + col
-                            step = page_offset + col * 2 + row
-                            if step >= loop.step_count:
-                                pads[pad_idx] = PAD_OFF
-                                continue
-                            is_playhead = (
-                                is_playing_loop
-                                and playing_measure == view_m
-                                and col == ph_col
-                                and row == ph_row
-                            )
-                            if is_playhead:
-                                pads[pad_idx] = PAD_PLAYHEAD
-                            elif loop.steps[step].on:
-                                pads[pad_idx] = color
-                            else:
-                                pads[pad_idx] = PAD_INACTIVE
-                else:
-                    # Normal page view: row 0 = page view_m, row 1 = page view_m+1.
-                    # Bresenham timing: step_in_bar fires spb times evenly over 32 ticks.
-                    step_in_bar = state.playhead * steps_per_bar // 32  # 0..spb-1
-                    global_firing_step = step_in_bar + playing_measure * steps_per_bar
-                    ph_measure = global_firing_step // 16
-                    ph_col = global_firing_step % 16
-                    for row in range(2):
-                        measure = view_m + row
-                        for col in range(16):
-                            pad_idx = row * 16 + col
-                            global_step = measure * 16 + col
-                            if global_step >= loop.step_count:
-                                pads[pad_idx] = PAD_OFF
-                                continue
-                            is_playhead = (
-                                is_playing_loop
-                                and measure == ph_measure
-                                and col == ph_col
-                            )
-                            if is_playhead:
-                                pads[pad_idx] = PAD_PLAYHEAD
-                            elif loop.steps[global_step].on:
-                                pads[pad_idx] = color
-                            else:
-                                pads[pad_idx] = PAD_INACTIVE
+                        global_firing_step = step_in_bar + playing_measure * steps_per_bar
+                        ph_measure = global_firing_step // 16
+                        ph_col = global_firing_step % 16
+                        for row in range(2):
+                            measure = view_m + row
+                            for col in range(16):
+                                pad_idx = row * 16 + col
+                                global_step = measure * 16 + col
+                                if global_step >= loop.step_count:
+                                    pads[pad_idx] = PAD_OFF
+                                    continue
+                                is_playhead = (
+                                    is_playing_loop
+                                    and measure == ph_measure
+                                    and col == ph_col
+                                )
+                                if is_playhead:
+                                    pads[pad_idx] = PAD_PLAYHEAD
+                                elif loop.steps[global_step].on:
+                                    pads[pad_idx] = color
+                                else:
+                                    pads[pad_idx] = PAD_INACTIVE
 
         else:  # dual-arm
             offsets = dict(state.loop_measure_offsets)
@@ -371,7 +425,8 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
         elif len(armed) == 1:
             t = state.tracks[armed[0]]
             if isinstance(t, SynthTrack):
-                main_line1 = f"{t.name} [{t.osc_type}]"
+                scale_short = SCALE_SHORT.get(t.scale, t.scale[:5].upper())
+                main_line1 = f"{t.name} {scale_short}/{pitch_name(t.root_note)}"
             else:
                 main_line1 = t.name if t is not None else "EMPTY"
         else:
@@ -418,17 +473,32 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
         # SK controls depend on primary armed track type
         first_track = state.tracks[armed[0]] if armed else None
         if isinstance(first_track, SynthTrack):
-            osc_color    = _OLED_ACTIVE if ctrl == "OSC"    else _OLED_DIM
-            cutoff_color = _OLED_ACTIVE if ctrl == "CUTOFF" else _OLED_DIM
-            reso_color   = _OLED_ACTIVE if ctrl == "RESO"   else _OLED_DIM
-            cutoff_hz = first_track.filter_cutoff
-            cutoff_str = f"{int(cutoff_hz)}Hz" if cutoff_hz < 1000 else f"{cutoff_hz/1000:.1f}k"
-            _set(OLED_BTN1_TITLE, "OSC", osc_color)
-            _set(OLED_BTN1_VALUE, first_track.osc_type.upper()[:4])
-            _set(OLED_BTN2_TITLE, "CUTOFF", cutoff_color)
-            _set(OLED_BTN2_VALUE, cutoff_str)
-            _set(OLED_BTN3_TITLE, "RESO", reso_color)
-            _set(OLED_BTN3_VALUE, f"{first_track.filter_res:.2f}")
+            shift = state.shift_held
+            if shift:
+                # Shift page: SCALE / ROOT / RESO
+                scale_color = _OLED_ACTIVE if ctrl == "SCALE" else _OLED_DIM
+                root_color  = _OLED_ACTIVE if ctrl == "ROOT"  else _OLED_DIM
+                reso_color  = _OLED_ACTIVE if ctrl == "RESO"  else _OLED_DIM
+                scale_short = SCALE_SHORT.get(first_track.scale, first_track.scale[:5].upper())
+                _set(OLED_BTN1_TITLE, "SCALE", scale_color)
+                _set(OLED_BTN1_VALUE, scale_short)
+                _set(OLED_BTN2_TITLE, "ROOT", root_color)
+                _set(OLED_BTN2_VALUE, pitch_name(first_track.root_note))
+                _set(OLED_BTN3_TITLE, "RESO", reso_color)
+                _set(OLED_BTN3_VALUE, f"{first_track.filter_res:.2f}")
+            else:
+                # Normal page: OSC / CUTOFF / RESO
+                osc_color    = _OLED_ACTIVE if ctrl == "OSC"    else _OLED_DIM
+                cutoff_color = _OLED_ACTIVE if ctrl == "CUTOFF" else _OLED_DIM
+                reso_color   = _OLED_ACTIVE if ctrl == "RESO"   else _OLED_DIM
+                cutoff_hz = first_track.filter_cutoff
+                cutoff_str = f"{int(cutoff_hz)}Hz" if cutoff_hz < 1000 else f"{cutoff_hz/1000:.1f}k"
+                _set(OLED_BTN1_TITLE, "OSC", osc_color)
+                _set(OLED_BTN1_VALUE, first_track.osc_type.upper()[:4])
+                _set(OLED_BTN2_TITLE, "CUTOFF", cutoff_color)
+                _set(OLED_BTN2_VALUE, cutoff_str)
+                _set(OLED_BTN3_TITLE, "RESO", reso_color)
+                _set(OLED_BTN3_VALUE, f"{first_track.filter_res:.2f}")
         else:
             bars_color  = _OLED_ACTIVE if ctrl == "BARS"  else _OLED_DIM
             numer_color = _OLED_ACTIVE if ctrl == "NUMER" else _OLED_DIM

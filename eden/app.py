@@ -39,8 +39,9 @@ from eden.audio import AudioMixer, StateRef, StepScheduler
 from eden.clock import SequencerClock
 from eden.reduce import reduce
 from eden.render import render_pads, render_oled, render_button_leds
-from eden.state import default_state, AppState, DrumTrack, SynthTrack
-from eden.events import ClockTicked, SessionLoaded, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
+from eden.scales import degree_to_pitch
+from eden.state import default_state, AppState, DrumTrack, SynthTrack, InstrumentSubmode, Mode
+from eden.events import ClockTicked, PadPressed, PlusMinusPressed, SessionLoaded, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
 from eden.state import Mode
 import eden.sessions as sessions
 
@@ -157,6 +158,32 @@ class EdenApp:
             # Schedule audio AFTER state swap so scheduler sees updated playhead.
             if isinstance(event, ClockTicked):
                 self._scheduler.on_tick()
+
+            # Immediate note-on for synth PADS/STEPS pitch entry (audio feedback).
+            if isinstance(event, PadPressed) and self._state.mode == Mode.INSTRUMENT:
+                self._maybe_trigger_synth_preview(event)
+
+    def _maybe_trigger_synth_preview(self, event: PadPressed) -> None:
+        """Fire a short preview note when recording a pitch in synth pad modes."""
+        if not self._state.armed_tracks:
+            return
+        track_idx = self._state.armed_tracks[0]
+        track = self._state.tracks[track_idx]
+        if not isinstance(track, SynthTrack):
+            return
+        submode = self._state.instrument_submode
+        if submode == InstrumentSubmode.PADS:
+            degree = self._state.pitch_window_offset + event.pad_index
+        elif submode == InstrumentSubmode.STEPS and event.pad_index < 16:
+            degree = self._state.pitch_window_offset + event.pad_index
+        else:
+            return
+        pitch = degree_to_pitch(track.root_note, track.scale, degree)
+        engine = self._mixer.get_engine(track_idx)
+        if engine is None:
+            return
+        gate = max(1, int(0.25 * self._mixer._sr))
+        engine.note_on(pitch, event.velocity / 127.0, gate, track)
 
     # ─── Engine lifecycle ─────────────────────────────────────────────────────
 
