@@ -70,5 +70,11 @@ class MetronomePressed(Event):
 
 
 @dataclass(frozen=True)
+class SongSlotPressed(Event):
+    slot: int    # 0-7 (A=0 … H=7)
+    pressed: bool
+
+
+@dataclass(frozen=True)
 class TapTempoPressed(Event):
     timestamp: float  # time.time() at moment of tap

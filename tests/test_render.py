@@ -378,9 +378,9 @@ def test_render_pads_instrument_dual_top_pad16_reflects_track1_step0():
 
 
 def test_render_oled_session_main_line1_track_name():
-    """Test 16: SESSION mode MAIN_LINE1 = track name for default state."""
+    """Test 16: SESSION mode MAIN_LINE1 = slot letter + track name."""
     oled = render_oled(default_state())
-    assert _t(oled, OLED_MAIN_LINE1) == "KICK"
+    assert _t(oled, OLED_MAIN_LINE1) == "[A] KICK"
 
 
 def test_render_oled_session_btn1_is_mute():

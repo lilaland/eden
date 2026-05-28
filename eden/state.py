@@ -103,6 +103,10 @@ class AppState:
     saved_armed_tracks: Optional[tuple[int, ...]] = None  # restored on exit from new-slot INSTRUMENT
     metronome_held: bool = False
     tap_times: tuple[float, ...] = ()  # recent Shift+Metronome tap timestamps
+    # Session management (M2)
+    active_session_slot: int = 0            # 0-7 → A-H, which slot is currently loaded
+    pending_session_slot: Optional[int] = None  # set on A-H press; app layer loads when playing_loops empty
+    active_loops: frozenset[tuple[int, int]] = frozenset()  # loops that auto-start on session load
 
 
 # ── Factory functions ─────────────────────────────────────────────────────────
@@ -158,4 +162,5 @@ def default_state() -> AppState:
         soloed_tracks=frozenset(),
         muted_tracks=frozenset(),
         instrument_submode=InstrumentSubmode.STEPS,
+        active_loops=frozenset({(0, 0), (1, 0)}),  # matches playing_loops for default
     )

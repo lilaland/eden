@@ -29,6 +29,7 @@ from eden.events import (
     PadReleased,
     ShiftChanged,
     SoftkeyPressed,
+    SongSlotPressed,
     TapTempoPressed,
     TouchbarMoved,
     TransportPressed,
@@ -51,6 +52,8 @@ def reduce(state: AppState, event: Event) -> AppState:
         return _on_metronome(state, event)
     if isinstance(event, TapTempoPressed):
         return _on_tap_tempo(state, event)
+    if isinstance(event, SongSlotPressed):
+        return _on_song_slot(state, event)
     # Metronome+jog intercepts encoder before mode dispatch.
     if isinstance(event, EncoderTurned) and state.metronome_held and event.encoder == 9:
         new_bpm = max(20.0, min(300.0, state.tempo_bpm + event.delta))
@@ -133,6 +136,33 @@ def _handle_loop_wrap(state: AppState) -> AppState:
 
 _TAP_MAX_TAPS = 8
 _TAP_TIMEOUT = 2.0  # seconds — gap larger than this resets tap history
+
+
+def _on_song_slot(state: AppState, event: SongSlotPressed) -> AppState:
+    if not event.pressed:
+        return state
+    slot = event.slot
+    if slot == state.active_session_slot and state.pending_session_slot is None:
+        return state  # already on this slot, no pending transition
+    if state.shift_held:
+        # Immediate cut: clear all playing loops; app layer loads the session.
+        return dataclasses.replace(
+            state,
+            pending_session_slot=slot,
+            playing_loops=frozenset(),
+            plays_remaining=(),
+            loop_measure_offsets=(),
+        )
+    # Graceful: mark infinite playing loops to finish after their current cycle.
+    remaining = dict(state.plays_remaining)
+    for key in state.playing_loops:
+        if key not in remaining:  # loop_count == 0 (infinite)
+            remaining[key] = 1
+    return dataclasses.replace(
+        state,
+        pending_session_slot=slot,
+        plays_remaining=tuple(remaining.items()),
+    )
 
 
 def _on_metronome(state: AppState, event: MetronomePressed) -> AppState:
@@ -274,6 +304,9 @@ def _session_transport(state: AppState, event: TransportPressed) -> AppState:
         return dataclasses.replace(state, is_playing=True)
     if event.button == "STOP":
         return dataclasses.replace(state, is_playing=False, playhead=0, loop_measure_offsets=())
+    if event.button == "REC" and state.shift_held:
+        # Shift+REC: set active_loops = currently playing loops (session startup config).
+        return dataclasses.replace(state, active_loops=state.playing_loops)
     return state
 
 
@@ -710,6 +743,8 @@ def _instrument_transport(state: AppState, event: TransportPressed) -> AppState:
         return dataclasses.replace(state, is_playing=True)
     if event.button == "STOP":
         return dataclasses.replace(state, is_playing=False, playhead=0, loop_measure_offsets=())
+    if event.button == "REC" and state.shift_held:
+        return dataclasses.replace(state, active_loops=state.playing_loops)
     return state
 
 

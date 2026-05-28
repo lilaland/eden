@@ -58,6 +58,7 @@ from eden.events import (
     PadReleased,
     EncoderTurned,
     MetronomePressed,
+    SongSlotPressed,
     TransportPressed,
     ModeButtonPressed,
     ShiftChanged,
@@ -422,6 +423,13 @@ class AtomSQ:
                     self._event_queue.put(ShiftChanged(held=held))
                 if self._cb_shift:
                     self._cb_shift(held)
+                return
+
+            # Song slot buttons A-H: CC 0-7, channel 0, native mode only.  [SNIFF]
+            if 0 <= cc <= 7 and self._native_mode:
+                pressed = (value == 127)
+                if self._event_queue:
+                    self._event_queue.put(SongSlotPressed(slot=cc, pressed=pressed))
                 return
 
             # Arrow keys: CC 90 = left, CC 102 = right, channel 0.  [SNIFF]

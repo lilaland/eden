@@ -39,23 +39,41 @@ from eden.clock import SequencerClock
 from eden.reduce import reduce
 from eden.render import render_pads, render_oled, render_button_leds
 from eden.state import default_state, AppState
-from eden.events import ClockTicked, SoftkeyPressed, TapTempoPressed, TouchbarMoved
+from eden.events import ClockTicked, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
+import eden.sessions as sessions
 
 # UNVERIFIED: pad LED addressing — pad_index → note offset confirmed in v0 probe.py
 # UNVERIFIED: ATM SQ Control port requirement — all LED/OLED output must go to Control port
 _PAD_NOTE_OFFSET = 36
+_DEFAULT_SESSIONS_DIR = "sessions"
 
 
 class EdenApp:
-    def __init__(self, sample_dir: str = "samples", bpm: float = 120.0) -> None:
+    def __init__(
+        self,
+        sample_dir: str = "samples",
+        bpm: float = 120.0,
+        session_paths: list[str | None] | None = None,
+        sessions_dir: str = _DEFAULT_SESSIONS_DIR,
+    ) -> None:
         self._eq: queue.Queue = queue.Queue()
+        self._sessions_dir = sessions_dir
+        self._session_paths: list[str | None] = list(session_paths) if session_paths else [None] * 8
+        while len(self._session_paths) < 8:
+            self._session_paths.append(None)
+
+        # Load initial state: slot 0 if it has a file, otherwise default.
         self._state = default_state()
         self._state = dataclasses.replace(self._state, tempo_bpm=bpm)
+        self._try_load_slot(0, initial=True)
+
         self._state_ref = StateRef(self._state)
 
         self._controller = AtomSQ(event_queue=self._eq)
         self._audio = SamplePlayer(sample_dir=sample_dir)
-        self._clock = SequencerClock(bpm=bpm, steps=32, ppq=8, event_queue=self._eq)
+        self._clock = SequencerClock(
+            bpm=self._state.tempo_bpm, steps=32, ppq=8, event_queue=self._eq
+        )
         self._scheduler = StepScheduler(player=self._audio, state_ref=self._state_ref)
 
         # Render delta state: compare against previous render to send only diffs.
@@ -81,7 +99,7 @@ class EdenApp:
         self._controller.close()
 
     def run(self) -> None:
-        print(f"Eden M1/M2 — {self._state.tempo_bpm:.0f} BPM  |  Ctrl-C to quit")
+        print(f"Eden M2 — {self._state.tempo_bpm:.0f} BPM  slot {sessions.slot_letter(self._state.active_session_slot)}  |  Ctrl-C to quit")
         self.start()
         try:
             self._event_loop()
@@ -106,9 +124,6 @@ class EdenApp:
 
             new_state = reduce(self._state, event)
 
-            if isinstance(event, SoftkeyPressed):
-                print(f"[EVENT] SoftkeyPressed key={event.key}  armed={new_state.armed_tracks}  mode={new_state.mode.name}")
-
             if new_state is not self._state:
                 old_bpm = self._state.tempo_bpm
                 self._state = new_state
@@ -117,9 +132,73 @@ class EdenApp:
                 if new_state.tempo_bpm != old_bpm:
                     self._clock.set_bpm(new_state.tempo_bpm)
 
+            # REC press → save current session to active slot.
+            if isinstance(event, TransportPressed) and event.button == "REC" and event.pressed:
+                self._save_session(self._state.active_session_slot)
+
+            # Pending session: load when playing_loops drains to empty.
+            if self._state.pending_session_slot is not None and not self._state.playing_loops:
+                self._load_session(self._state.pending_session_slot)
+
             # Schedule audio AFTER state swap so scheduler sees updated playhead.
             if isinstance(event, ClockTicked):
                 self._scheduler.on_tick()
+
+    # ─── Session I/O ─────────────────────────────────────────────────────────
+
+    def _slot_path(self, slot: int) -> str:
+        """Resolve or auto-generate a file path for the given slot."""
+        if self._session_paths[slot]:
+            return self._session_paths[slot]
+        letter = sessions.slot_letter(slot).lower()
+        path = os.path.join(self._sessions_dir, f"session_{letter}.json")
+        self._session_paths[slot] = path
+        return path
+
+    def _save_session(self, slot: int) -> None:
+        path = self._slot_path(slot)
+        name = os.path.splitext(os.path.basename(path))[0]
+        data = sessions.state_to_session(self._state, name)
+        try:
+            sessions.save_file(path, data)
+        except OSError as e:
+            print(f"[session] save failed: {e}", file=sys.stderr)
+
+    def _load_session(self, slot: int) -> None:
+        path = self._session_paths[slot]
+        if not path or not os.path.exists(path):
+            # Empty slot — just switch the active slot index.
+            self._state = dataclasses.replace(
+                self._state, active_session_slot=slot, pending_session_slot=None
+            )
+            self._state_ref.set(self._state)
+            self._flush_render()
+            return
+        try:
+            data = sessions.load_file(path)
+        except (OSError, ValueError) as e:
+            print(f"[session] load failed: {e}", file=sys.stderr)
+            self._state = dataclasses.replace(self._state, pending_session_slot=None)
+            return
+        patch = sessions.session_to_state_patch(data, slot)
+        self._state = dataclasses.replace(self._state, **patch)
+        self._state_ref.set(self._state)
+        self._clock.set_bpm(self._state.tempo_bpm)
+        self._flush_render()
+
+    def _try_load_slot(self, slot: int, initial: bool = False) -> None:
+        """Load a session file into state if the path exists. No-op if missing."""
+        path = self._session_paths[slot]
+        if not path or not os.path.exists(path):
+            if initial:
+                self._state = dataclasses.replace(self._state, active_session_slot=slot)
+            return
+        try:
+            data = sessions.load_file(path)
+            patch = sessions.session_to_state_patch(data, slot)
+            self._state = dataclasses.replace(self._state, **patch)
+        except (OSError, ValueError) as e:
+            print(f"[session] initial load failed for slot {sessions.slot_letter(slot)}: {e}", file=sys.stderr)
 
     # ─── Render / diff / send ─────────────────────────────────────────────────
 
@@ -158,10 +237,30 @@ class EdenApp:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Eden M1/M2 jambox")
+    parser = argparse.ArgumentParser(description="Eden M2 jambox")
     parser.add_argument("--bpm", type=float, default=120.0)
     parser.add_argument("--samples", default="samples")
+    parser.add_argument(
+        "--session", action="append", metavar="SLOT:FILE",
+        help="Pre-load session file into A-H slot. Example: --session A:kick.json"
+    )
+    parser.add_argument("--sessions-dir", default=_DEFAULT_SESSIONS_DIR,
+                        help="Directory for auto-named session files (default: sessions/)")
     args = parser.parse_args()
 
-    app = EdenApp(sample_dir=args.samples, bpm=args.bpm)
+    session_paths: list[str | None] = [None] * 8
+    for spec in (args.session or []):
+        letter, _, path = spec.partition(":")
+        idx = sessions.slot_from_letter(letter)
+        if idx is not None:
+            session_paths[idx] = path
+        else:
+            print(f"[warn] unknown slot '{letter}' in --session {spec}", file=sys.stderr)
+
+    app = EdenApp(
+        sample_dir=args.samples,
+        bpm=args.bpm,
+        session_paths=session_paths,
+        sessions_dir=args.sessions_dir,
+    )
     app.run()

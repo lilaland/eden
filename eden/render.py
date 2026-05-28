@@ -7,6 +7,7 @@ a plain Python value suitable for the controller layer to consume.
 from __future__ import annotations
 
 import eden.catalog as catalog
+import eden.sessions as sessions
 from eden.state import (
     AppState, Mode, InstrumentSubmode, Loop, DrumTrack, SynthTrack, SampleTrack, Track,
 )
@@ -307,9 +308,13 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
             loop_count = loop.loop_count
         loop_count_str = "inf" if loop_count == 0 else f"{loop_count}x"
 
-        _set(OLED_MAIN_LINE1, track_name)
+        slot_letter = sessions.slot_letter(state.active_session_slot)
+        _set(OLED_MAIN_LINE1, f"[{slot_letter}] {track_name}")
 
-        if state.armed_tracks:
+        if state.pending_session_slot is not None:
+            target = sessions.slot_letter(state.pending_session_slot)
+            _set(OLED_MAIN_LINE2, f"SWITCH->{target}...")
+        elif state.armed_tracks:
             names = []
             for idx in state.armed_tracks[:2]:
                 t = state.tracks[idx]
