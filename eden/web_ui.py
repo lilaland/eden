@@ -149,10 +149,10 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
 #logo .o{color:#e07800}
 #logo small{display:block;font-size:7px;letter-spacing:1px;color:#333;margin-top:1px}
 
-/* encoders: bottom row (5-8) staggered right by ~half knob width */
-#encs{display:flex;flex-direction:column;gap:5px;padding-top:2px}
-.enc-row{display:flex;gap:5px}
-.enc-row-bot{margin-left:22px}
+/* encoders: row1 has spacer, row2 has +/- pair — both flush left, enc cols align */
+#encs{display:flex;flex-direction:column;gap:6px;padding-top:2px}
+.enc-row{display:flex;gap:14px;align-items:center}
+.enc-spacer{width:63px;flex-shrink:0}
 .enc{
   width:40px;height:40px;border-radius:50%;
   background:radial-gradient(circle at 38% 32%,#363636,#111);
@@ -161,6 +161,13 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
   font-size:8px;color:#3a3a3a;
   box-shadow:0 3px 7px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.06);
 }
+/* +/- pair left of enc row 2 */
+.pm-pair{display:flex;gap:3px;flex-shrink:0}
+.pm-btn{
+  width:30px;height:28px;border-radius:3px;
+  background:#1a1a1a;border:1px solid #272727;
+  color:#555;font-size:12px;text-align:center;line-height:28px;cursor:default;
+}
 
 /* right panel */
 #rpanel{display:flex;align-items:flex-start;gap:8px;margin-left:auto}
@@ -168,7 +175,7 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
 /* mode buttons: single column */
 #mode-col{display:flex;flex-direction:column;gap:4px;padding-top:2px}
 .mode-btn{
-  width:54px;height:26px;border-radius:4px;
+  width:62px;height:30px;border-radius:4px;
   background:#1e1e1e;border:1px solid #2a2a2a;
   color:#555;font-size:8px;font-family:inherit;
   text-transform:uppercase;letter-spacing:.4px;cursor:default;transition:all .06s;
@@ -179,8 +186,8 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
 #oled-block{display:flex;flex-direction:column;gap:3px}
 .sk-btn-row{display:flex;gap:3px}
 .sk-btn{
-  flex:1;min-width:0;height:36px;border-radius:3px;
-  background:#141414;border:1px solid #1e1e1e;border-top:2px solid #1e1e1e;
+  flex:1;min-width:0;height:42px;border-radius:3px;
+  background:#141414;border:1px solid #1e1e1e;border-top:4px solid #1e1e1e;
   padding:2px 5px;cursor:default;transition:border-top-color .08s;
 }
 .sk-btn-title{
@@ -195,7 +202,7 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
 }
 .main-line{font-size:11px;color:#ddd;white-space:nowrap;overflow:hidden;line-height:1.5}
 
-/* nav column: enc9 (jog) | back/fwd | +/- */
+/* nav column: enc9 (jog) | back/fwd */
 #nav-col{display:flex;flex-direction:column;align-items:center;gap:5px}
 #enc9{
   width:56px;height:56px;border-radius:50%;
@@ -214,9 +221,9 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
 /* A-H slots: 2 rows of 4 */
 .slots{display:flex;gap:3px;margin-bottom:3px}
 .slot-btn{
-  width:28px;height:24px;border-radius:3px;
+  width:32px;height:28px;border-radius:3px;
   background:#181818;border:1px solid #252525;
-  color:#444;font-size:8px;text-align:center;line-height:24px;
+  color:#444;font-size:8px;text-align:center;line-height:28px;
   cursor:default;transition:all .06s;
 }
 .slot-btn.active{background:#e07800;border-color:#e07800;color:#000;box-shadow:0 0 6px rgba(224,120,0,.5)}
@@ -224,9 +231,9 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
 /* transport */
 .tr-row{display:flex;gap:4px;margin-top:4px}
 .tr-btn{
-  width:36px;height:30px;border-radius:4px;
+  width:42px;height:36px;border-radius:4px;
   background:#1e1e1e;border:1px solid #2a2a2a;
-  color:#555;font-size:11px;text-align:center;line-height:30px;
+  color:#555;font-size:13px;text-align:center;line-height:36px;
   cursor:default;transition:all .06s;
 }
 .tr-btn.play.lit {background:#00b060;border-color:#00b060;color:#000;box-shadow:0 0 7px rgba(0,176,96,.5)}
@@ -235,8 +242,8 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
 .tr-btn.metro.lit{background:#555;border-color:#666;color:#ddd}
 
 /* touchstrip */
-#ts-wrap{flex:1;height:12px;background:#0d0d0d;border-radius:6px;border:1px solid #202020;position:relative;overflow:hidden}
-#ts-pos{position:absolute;width:18px;height:100%;background:#e07800;border-radius:5px;left:50%;transform:translateX(-50%);opacity:0;transition:left .04s,opacity .1s}
+#ts-wrap{flex:1;height:18px;background:#0d0d0d;border-radius:8px;border:1px solid #202020;position:relative;overflow:hidden}
+#ts-pos{position:absolute;width:22px;height:100%;background:#e07800;border-radius:7px;left:50%;transform:translateX(-50%);opacity:0;transition:left .04s,opacity .1s}
 
 /* nav cross: 3x3 grid, corners empty */
 #nav-cross{
@@ -287,10 +294,15 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
 
     <div id="encs">
       <div class="enc-row">
+        <div class="enc-spacer"></div>
         <div class="enc">1</div><div class="enc">2</div>
         <div class="enc">3</div><div class="enc">4</div>
       </div>
-      <div class="enc-row enc-row-bot">
+      <div class="enc-row">
+        <div class="pm-pair">
+          <div class="pm-btn">+</div>
+          <div class="pm-btn">&#8722;</div>
+        </div>
         <div class="enc">5</div><div class="enc">6</div>
         <div class="enc">7</div><div class="enc">8</div>
       </div>
@@ -324,16 +336,12 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
         </div>
       </div>
 
-      <!-- Nav column: enc9 (jog wheel) | back/fwd | +/- -->
+      <!-- Nav column: enc9 (jog wheel) | back/fwd -->
       <div id="nav-col">
         <div id="enc9">NAV</div>
         <div class="nav-pair">
           <div class="nav-sm" title="Back">&#9664;</div>
           <div class="nav-sm" title="Forward">&#9654;</div>
-        </div>
-        <div class="nav-pair">
-          <div class="nav-sm">+</div>
-          <div class="nav-sm">&#8722;</div>
         </div>
       </div>
 
