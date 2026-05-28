@@ -35,11 +35,11 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eden.controller import AtomSQ
-from eden.audio import SamplePlayer, StateRef, StepScheduler
+from eden.audio import AudioMixer, StateRef, StepScheduler
 from eden.clock import SequencerClock
 from eden.reduce import reduce
 from eden.render import render_pads, render_oled, render_button_leds
-from eden.state import default_state, AppState
+from eden.state import default_state, AppState, DrumTrack, SynthTrack
 from eden.events import ClockTicked, SessionLoaded, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
 from eden.state import Mode
 import eden.sessions as sessions
@@ -72,11 +72,12 @@ class EdenApp:
         self._state_ref = StateRef(self._state)
 
         self._controller = AtomSQ(event_queue=self._eq)
-        self._audio = SamplePlayer(sample_dir=sample_dir)
+        self._mixer = AudioMixer(sample_dir=sample_dir)
         self._clock = SequencerClock(
             bpm=self._state.tempo_bpm, steps=32, ppq=8, event_queue=self._eq
         )
-        self._scheduler = StepScheduler(player=self._audio, state_ref=self._state_ref)
+        self._scheduler = StepScheduler(mixer=self._mixer, state_ref=self._state_ref)
+        self._init_engines(self._state)
 
         # Render delta state: compare against previous render to send only diffs.
         self._last_pad_colors: tuple[tuple[int, int, int], ...] = tuple(
@@ -96,8 +97,8 @@ class EdenApp:
     def stop(self) -> None:
         self._clock.stop()
         self._controller.stop_listening()
-        self._audio.stop_all()
-        self._audio.close()
+        self._mixer.stop_all()
+        self._mixer.close()
         self._controller.close()
 
     def run(self, ui=None) -> None:
@@ -142,6 +143,7 @@ class EdenApp:
 
             if new_state is not self._state:
                 old_bpm = self._state.tempo_bpm
+                self._sync_engines(self._state, new_state)
                 self._state = new_state
                 self._state_ref.set(new_state)
                 self._flush_render()
@@ -155,6 +157,45 @@ class EdenApp:
             # Schedule audio AFTER state swap so scheduler sees updated playhead.
             if isinstance(event, ClockTicked):
                 self._scheduler.on_tick()
+
+    # ─── Engine lifecycle ─────────────────────────────────────────────────────
+
+    def _init_engines(self, state: AppState) -> None:
+        """Create engines for all non-None tracks in state."""
+        for i, track in enumerate(state.tracks):
+            if track is not None:
+                self._mixer.assign_engine(i, self._mixer.create_engine_for(track))
+
+    def _sync_engines(self, old_state: AppState, new_state: AppState) -> None:
+        """
+        Diff-based engine management called after every state transition.
+
+        Tracks that changed get their engines replaced. When a graceful session
+        transition is in progress (finishing_loops is non-empty), old engines
+        for finishing tracks are moved to _finishing_engines so they keep playing.
+        When finishing_loops drains to empty, finishing engines are released.
+        """
+        old_tracks = old_state.tracks
+        new_tracks = new_state.tracks
+
+        for i, (old_t, new_t) in enumerate(zip(old_tracks, new_tracks)):
+            if old_t is new_t:
+                continue
+
+            # Preserve old engine if this track has finishing loops
+            if new_state.finishing_loops and old_t is not None:
+                if any(tid == i for tid, _ in new_state.finishing_loops):
+                    old_engine = self._mixer.get_engine(i)
+                    if old_engine is not None:
+                        self._mixer.assign_finishing_engine(i, old_engine)
+
+            self._mixer.remove_engine(i)
+            if new_t is not None:
+                self._mixer.assign_engine(i, self._mixer.create_engine_for(new_t))
+
+        # Release finishing engines once all finishing loops have played out
+        if old_state.finishing_loops and not new_state.finishing_loops:
+            self._mixer.clear_finishing_engines()
 
     # ─── Session I/O ─────────────────────────────────────────────────────────
 
@@ -211,6 +252,7 @@ class EdenApp:
         new_state = reduce(self._state, ev)
         if new_state is not self._state:
             old_bpm = self._state.tempo_bpm
+            self._sync_engines(self._state, new_state)
             self._state = new_state
             self._state_ref.set(new_state)
             self._flush_render()
