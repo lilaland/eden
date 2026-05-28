@@ -16,6 +16,7 @@ from eden.state import (
     InstrumentSubmode,
     Loop,
     Mode,
+    StepNote,
     default_loop,
     default_state,
     default_track_loops,
@@ -59,7 +60,7 @@ def _step_on(state: AppState, track_idx: int, loop_idx: int, step: int) -> AppSt
     track = state.tracks[track_idx]
     assert isinstance(track, DrumTrack)
     loop = track.loops[loop_idx]
-    new_steps = loop.steps[:step] + (True,) + loop.steps[step + 1:]
+    new_steps = loop.steps[:step] + (StepNote(on=True),) + loop.steps[step + 1:]
     new_loop = dataclasses.replace(loop, steps=new_steps)
     new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
     new_track = dataclasses.replace(track, loops=new_loops)
@@ -119,7 +120,7 @@ def test_clock_always_wraps_at_32_for_multi_measure_loop():
     state = default_state()
     # Make track 0 loop 0 a 32-step SIZE=16 loop spanning 2 bars
     t0 = state.tracks[0]
-    long_loop = Loop(steps=tuple(i % 2 == 0 for i in range(32)), bars=2)
+    long_loop = Loop(steps=tuple(StepNote(on=i % 2 == 0) for i in range(32)), bars=2)
     new_loops = (long_loop,) + t0.loops[1:]
     t0_new = dataclasses.replace(t0, loops=new_loops)
     state = dataclasses.replace(
@@ -539,14 +540,14 @@ def test_instrument_pad0_toggles_step0_single_arm():
     """Pad 0 toggles step 0 in the armed track's loop (single-arm)."""
     state = _armed_instrument(armed=(0,))
     result = reduce(state, PadPressed(pad_index=0, velocity=100))
-    assert result.tracks[0].loops[1].steps[0] is True
+    assert result.tracks[0].loops[1].steps[0].on is True
 
 
 def test_instrument_pad15_toggles_step15_single_arm():
     """Pad 15 toggles step 15 in single-arm mode."""
     state = _armed_instrument(armed=(0,))
     result = reduce(state, PadPressed(pad_index=15, velocity=100))
-    assert result.tracks[0].loops[1].steps[15] is True
+    assert result.tracks[0].loops[1].steps[15].on is True
 
 
 def test_instrument_pad16_toggles_step16_single_arm():
@@ -562,7 +563,7 @@ def test_instrument_pad16_toggles_step16_single_arm():
     state = dataclasses.replace(base_state, tracks=new_tracks)
 
     result = reduce(state, PadPressed(pad_index=16, velocity=100))
-    assert result.tracks[0].loops[1].steps[16] is True
+    assert result.tracks[0].loops[1].steps[16].on is True
 
 
 def test_instrument_pad31_toggles_step31_single_arm():
@@ -577,16 +578,16 @@ def test_instrument_pad31_toggles_step31_single_arm():
     state = dataclasses.replace(base_state, tracks=new_tracks)
 
     result = reduce(state, PadPressed(pad_index=31, velocity=100))
-    assert result.tracks[0].loops[1].steps[31] is True
+    assert result.tracks[0].loops[1].steps[31].on is True
 
 
 def test_instrument_double_toggle_restores_original():
     """Toggling the same step twice returns the step to its original (False) state."""
     state = _armed_instrument(armed=(0,))
     s1 = reduce(state, PadPressed(pad_index=3, velocity=100))
-    assert s1.tracks[0].loops[1].steps[3] is True
+    assert s1.tracks[0].loops[1].steps[3].on is True
     s2 = reduce(s1, PadPressed(pad_index=3, velocity=100))
-    assert s2.tracks[0].loops[1].steps[3] is False
+    assert s2.tracks[0].loops[1].steps[3].on is False
 
 
 # ── Instrument PadPressed (dual-arm) ─────────────────────────────────────────
@@ -596,18 +597,18 @@ def test_instrument_pad0_dual_arm_toggles_track0_step0():
     """Pad 0 (bottom row) toggles step 0 in armed_tracks[0] during dual-arm."""
     state = _armed_instrument(armed=(0, 1))
     result = reduce(state, PadPressed(pad_index=0, velocity=100))
-    assert result.tracks[0].loops[1].steps[0] is True
+    assert result.tracks[0].loops[1].steps[0].on is True
     # Track 1 (armed_tracks[1]) must be unaffected
-    assert result.tracks[1].loops[1].steps[0] is False
+    assert result.tracks[1].loops[1].steps[0].on is False
 
 
 def test_instrument_pad16_dual_arm_toggles_track1_step0():
     """Pad 16 (top row) toggles step 0 in armed_tracks[1] during dual-arm."""
     state = _armed_instrument(armed=(0, 1))
     result = reduce(state, PadPressed(pad_index=16, velocity=100))
-    assert result.tracks[1].loops[1].steps[0] is True
+    assert result.tracks[1].loops[1].steps[0].on is True
     # Track 0 must be unaffected
-    assert result.tracks[0].loops[1].steps[0] is False
+    assert result.tracks[0].loops[1].steps[0].on is False
 
 
 # ── Instrument SoftkeyPressed ─────────────────────────────────────────────────
@@ -659,7 +660,7 @@ def test_instrument_sk5_clear_without_shift_is_noop():
     state = _step_on(_armed_instrument(), track_idx=0, loop_idx=1, step=4)
     result = reduce(state, SoftkeyPressed(key=4))
     # Step should remain set
-    assert result.tracks[0].loops[1].steps[4] is True
+    assert result.tracks[0].loops[1].steps[4].on is True
 
 
 def test_instrument_sk5_clear_with_shift_clears_all_steps():
@@ -668,7 +669,7 @@ def test_instrument_sk5_clear_with_shift_clears_all_steps():
     state = _step_on(state, track_idx=0, loop_idx=1, step=7)
     state = dataclasses.replace(state, shift_held=True)
     result = reduce(state, SoftkeyPressed(key=4))
-    assert all(s is False for s in result.tracks[0].loops[1].steps)
+    assert all(not s.on for s in result.tracks[0].loops[1].steps)
 
 
 def test_instrument_sk5_clear_dual_arm_clears_both_tracks():
@@ -678,8 +679,8 @@ def test_instrument_sk5_clear_dual_arm_clears_both_tracks():
     state = _step_on(state, track_idx=1, loop_idx=1, step=5)
     state = dataclasses.replace(state, shift_held=True)
     result = reduce(state, SoftkeyPressed(key=4))
-    assert all(s is False for s in result.tracks[0].loops[1].steps)
-    assert all(s is False for s in result.tracks[1].loops[1].steps)
+    assert all(not s.on for s in result.tracks[0].loops[1].steps)
+    assert all(not s.on for s in result.tracks[1].loops[1].steps)
 
 
 def test_clear_armed_track_persists_until_back():
@@ -694,7 +695,7 @@ def test_clear_armed_track_persists_until_back():
     state = dataclasses.replace(state, shift_held=True)
     after_clear = reduce(state, SoftkeyPressed(key=4))  # SK5 CLEAR
     # Steps cleared, but track and mode persist.
-    assert all(s is False for s in after_clear.tracks[0].loops[1].steps)
+    assert all(not s.on for s in after_clear.tracks[0].loops[1].steps)
     assert after_clear.tracks[0] is not None
     assert after_clear.mode is Mode.INSTRUMENT
     # BACK now GCs the empty armed track.
@@ -760,8 +761,8 @@ def test_instrument_pad_uses_view_measure():
     state = dataclasses.replace(state, instrument_active_ctrl="", instrument_view_measure=1)
     # Press pad 0 with view_measure=1 → should toggle step 16 (not step 0)
     result = reduce(state, PadPressed(pad_index=0, velocity=100))
-    assert result.tracks[0].loops[1].steps[16] is True
-    assert result.tracks[0].loops[1].steps[0] is False
+    assert result.tracks[0].loops[1].steps[16].on is True
+    assert result.tracks[0].loops[1].steps[0].on is False
 
 
 def test_instrument_pad_auto_extends_loop_when_editing_beyond_length():
@@ -772,7 +773,7 @@ def test_instrument_pad_auto_extends_loop_when_editing_beyond_length():
     result = reduce(state, PadPressed(pad_index=0, velocity=100))
     # Loop should have been extended to at least 32 steps (2 bars)
     assert result.tracks[0].loops[1].step_count == 32
-    assert result.tracks[0].loops[1].steps[16] is True
+    assert result.tracks[0].loops[1].steps[16].on is True
 
 
 # ── BARS control ─────────────────────────────────────────────────────────────
@@ -1145,6 +1146,6 @@ def test_reduce_does_not_mutate_input_state():
     _ = reduce(state, PadPressed(pad_index=0, velocity=100))
 
     assert state.tracks[0].loops[1].steps == original_steps
-    assert state.tracks[0].loops[1].steps[0] is False
+    assert state.tracks[0].loops[1].steps[0].on is False
 
 

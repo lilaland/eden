@@ -12,6 +12,19 @@ class Mode(Enum):
     INSTRUMENT = auto()
 
 
+@dataclass(frozen=True)
+class StepNote:
+    """A single step in a loop. Drums use on/velocity; synths use all fields."""
+    on: bool
+    pitch: int = 60      # MIDI note 0-127; ignored by DrumTrack
+    velocity: int = 100  # 0-127; used by both drums and synths
+    gate: float = 0.5    # fraction of step duration held; ignored by DrumTrack
+
+    @classmethod
+    def off(cls) -> "StepNote":
+        return cls(on=False)
+
+
 class InstrumentSubmode(Enum):
     STEPS = auto()  # default step-grid editing
     PADS = auto()   # M2: live pad recording into a loop slot
@@ -21,16 +34,15 @@ class InstrumentSubmode(Enum):
 class Loop:
     """A single loop slot: variable-length step sequence plus play-count config."""
 
-    steps: tuple[bool, ...]  # 16 or 32 booleans
-    loop_count: int = 0      # 0=∞, 1/2/4/8=plays per cycle (configured)
-    # TODO M3+: add plays_remaining tracking
+    steps: tuple[StepNote, ...]  # 16 or 32 StepNotes
+    loop_count: int = 0          # 0=∞, 1/2/4/8=plays per cycle (configured)
     bars: int = 1
     numerator: int = 4
-    step_size: int = 16      # note value denominator: 4/8/16/32
+    step_size: int = 16          # note value denominator: 4/8/16/32
 
     @property
     def is_empty(self) -> bool:
-        return not any(self.steps)
+        return not any(s.on for s in self.steps)
 
     @property
     def step_count(self) -> int:
@@ -118,7 +130,7 @@ class AppState:
 
 def default_loop(step_count: int = 16) -> Loop:
     """Create an empty loop with all steps off."""
-    return Loop(steps=tuple(False for _ in range(step_count)))
+    return Loop(steps=tuple(StepNote.off() for _ in range(step_count)))
 
 
 def default_track_loops(step_count: int = 16) -> tuple[Loop, ...]:
@@ -127,14 +139,12 @@ def default_track_loops(step_count: int = 16) -> tuple[Loop, ...]:
 
 
 def _kick_loop() -> Loop:
-    """4-on-the-floor kick pattern: beats 1, 2, 3, 4 (steps 0, 4, 8, 12)."""
-    steps = tuple(i in (0, 4, 8, 12) for i in range(16))
+    steps = tuple(StepNote(on=i in (0, 4, 8, 12)) for i in range(16))
     return Loop(steps=steps)
 
 
 def _snare_loop() -> Loop:
-    """Backbeat snare: beats 2 and 4 (steps 4, 12)."""
-    steps = tuple(i in (4, 12) for i in range(16))
+    steps = tuple(StepNote(on=i in (4, 12)) for i in range(16))
     return Loop(steps=steps)
 
 

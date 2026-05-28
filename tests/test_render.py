@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pytest
 
 from eden.state import (
-    AppState, Mode, InstrumentSubmode, DrumTrack, SynthTrack, Loop,
+    AppState, Mode, InstrumentSubmode, DrumTrack, SynthTrack, Loop, StepNote,
     default_state, default_loop, default_track_loops,
 )
 from eden.theme import (
@@ -42,7 +42,7 @@ def armed_single_state() -> AppState:
     s = default_state()
     # Give track 0 a 32-step loop at selected_loop=0
     t0 = s.tracks[0]
-    loop32 = Loop(steps=tuple(i % 4 == 0 for i in range(32)))  # steps 0,4,8...
+    loop32 = Loop(steps=tuple(StepNote(on=i % 4 == 0) for i in range(32)))  # steps 0,4,8...
     new_loops = (loop32,) + t0.loops[1:]
     new_t0 = dataclasses.replace(t0, loops=new_loops)
     new_tracks = (new_t0,) + s.tracks[1:]
@@ -62,7 +62,7 @@ def armed_dual_state() -> AppState:
     s = armed_single_state()
     # Give track 1 a 16-step loop at selected_loop=0 with step 0 on
     t1 = s.tracks[1]
-    steps = tuple(i == 0 for i in range(16))
+    steps = tuple(StepNote(on=i == 0) for i in range(16))
     loop16 = Loop(steps=steps)
     new_loops = (loop16,) + t1.loops[1:]
     new_t1 = dataclasses.replace(t1, loops=new_loops)
@@ -130,7 +130,7 @@ def test_render_pads_session_playing_loop_pulses_type_color():
     """Test 8: Non-selected playing loop pulses in track type color."""
     s = default_state()
     t0 = s.tracks[0]
-    steps = tuple(i == 0 for i in range(16))
+    steps = tuple(StepNote(on=i == 0) for i in range(16))
     loop_with_step = Loop(steps=steps)
     new_loops = t0.loops[:1] + (loop_with_step,) + t0.loops[2:]
     new_t0 = dataclasses.replace(t0, loops=new_loops)
@@ -245,7 +245,7 @@ def _interleaved_state() -> AppState:
     s = default_state()
     t0 = s.tracks[0]
     # 1 bar, 4 beats, 1/32 → 32 steps; step 0 on
-    loop32 = Loop(steps=(True,) + tuple(False for _ in range(31)), bars=1, numerator=4, step_size=32)
+    loop32 = Loop(steps=(StepNote(on=True),) + tuple(StepNote.off() for _ in range(31)), bars=1, numerator=4, step_size=32)
     new_loops = (loop32,) + t0.loops[1:]
     new_t0 = dataclasses.replace(t0, loops=new_loops)
     return dataclasses.replace(
@@ -289,7 +289,7 @@ def test_render_pads_interleaved_step1_active_shows_on_pad16():
     t0 = s.tracks[0]
     loop = t0.loops[0]
     # Turn on step 1
-    new_steps = (True, True) + loop.steps[2:]
+    new_steps = (StepNote(on=True), StepNote(on=True)) + loop.steps[2:]
     new_loop = dataclasses.replace(loop, steps=new_steps)
     new_loops = (new_loop,) + t0.loops[1:]
     new_t0 = dataclasses.replace(t0, loops=new_loops)
@@ -339,14 +339,14 @@ def test_render_pads_interleaved_step_beyond_count_is_inactive():
     # step_count=32, so all 32 pads map to steps 0-31, none beyond
     # Use a shorter loop to test: 1 bar, numer=2, size=32 → 16 steps
     t0 = s.tracks[0]
-    short_loop = Loop(steps=tuple(False for _ in range(16)), bars=1, numerator=2, step_size=32)
+    short_loop = Loop(steps=tuple(StepNote.off() for _ in range(16)), bars=1, numerator=2, step_size=32)
     new_loops = (short_loop,) + t0.loops[1:]
     new_t0 = dataclasses.replace(t0, loops=new_loops)
     s = dataclasses.replace(s, tracks=(new_t0,) + s.tracks[1:])
     pads = render_pads(s)
     # steps_per_bar = 2 * 8 = 16... not > 16, falls back to normal view
     # Use numer=3, size=32 → steps_per_bar=24 > 16, step_count=24
-    medium_loop = Loop(steps=tuple(False for _ in range(24)), bars=1, numerator=3, step_size=32)
+    medium_loop = Loop(steps=tuple(StepNote.off() for _ in range(24)), bars=1, numerator=3, step_size=32)
     new_loops2 = (medium_loop,) + t0.loops[1:]
     new_t0b = dataclasses.replace(t0, loops=new_loops2)
     s2 = dataclasses.replace(s, tracks=(new_t0b,) + s.tracks[1:])

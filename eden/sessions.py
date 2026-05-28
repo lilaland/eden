@@ -7,11 +7,11 @@ import os
 from typing import Optional
 
 from eden.state import (
-    AppState, DrumTrack, Loop, Mode, InstrumentSubmode,
+    AppState, DrumTrack, Loop, StepNote, Mode, InstrumentSubmode,
     default_loop, default_track_loops,
 )
 
-SESSION_VERSION = 1
+SESSION_VERSION = 2
 
 _SLOT_LETTERS = "ABCDEFGH"
 
@@ -27,12 +27,25 @@ def slot_from_letter(letter: str) -> Optional[int]:
 
 # ── Step encoding ─────────────────────────────────────────────────────────────
 
-def _steps_to_str(steps: tuple[bool, ...]) -> str:
-    return "".join("1" if s else "0" for s in steps)
+def _steps_to_str(steps: tuple[StepNote, ...]) -> str:
+    return "".join("1" if s.on else "0" for s in steps)
 
 
-def _str_to_steps(s: str) -> tuple[bool, ...]:
-    return tuple(c == "1" for c in s)
+def _str_to_steps(
+    s: str,
+    pitches: list | None = None,
+    velocities: list | None = None,
+    gates: list | None = None,
+) -> tuple[StepNote, ...]:
+    result = []
+    for i, c in enumerate(s):
+        result.append(StepNote(
+            on=c == "1",
+            pitch=pitches[i] if pitches and i < len(pitches) else 60,
+            velocity=velocities[i] if velocities and i < len(velocities) else 100,
+            gate=gates[i] if gates and i < len(gates) else 0.5,
+        ))
+    return tuple(result)
 
 
 # ── Loop ──────────────────────────────────────────────────────────────────────
@@ -40,19 +53,35 @@ def _str_to_steps(s: str) -> tuple[bool, ...]:
 def _loop_to_dict(loop: Loop) -> Optional[dict]:
     if loop.is_empty:
         return None
-    return {
+    d: dict = {
         "steps": _steps_to_str(loop.steps),
         "bars": loop.bars,
         "numerator": loop.numerator,
         "step_size": loop.step_size,
         "loop_count": loop.loop_count,
     }
+    # Only emit per-step arrays when non-default (drums never will)
+    pitches = [s.pitch for s in loop.steps]
+    velocities = [s.velocity for s in loop.steps]
+    gates = [s.gate for s in loop.steps]
+    if any(p != 60 for p in pitches):
+        d["pitches"] = pitches
+    if any(v != 100 for v in velocities):
+        d["velocities"] = velocities
+    if any(g != 0.5 for g in gates):
+        d["gates"] = gates
+    return d
 
 
 def _dict_to_loop(d: Optional[dict]) -> Loop:
     if d is None:
         return default_loop()
-    steps = _str_to_steps(d["steps"])
+    steps = _str_to_steps(
+        d["steps"],
+        pitches=d.get("pitches"),
+        velocities=d.get("velocities"),
+        gates=d.get("gates"),
+    )
     return Loop(
         steps=steps,
         bars=d.get("bars", 1),

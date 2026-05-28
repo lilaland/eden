@@ -176,7 +176,7 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
                             )
                             if is_playhead:
                                 pads[pad_idx] = PAD_PLAYHEAD
-                            elif loop.steps[step]:
+                            elif loop.steps[step].on:
                                 pads[pad_idx] = color
                             else:
                                 pads[pad_idx] = PAD_INACTIVE
@@ -202,7 +202,7 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
                             )
                             if is_playhead:
                                 pads[pad_idx] = PAD_PLAYHEAD
-                            elif loop.steps[global_step]:
+                            elif loop.steps[global_step].on:
                                 pads[pad_idx] = color
                             else:
                                 pads[pad_idx] = PAD_INACTIVE
@@ -232,7 +232,7 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
                     )
                     if is_playhead:
                         pads[pad_idx] = PAD_PLAYHEAD
-                    elif loop.steps[global_step]:
+                    elif loop.steps[global_step].on:
                         pads[pad_idx] = color
                     else:
                         pads[pad_idx] = PAD_INACTIVE

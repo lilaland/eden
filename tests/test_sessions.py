@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from eden.state import default_state, AppState, DrumTrack, Loop, default_loop
+from eden.state import default_state, AppState, DrumTrack, Loop, StepNote, default_loop
 from eden.events import SessionLoaded, TransportPressed, ShiftChanged
 from eden.reduce import reduce
 import eden.sessions as sessions
@@ -32,7 +32,7 @@ def test_steps_roundtrip_all_off():
 
 
 def test_steps_roundtrip_pattern():
-    steps = tuple(i in (0, 4, 8, 12) for i in range(16))
+    steps = tuple(StepNote(on=i in (0, 4, 8, 12)) for i in range(16))
     loop = Loop(steps=steps)
     d = sessions._loop_to_dict(loop)
     assert d is not None
@@ -42,12 +42,45 @@ def test_steps_roundtrip_pattern():
 
 
 def test_steps_roundtrip_32_step():
-    steps = tuple(i % 2 == 0 for i in range(32))
+    steps = tuple(StepNote(on=i % 2 == 0) for i in range(32))
     loop = Loop(steps=steps, step_size=32)
     d = sessions._loop_to_dict(loop)
     assert len(d["steps"]) == 32
     back = sessions._dict_to_loop(d)
     assert back.steps == steps
+
+
+def test_steps_roundtrip_velocity():
+    steps = tuple(StepNote(on=True, velocity=80) for _ in range(4)) + \
+            tuple(StepNote.off() for _ in range(12))
+    loop = Loop(steps=steps)
+    d = sessions._loop_to_dict(loop)
+    assert "velocities" in d
+    back = sessions._dict_to_loop(d)
+    assert back.steps[0].velocity == 80
+    assert back.steps[0].on is True
+
+
+def test_steps_roundtrip_pitch_and_gate():
+    steps = (StepNote(on=True, pitch=72, gate=0.25),) + \
+            tuple(StepNote.off() for _ in range(15))
+    loop = Loop(steps=steps)
+    d = sessions._loop_to_dict(loop)
+    assert "pitches" in d
+    assert "gates" in d
+    back = sessions._dict_to_loop(d)
+    assert back.steps[0].pitch == 72
+    assert back.steps[0].gate == 0.25
+
+
+def test_steps_drum_no_extra_arrays():
+    """Drum loops (all-default pitch/velocity/gate) never emit pitches/velocities/gates."""
+    steps = tuple(StepNote(on=i in (0, 4, 8, 12)) for i in range(16))
+    loop = Loop(steps=steps)
+    d = sessions._loop_to_dict(loop)
+    assert "pitches" not in d
+    assert "velocities" not in d
+    assert "gates" not in d
 
 
 # ── Track serialization ───────────────────────────────────────────────────────

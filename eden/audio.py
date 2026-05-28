@@ -305,8 +305,9 @@ class StepScheduler:
                     stride = spb
                 offset = offsets.get(key, 0)
                 effective_step = step_in_bar + offset * stride
-                if effective_step < loop.step_count and loop.steps[effective_step]:
-                    self._player.trigger(track.sample_name, 1.0)
+                step = loop.steps[effective_step]
+                if effective_step < loop.step_count and step.on:
+                    self._player.trigger(track.sample_name, step.velocity / 127.0)
                     break
 
 

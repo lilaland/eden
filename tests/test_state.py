@@ -17,6 +17,7 @@ from eden.state import (
     Loop,
     Mode,
     SampleTrack,
+    StepNote,
     SynthTrack,
     default_loop,
     default_state,
@@ -73,13 +74,13 @@ def test_default_state_track2_is_none():
 
 
 def test_loop_is_empty_all_false():
-    loop = Loop(steps=tuple(False for _ in range(16)))
+    loop = Loop(steps=tuple(StepNote.off() for _ in range(16)))
     assert loop.is_empty is True
 
 
 def test_loop_is_empty_one_true():
-    steps = [False] * 16
-    steps[3] = True
+    steps = [StepNote.off()] * 16
+    steps[3] = StepNote(on=True)
     loop = Loop(steps=tuple(steps))
     assert loop.is_empty is False
 
@@ -97,7 +98,7 @@ def test_loop_step_count_32():
 def test_default_loop_32_all_false():
     loop = default_loop(32)
     assert len(loop.steps) == 32
-    assert all(s is False for s in loop.steps)
+    assert all(not s.on for s in loop.steps)
 
 
 # ── Immutability ──────────────────────────────────────────────────────────────

@@ -13,6 +13,7 @@ from eden.state import (
     Loop,
     Mode,
     SampleTrack,
+    StepNote,
     SynthTrack,
     Track,
     default_loop,
@@ -576,16 +577,16 @@ def _resize_loop_to(loop: Loop, bars: int, numer: int, size: int) -> Loop:
     if size != loop.step_size:
         old_spu = loop.step_size // 4
         new_spu = size // 4
-        new_steps: list[bool] = [False] * new_count
-        for i, active in enumerate(loop.steps):
-            if active:
+        new_steps: list[StepNote] = [StepNote.off()] * new_count
+        for i, step in enumerate(loop.steps):
+            if step.on:
                 new_i = i * new_spu // old_spu
                 if 0 <= new_i < new_count:
-                    new_steps[new_i] = True
+                    new_steps[new_i] = step  # preserve pitch/velocity/gate
         return dataclasses.replace(loop, steps=tuple(new_steps), bars=bars, numerator=numer, step_size=size)
     current = loop.steps
     if new_count > len(current):
-        new_steps_t = current + (False,) * (new_count - len(current))
+        new_steps_t = current + tuple(StepNote.off() for _ in range(new_count - len(current)))
     else:
         new_steps_t = current[:new_count]
     return dataclasses.replace(loop, steps=new_steps_t, bars=bars, numerator=numer, step_size=size)
@@ -742,7 +743,7 @@ def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
         else:
             step_idx = view_m * 16 + pad
         state = _ensure_loop_length(state, affected_track, loop_idx, step_idx + 1)
-        new_state = _toggle_step(state, affected_track, loop_idx, step_idx)
+        new_state = _toggle_step(state, affected_track, loop_idx, step_idx, event.velocity)
     else:
         # dual-arm: bottom row → arm1, top row → arm2; both at view_measure
         row = pad // 16
@@ -750,7 +751,7 @@ def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
         affected_track = state.armed_tracks[row] if row < len(state.armed_tracks) else state.armed_tracks[0]
         step_idx = view_m * 16 + step_in_row
         state = _ensure_loop_length(state, affected_track, loop_idx, step_idx + 1)
-        new_state = _toggle_step(state, affected_track, loop_idx, step_idx)
+        new_state = _toggle_step(state, affected_track, loop_idx, step_idx, event.velocity)
 
     # Auto-start any armed loop that just became non-empty.
     new_playing = set(new_state.playing_loops)
@@ -778,7 +779,7 @@ def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
 
 
 def _toggle_step(
-    state: AppState, track_idx: int, loop_idx: int, step_idx: int
+    state: AppState, track_idx: int, loop_idx: int, step_idx: int, velocity: int = 100
 ) -> AppState:
     """Return a new AppState with the given step toggled. Pure, no mutation."""
     track = state.tracks[track_idx]
@@ -786,12 +787,13 @@ def _toggle_step(
         return state
     if isinstance(track, (SynthTrack, SampleTrack)):
         raise NotImplementedError("SynthTrack/SampleTrack step editing is M3")
-    # DrumTrack path
     loop = track.loops[loop_idx]
     old_steps = loop.steps
     if step_idx >= len(old_steps):
         return state
-    new_steps = old_steps[:step_idx] + (not old_steps[step_idx],) + old_steps[step_idx + 1:]
+    old_step = old_steps[step_idx]
+    new_step = StepNote.off() if old_step.on else StepNote(on=True, velocity=velocity)
+    new_steps = old_steps[:step_idx] + (new_step,) + old_steps[step_idx + 1:]
     new_loop = dataclasses.replace(loop, steps=new_steps)
     new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
     new_track = dataclasses.replace(track, loops=new_loops)
@@ -934,7 +936,7 @@ def _clear_armed_loops(state: AppState) -> AppState:
         if track is None or not isinstance(track, DrumTrack):
             continue
         loop = track.loops[new_state.selected_loop]
-        blank_steps = tuple(False for _ in range(loop.step_count))
+        blank_steps = tuple(StepNote.off() for _ in range(loop.step_count))
         new_loop = dataclasses.replace(loop, steps=blank_steps)
         new_loops = (
             track.loops[:new_state.selected_loop]
