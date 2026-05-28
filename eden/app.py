@@ -29,6 +29,7 @@ import dataclasses
 import os
 import queue
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -99,11 +100,18 @@ class EdenApp:
         self._audio.close()
         self._controller.close()
 
-    def run(self) -> None:
+    def run(self, ui=None) -> None:
         print(f"Eden M2 — {self._state.tempo_bpm:.0f} BPM  slot {sessions.slot_letter(self._state.active_session_slot)}  |  Ctrl-C to quit")
         self.start()
         try:
-            self._event_loop()
+            if ui is not None:
+                # Run the Eden event loop on a background thread so the UI
+                # can own the main thread (required on macOS for SDL/pygame).
+                bg = threading.Thread(target=self._event_loop, daemon=True)
+                bg.start()
+                ui.run_blocking()  # blocks until window closed or Ctrl-C
+            else:
+                self._event_loop()
         except KeyboardInterrupt:
             pass
         finally:
@@ -269,6 +277,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--sessions-dir", default=_DEFAULT_SESSIONS_DIR,
                         help="Directory for auto-named session files (default: sessions/)")
+    parser.add_argument("--ui", action="store_true",
+                        help="Open the pygame debug window (requires pygame)")
+    parser.add_argument("--web", action="store_true",
+                        help="Open browser controller mirror on http://localhost:8765")
     args = parser.parse_args()
 
     session_paths: list[str | None] = [None] * 8
@@ -286,4 +298,13 @@ if __name__ == "__main__":
         session_paths=session_paths,
         sessions_dir=args.sessions_dir,
     )
-    app.run()
+
+    ui = None
+    if args.web:
+        from eden.web_ui import WebUI
+        ui = WebUI(app._state_ref)
+    elif args.ui:
+        from eden.debug_ui import DebugUI
+        ui = DebugUI(app._state_ref)
+
+    app.run(ui=ui)
