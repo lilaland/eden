@@ -62,3 +62,13 @@ class TouchbarMoved(Event):
 class ArrowPressed(Event):
     direction: str   # "LEFT" | "RIGHT"
     pressed: bool
+
+
+@dataclass(frozen=True)
+class MetronomePressed(Event):
+    pressed: bool
+
+
+@dataclass(frozen=True)
+class TapTempoPressed(Event):
+    timestamp: float  # time.time() at moment of tap

@@ -23,11 +23,13 @@ from eden.events import (
     ClockTicked,
     EncoderTurned,
     Event,
+    MetronomePressed,
     ModeButtonPressed,
     PadPressed,
     PadReleased,
     ShiftChanged,
     SoftkeyPressed,
+    TapTempoPressed,
     TouchbarMoved,
     TransportPressed,
 )
@@ -45,6 +47,14 @@ def reduce(state: AppState, event: Event) -> AppState:
         return _on_clock_ticked(state)
     if isinstance(event, ModeButtonPressed):
         return _on_mode_button(state, event)
+    if isinstance(event, MetronomePressed):
+        return _on_metronome(state, event)
+    if isinstance(event, TapTempoPressed):
+        return _on_tap_tempo(state, event)
+    # Metronome+jog intercepts encoder before mode dispatch.
+    if isinstance(event, EncoderTurned) and state.metronome_held and event.encoder == 9:
+        new_bpm = max(20.0, min(300.0, state.tempo_bpm + event.delta))
+        return dataclasses.replace(state, tempo_bpm=float(new_bpm))
     if state.mode == Mode.SESSION:
         return _reduce_session(state, event)
     if state.mode == Mode.INSTRUMENT:
@@ -119,6 +129,30 @@ def _handle_loop_wrap(state: AppState) -> AppState:
         plays_remaining=tuple(remaining.items()),
         loop_measure_offsets=tuple(offsets.items()),
     )
+
+
+_TAP_MAX_TAPS = 8
+_TAP_TIMEOUT = 2.0  # seconds — gap larger than this resets tap history
+
+
+def _on_metronome(state: AppState, event: MetronomePressed) -> AppState:
+    if not event.pressed:
+        return dataclasses.replace(state, metronome_held=False)
+    return dataclasses.replace(state, metronome_held=True)
+
+
+def _on_tap_tempo(state: AppState, event: TapTempoPressed) -> AppState:
+    times = state.tap_times
+    if times and (event.timestamp - times[-1]) > _TAP_TIMEOUT:
+        times = ()
+    times = (times + (event.timestamp,))[-_TAP_MAX_TAPS:]
+    new_state = dataclasses.replace(state, tap_times=times, playhead=0)
+    if len(times) >= 2:
+        intervals = [times[i] - times[i - 1] for i in range(1, len(times))]
+        avg = sum(intervals) / len(intervals)
+        new_bpm = max(20.0, min(300.0, 60.0 / avg))
+        return dataclasses.replace(new_state, tempo_bpm=float(new_bpm))
+    return new_state
 
 
 def _on_mode_button(state: AppState, event: ModeButtonPressed) -> AppState:

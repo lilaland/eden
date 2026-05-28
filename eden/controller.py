@@ -57,6 +57,7 @@ from eden.events import (
     PadPressed,
     PadReleased,
     EncoderTurned,
+    MetronomePressed,
     TransportPressed,
     ModeButtonPressed,
     ShiftChanged,
@@ -392,7 +393,7 @@ class AtomSQ:
                 return
 
             if cc == ENC9_NATIVE_CC and self._native_mode:
-                delta = value if value <= 63 else value - 128
+                delta = value if value < 64 else -(value - 64)  # signed-magnitude [SNIFF: CCW=0x41]
                 if delta != 0:
                     if self._event_queue:
                         self._event_queue.put(EncoderTurned(encoder=9, delta=delta))
@@ -404,6 +405,10 @@ class AtomSQ:
             if cc in transport_table:
                 name = transport_table[cc]
                 pressed = (value == 127)
+                if name == "METRO":
+                    if self._event_queue:
+                        self._event_queue.put(MetronomePressed(pressed=pressed))
+                    return
                 if self._event_queue:
                     self._event_queue.put(TransportPressed(button=name, pressed=pressed))
                 if self._cb_transport:
@@ -450,7 +455,7 @@ class AtomSQ:
 
     def _decode_encoder_delta(self, enc_num: int, value: int) -> int:
         if self._native_mode and enc_num != 9:
-            return value if value <= 63 else value - 128
+            return value if value < 64 else -(value - 64)  # signed-magnitude
         last = self._enc_last.get(enc_num)
         self._enc_last[enc_num] = value
         if last is None:

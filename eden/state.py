@@ -101,6 +101,8 @@ class AppState:
     new_slot_var_idx: int = 0          # index into variations for current category
     new_slot_active_ctrl: str = ""     # "" | "TYPE" | "CAT" | "VAR"
     saved_armed_tracks: Optional[tuple[int, ...]] = None  # restored on exit from new-slot INSTRUMENT
+    metronome_held: bool = False
+    tap_times: tuple[float, ...] = ()  # recent Shift+Metronome tap timestamps
 
 
 # ── Factory functions ─────────────────────────────────────────────────────────

@@ -29,6 +29,7 @@ import dataclasses
 import os
 import queue
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -38,7 +39,7 @@ from eden.clock import SequencerClock
 from eden.reduce import reduce
 from eden.render import render_pads, render_oled, render_button_leds
 from eden.state import default_state, AppState
-from eden.events import ClockTicked, SoftkeyPressed, TouchbarMoved
+from eden.events import ClockTicked, SoftkeyPressed, TapTempoPressed, TouchbarMoved
 
 # UNVERIFIED: pad LED addressing — pad_index → note offset confirmed in v0 probe.py
 # UNVERIFIED: ATM SQ Control port requirement — all LED/OLED output must go to Control port
@@ -99,15 +100,22 @@ class EdenApp:
             except queue.Empty:
                 continue
 
+            # SK4 while metronome held → tap tempo (needs wall-clock timestamp).
+            if isinstance(event, SoftkeyPressed) and event.key == 3 and self._state.metronome_held:
+                event = TapTempoPressed(timestamp=time.time())
+
             new_state = reduce(self._state, event)
 
             if isinstance(event, SoftkeyPressed):
                 print(f"[EVENT] SoftkeyPressed key={event.key}  armed={new_state.armed_tracks}  mode={new_state.mode.name}")
 
             if new_state is not self._state:
+                old_bpm = self._state.tempo_bpm
                 self._state = new_state
                 self._state_ref.set(new_state)
                 self._flush_render()
+                if new_state.tempo_bpm != old_bpm:
+                    self._clock.set_bpm(new_state.tempo_bpm)
 
             # Schedule audio AFTER state swap so scheduler sees updated playhead.
             if isinstance(event, ClockTicked):

@@ -23,6 +23,8 @@ from eden.state import (
 from eden.events import (
     ClockTicked,
     EncoderTurned,
+    MetronomePressed,
+    TapTempoPressed,
     ModeButtonPressed,
     PadPressed,
     SoftkeyPressed,
@@ -1060,6 +1062,76 @@ def test_inst_from_empty_slot_song_restores_armed_tracks():
     assert s.mode is Mode.SESSION
     assert s.armed_tracks == (0,)
     assert s.saved_armed_tracks is None
+
+
+# ── Metronome ────────────────────────────────────────────────────────────────
+
+
+def test_metronome_held_flag_set_on_press():
+    s = reduce(default_state(), MetronomePressed(pressed=True))
+    assert s.metronome_held is True
+
+
+def test_metronome_held_cleared_on_release():
+    s = dataclasses.replace(default_state(), metronome_held=True)
+    s = reduce(s, MetronomePressed(pressed=False))
+    assert s.metronome_held is False
+
+
+def test_metronome_jog_changes_bpm():
+    s = dataclasses.replace(default_state(), metronome_held=True)
+    s = reduce(s, EncoderTurned(encoder=9, delta=5))
+    assert s.tempo_bpm == 125.0
+
+
+def test_metronome_jog_clamps_at_300():
+    s = dataclasses.replace(default_state(), metronome_held=True, tempo_bpm=299.0)
+    s = reduce(s, EncoderTurned(encoder=9, delta=10))
+    assert s.tempo_bpm == 300.0
+
+
+def test_metronome_jog_clamps_at_20():
+    s = dataclasses.replace(default_state(), metronome_held=True, tempo_bpm=21.0)
+    s = reduce(s, EncoderTurned(encoder=9, delta=-10))
+    assert s.tempo_bpm == 20.0
+
+
+def test_metronome_jog_intercepts_in_instrument_mode():
+    s = _armed_instrument(armed=(0,))
+    s = dataclasses.replace(s, metronome_held=True)
+    s = reduce(s, EncoderTurned(encoder=9, delta=-3))
+    assert s.tempo_bpm == 117.0
+
+
+def test_tap_tempo_first_tap_records_timestamp():
+    s = reduce(default_state(), TapTempoPressed(timestamp=1000.0))
+    assert s.tap_times == (1000.0,)
+    assert s.tempo_bpm == 120.0  # unchanged — need 2 taps
+
+
+def test_tap_tempo_two_taps_set_bpm():
+    s = reduce(default_state(), TapTempoPressed(timestamp=1000.0))
+    s = reduce(s, TapTempoPressed(timestamp=1000.5))  # 0.5s interval = 120 BPM
+    assert abs(s.tempo_bpm - 120.0) < 0.01
+
+
+def test_tap_tempo_averages_multiple_taps():
+    s = default_state()
+    for t in [0.0, 0.5, 1.0, 1.5]:  # 0.5s intervals = 120 BPM
+        s = reduce(s, TapTempoPressed(timestamp=t))
+    assert abs(s.tempo_bpm - 120.0) < 0.01
+
+
+def test_tap_tempo_resets_playhead():
+    s = dataclasses.replace(default_state(), playhead=15)
+    s = reduce(s, TapTempoPressed(timestamp=0.0))
+    assert s.playhead == 0
+
+
+def test_tap_tempo_timeout_resets_history():
+    s = reduce(default_state(), TapTempoPressed(timestamp=0.0))
+    s = reduce(s, TapTempoPressed(timestamp=3.0))  # > 2s timeout
+    assert s.tap_times == (3.0,)  # history reset; only this tap recorded
 
 
 # ── Immutability ──────────────────────────────────────────────────────────────

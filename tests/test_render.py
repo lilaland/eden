@@ -579,6 +579,39 @@ def test_render_oled_instrument_bars_not_disabled_in_dual_arm():
     assert _color(oled, OLED_BTN1_TITLE) == _OLED_DIM
 
 
+# ── render_oled metronome overlay ────────────────────────────────────────────
+
+
+def test_render_oled_metronome_held_shows_bpm():
+    s = dataclasses.replace(default_state(), metronome_held=True, tempo_bpm=120.0)
+    oled = render_oled(s)
+    assert oled[OLED_MAIN_LINE1][0] == "TEMPO"
+    assert "120" in oled[OLED_MAIN_LINE2][0]
+    assert "BPM" in oled[OLED_MAIN_LINE2][0]
+
+
+def test_render_oled_metronome_held_overrides_session():
+    """BPM overlay takes priority over normal session OLED content."""
+    s = dataclasses.replace(default_state(), metronome_held=True)
+    oled = render_oled(s)
+    assert OLED_MAIN_LINE1 in oled
+    assert oled[OLED_MAIN_LINE1][0] == "TEMPO"
+
+
+def test_render_oled_metronome_held_overrides_instrument():
+    s = dataclasses.replace(default_state(), metronome_held=True,
+                            mode=Mode.INSTRUMENT, armed_tracks=(0,))
+    oled = render_oled(s)
+    assert oled[OLED_MAIN_LINE1][0] == "TEMPO"
+
+
+def test_render_oled_metronome_tap_count_shown():
+    s = dataclasses.replace(default_state(), metronome_held=True,
+                            tap_times=(1.0, 1.5, 2.0))
+    oled = render_oled(s)
+    assert "3" in oled[OLED_BTN4_VALUE][0]
+
+
 # ── render_button_leds ────────────────────────────────────────────────────────
 
 

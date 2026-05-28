@@ -255,6 +255,22 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
         if text:
             out[slot] = (text, *color)
 
+    # Metronome held — BPM display overrides all other content.
+    if state.metronome_held:
+        bpm = state.tempo_bpm
+        bpm_str = f"{bpm:.1f}" if bpm != int(bpm) else f"{int(bpm)}"
+        _set(OLED_MAIN_LINE1, "TEMPO")
+        _set(OLED_MAIN_LINE2, f"{bpm_str} BPM")
+        _set(OLED_BTN3_TITLE, "JOG", _OLED_DIM)
+        _set(OLED_BTN3_VALUE, "BPM")
+        tap_count = len(state.tap_times)
+        if tap_count >= 1:
+            _set(OLED_BTN4_TITLE, "TAP", _OLED_ACTIVE)
+            _set(OLED_BTN4_VALUE, f"{tap_count} tap{'s' if tap_count != 1 else ''}")
+        else:
+            _set(OLED_BTN4_TITLE, "SHIFT+TAP", _OLED_DIM)
+        return out
+
     if state.mode == Mode.SESSION:
         # ── New-instrument picker (empty slot selected) ───────────────────────
         if state.tracks[state.selected_track] is None:
