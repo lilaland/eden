@@ -393,7 +393,20 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
         _set(OLED_BTN2_TITLE, "UNSOLO" if is_soloed else "SOLO",
              _OLED_SOLOED if is_soloed else _OLED_DIM)
 
-        _set(OLED_BTN3_TITLE, f"LOOP x{loop_count_str}", _OLED_DIM)
+        # SK3: VOL (normal) | LOOPxN (shift)
+        if state.shift_held:
+            _set(OLED_BTN3_TITLE, f"LOOPx{loop_count_str}", _OLED_DIM)
+        else:
+            vol_active = state.session_active_ctrl == "VOL"
+            vol_color = _OLED_ACTIVE if vol_active else _OLED_DIM
+            _set(OLED_BTN3_TITLE, "VOL", vol_color)
+            if vol_active and sel_track is not None:
+                if state.session_selected_row == 1:
+                    lv = sel_track.loops[state.selected_loop].volume
+                    _set(OLED_BTN3_VALUE, f"L{state.selected_loop + 1} {lv:.0%}")
+                else:
+                    tv = getattr(sel_track, "volume", 1.0)
+                    _set(OLED_BTN3_VALUE, f"Trk {tv:.0%}")
 
         # SK4: ARM1 — bar lit orange when armed, dim when not
         if state.armed_tracks:
@@ -511,8 +524,12 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
             _set(OLED_BTN3_VALUE, f"1/{first_size}")
 
         _set(OLED_BTN4_TITLE, "< BACK", _OLED_DIM)
-        _set(OLED_BTN5_TITLE, "CLEAR", _OLED_DIM)
-        _set(OLED_BTN5_VALUE, "SHIFT+")
+        if state.shift_held:
+            _set(OLED_BTN5_TITLE, "CLEAR", _OLED_DIM)
+            _set(OLED_BTN5_VALUE, "SHIFT+")
+        else:
+            vel_color = _OLED_ACTIVE if state.vel_sensitive else _OLED_DIM
+            _set(OLED_BTN5_TITLE, "VEL" if state.vel_sensitive else "MONO", vel_color)
 
     return out
 

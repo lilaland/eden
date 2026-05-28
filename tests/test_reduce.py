@@ -293,6 +293,7 @@ def test_session_pad_top_row_initializes_plays_remaining_when_loop_count_set():
         selected_loop=0,
         playing_loops=frozenset(),
     )
+    s = dataclasses.replace(s, shift_held=True)
     s = reduce(s, SoftkeyPressed(key=2))  # loop_count 0→1
     s = reduce(s, SoftkeyPressed(key=2))  # loop_count 1→2
     assert s.tracks[0].loops[0].loop_count == 2
@@ -366,16 +367,18 @@ def test_sk2_unsolos_already_soloed_track():
 
 
 def test_sk3_cycles_loop_count_0_to_1():
-    """SK3 cycles loop_count 0→1 on a DrumTrack loop."""
-    state = dataclasses.replace(default_state(), selected_track=0, selected_loop=0)
+    """Shift+SK3 cycles loop_count 0→1 on a DrumTrack loop."""
+    state = dataclasses.replace(default_state(), selected_track=0, selected_loop=0,
+                                shift_held=True)
     result = reduce(state, SoftkeyPressed(key=2))
     loop = result.tracks[0].loops[0]
     assert loop.loop_count == 1
 
 
 def test_sk3_cycles_loop_count_full_sequence():
-    """SK3 cycles loop_count: 1→2→4→8→0."""
-    state = dataclasses.replace(default_state(), selected_track=0, selected_loop=0)
+    """Shift+SK3 cycles loop_count: 1→2→4→8→0."""
+    state = dataclasses.replace(default_state(), selected_track=0, selected_loop=0,
+                                shift_held=True)
     # Start at 0, advance to 1
     s1 = reduce(state, SoftkeyPressed(key=2))
     assert s1.tracks[0].loops[0].loop_count == 1
@@ -1147,5 +1150,136 @@ def test_reduce_does_not_mutate_input_state():
 
     assert state.tracks[0].loops[1].steps == original_steps
     assert state.tracks[0].loops[1].steps[0].on is False
+
+
+# ── MONO / VEL sensitivity ────────────────────────────────────────────────────
+
+
+def test_sk5_instrument_toggles_vel_sensitive():
+    """SK5 in INSTRUMENT mode toggles vel_sensitive."""
+    s = _armed_instrument(armed=(0,))
+    assert s.vel_sensitive is False
+    s2 = reduce(s, SoftkeyPressed(key=4))
+    assert s2.vel_sensitive is True
+    s3 = reduce(s2, SoftkeyPressed(key=4))
+    assert s3.vel_sensitive is False
+
+
+def test_mono_step_uses_velocity_100():
+    """In MONO mode (default), step velocity is always 100."""
+    s = _armed_instrument(armed=(0,))
+    assert s.vel_sensitive is False
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=42))
+    assert s2.tracks[0].loops[1].steps[0].velocity == 100
+
+
+def test_vel_sensitive_step_uses_pad_velocity():
+    """In VEL mode, step velocity equals the pad hit velocity."""
+    s = dataclasses.replace(_armed_instrument(armed=(0,)), vel_sensitive=True)
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=42))
+    assert s2.tracks[0].loops[1].steps[0].velocity == 42
+
+
+def test_shift_sk5_instrument_clears_loops():
+    """Shift+SK5 in INSTRUMENT mode still clears armed loops."""
+    s = dataclasses.replace(_armed_instrument(armed=(0,)), shift_held=True)
+    # Put a step on first
+    s = reduce(s, PadPressed(pad_index=0, velocity=100))
+    assert not s.tracks[0].loops[1].is_empty
+    s2 = reduce(s, SoftkeyPressed(key=4))
+    assert s2.tracks[0].loops[1].is_empty
+
+
+# ── SESSION VOL control ───────────────────────────────────────────────────────
+
+
+def _session_with_track():
+    """Default state: SESSION, track 0 selected."""
+    return dataclasses.replace(default_state(), selected_track=0, selected_loop=0)
+
+
+def test_sk3_session_activates_vol_ctrl():
+    """SK3 in SESSION activates VOL ctrl."""
+    s = _session_with_track()
+    s2 = reduce(s, SoftkeyPressed(key=2))
+    assert s2.session_active_ctrl == "VOL"
+
+
+def test_sk3_session_deactivates_vol_ctrl():
+    """Pressing SK3 again deactivates VOL ctrl."""
+    s = dataclasses.replace(_session_with_track(), session_active_ctrl="VOL")
+    s2 = reduce(s, SoftkeyPressed(key=2))
+    assert s2.session_active_ctrl == ""
+
+
+def test_shift_sk3_session_cycles_loop_count():
+    """Shift+SK3 in SESSION still cycles loop_count."""
+    s = dataclasses.replace(_session_with_track(), shift_held=True)
+    s2 = reduce(s, SoftkeyPressed(key=2))
+    assert s2.tracks[0].loops[0].loop_count == 1
+
+
+def test_vol_jog_adjusts_track_volume_row0():
+    """With VOL active and row 0 selected, jog adjusts track.volume."""
+    track = dataclasses.replace(default_state().tracks[0], volume=0.5)
+    tracks = (track,) + default_state().tracks[1:]
+    s = dataclasses.replace(_session_with_track(), tracks=tracks,
+                            session_active_ctrl="VOL", session_selected_row=0)
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=1))
+    assert s2.tracks[0].volume > 0.5
+
+
+def test_vol_jog_adjusts_loop_volume_row1():
+    """With VOL active and row 1 selected, jog adjusts the loop's volume."""
+    loop = dataclasses.replace(default_state().tracks[0].loops[0], volume=0.5)
+    loops = (loop,) + default_state().tracks[0].loops[1:]
+    track = dataclasses.replace(default_state().tracks[0], loops=loops)
+    tracks = (track,) + default_state().tracks[1:]
+    s = dataclasses.replace(_session_with_track(), tracks=tracks,
+                            session_active_ctrl="VOL", session_selected_row=1)
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=1))
+    assert s2.tracks[0].loops[0].volume > 0.5
+
+
+def test_vol_jog_clamped_low():
+    """Track volume cannot go below 0."""
+    track = dataclasses.replace(default_state().tracks[0], volume=0.01)
+    tracks = (track,) + default_state().tracks[1:]
+    s = dataclasses.replace(_session_with_track(), tracks=tracks,
+                            session_active_ctrl="VOL", session_selected_row=0)
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=-10))
+    assert s2.tracks[0].volume >= 0.0
+
+
+def test_vol_jog_clamped_high():
+    """Track volume cannot exceed 1."""
+    track = dataclasses.replace(default_state().tracks[0], volume=0.99)
+    tracks = (track,) + default_state().tracks[1:]
+    s = dataclasses.replace(_session_with_track(), tracks=tracks,
+                            session_active_ctrl="VOL", session_selected_row=0)
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=10))
+    assert s2.tracks[0].volume <= 1.0
+
+
+def test_session_row1_pad_sets_selected_row():
+    """Pressing a loop-row pad (>=16) sets session_selected_row=1."""
+    s = _session_with_track()
+    s2 = reduce(s, PadPressed(pad_index=16, velocity=100))
+    assert s2.session_selected_row == 1
+
+
+def test_session_row0_pad_sets_selected_row():
+    """Pressing a track-row pad (<16) sets session_selected_row=0."""
+    s = dataclasses.replace(_session_with_track(), session_selected_row=1)
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    assert s2.session_selected_row == 0
+
+
+def test_auto_start_updates_active_loops():
+    """Auto-starting a loop on first step edit also adds it to active_loops."""
+    s = _armed_instrument(armed=(0,))
+    assert (0, 1) not in s.active_loops
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    assert (0, 1) in s2.active_loops
 
 

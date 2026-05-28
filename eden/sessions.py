@@ -60,6 +60,8 @@ def _loop_to_dict(loop: Loop) -> Optional[dict]:
         "step_size": loop.step_size,
         "loop_count": loop.loop_count,
     }
+    if loop.volume != 1.0:
+        d["volume"] = loop.volume
     # Only emit per-step arrays when non-default (drums never will)
     pitches = [s.pitch for s in loop.steps]
     velocities = [s.velocity for s in loop.steps]
@@ -88,6 +90,7 @@ def _dict_to_loop(d: Optional[dict]) -> Loop:
         numerator=d.get("numerator", 4),
         step_size=d.get("step_size", 16),
         loop_count=d.get("loop_count", 0),
+        volume=d.get("volume", 1.0),
     )
 
 
@@ -101,6 +104,7 @@ def _track_to_dict(track) -> Optional[dict]:
             "type": "drum",
             "name": track.name,
             "sample_name": track.sample_name,
+            "volume": track.volume,
             "loops": [_loop_to_dict(lp) for lp in track.loops],
         }
     if isinstance(track, SynthTrack):
@@ -132,7 +136,8 @@ def _dict_to_track(d: Optional[dict]):
         loops = tuple(_dict_to_loop(l) for l in raw_loops)
         while len(loops) < 16:
             loops += (default_loop(),)
-        return DrumTrack(name=d["name"], sample_name=d["sample_name"], loops=loops[:16])
+        return DrumTrack(name=d["name"], sample_name=d["sample_name"],
+                         volume=d.get("volume", 1.0), loops=loops[:16])
     if t == "synth":
         raw_loops = d.get("loops", [])
         loops = tuple(_dict_to_loop(l) for l in raw_loops)

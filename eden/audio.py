@@ -282,7 +282,8 @@ class StepScheduler:
                 # gate_samples: step.gate fraction of one step's duration
                 step_secs = (4.0 / loop.step_size) * (60.0 / bpm)
                 gate_samples = max(1, int(step.gate * step_secs * sr))
-                engine.note_on(step.pitch, step.velocity / 127.0, gate_samples, track)
+                amplitude = (step.velocity / 127.0) * loop.volume
+                engine.note_on(step.pitch, amplitude, gate_samples, track)
                 break
 
 

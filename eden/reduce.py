@@ -307,6 +307,8 @@ def _session_pad_pressed(state: AppState, event: PadPressed) -> AppState:
         if pad != state.selected_track:
             state = _drop_fully_empty_tracks(state, (state.selected_track,))
         track = state.tracks[pad]
+        # Clear VOL ctrl when changing tracks; keep it if re-selecting same track.
+        new_ctrl = state.session_active_ctrl if pad == state.selected_track else ""
         if track is None:
             # Select empty slot and reset the new-instrument picker indices.
             return dataclasses.replace(
@@ -314,6 +316,8 @@ def _session_pad_pressed(state: AppState, event: PadPressed) -> AppState:
                 selected_track=pad,
                 selected_loop=0,
                 arm_pads_offer_loop=None,
+                session_selected_row=0,
+                session_active_ctrl=new_ctrl,
                 new_slot_type_idx=0,
                 new_slot_cat_idx=0,
                 new_slot_var_idx=0,
@@ -324,12 +328,15 @@ def _session_pad_pressed(state: AppState, event: PadPressed) -> AppState:
             selected_track=pad,
             selected_loop=0,
             arm_pads_offer_loop=None,
+            session_selected_row=0,
+            session_active_ctrl=new_ctrl,
         )
     else:
         # Top row: always update selected_loop for visual feedback, then toggle
         # playing only if the loop has content.
         loop_idx = pad - 16
-        base = dataclasses.replace(state, selected_loop=loop_idx, arm_pads_offer_loop=None)
+        base = dataclasses.replace(state, selected_loop=loop_idx, arm_pads_offer_loop=None,
+                                   session_selected_row=1)
 
         # Shift + empty loop → offer ARM PADS mode
         if state.shift_held:
@@ -405,8 +412,11 @@ def _session_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
             else state.soloed_tracks | {t}
         )
         return dataclasses.replace(state, soloed_tracks=new_soloed)
-    if event.key == 2:  # SK3: LOOPxN — cycle loop_count on selected loop
-        return _cycle_loop_count(state)
+    if event.key == 2:  # SK3: VOL (normal) | LOOPxN (shift)
+        if state.shift_held:
+            return _cycle_loop_count(state)
+        new_ctrl = "" if state.session_active_ctrl == "VOL" else "VOL"
+        return dataclasses.replace(state, session_active_ctrl=new_ctrl)
     if event.key == 3:  # SK4: ARM1 — arm selected track as single, enter INSTRUMENT
         return _arm_single(state)
     if event.key == 4:  # SK5: ARM2 — add to dual-arm list
@@ -507,9 +517,32 @@ def _session_encoder(state: AppState, event: EncoderTurned) -> AppState:
         # New-instrument picker active: jog changes the selected control.
         if state.tracks[state.selected_track] is None and state.new_slot_active_ctrl:
             return _new_slot_encoder(state, event)
+        if state.session_active_ctrl == "VOL":
+            return _adjust_vol(state, event.delta)
         new_bpm = max(60.0, min(200.0, state.tempo_bpm + event.delta))
         return dataclasses.replace(state, tempo_bpm=float(new_bpm))
     return state
+
+
+def _adjust_vol(state: AppState, delta: int) -> AppState:
+    """Adjust track or loop volume by delta steps of 2.5%."""
+    step = 0.025 * delta
+    track_idx = state.selected_track
+    track = state.tracks[track_idx]
+    if track is None:
+        return state
+    if state.session_selected_row == 1:
+        loop_idx = state.selected_loop
+        loop = track.loops[loop_idx]
+        new_vol = round(max(0.0, min(1.0, loop.volume + step)), 3)
+        new_loop = dataclasses.replace(loop, volume=new_vol)
+        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+        new_track = dataclasses.replace(track, loops=new_loops)
+    else:
+        new_vol = round(max(0.0, min(1.0, track.volume + step)), 3)
+        new_track = dataclasses.replace(track, volume=new_vol)
+    new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+    return dataclasses.replace(state, tracks=new_tracks)
 
 
 def _new_slot_encoder(state: AppState, event: EncoderTurned) -> AppState:
@@ -768,6 +801,7 @@ def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
 def _auto_start_and_gc(state: AppState, affected_track: int, loop_idx: int) -> AppState:
     """Auto-start loops that just became non-empty, then GC if fully empty."""
     new_playing = set(state.playing_loops)
+    new_active = set(state.active_loops)
     changed = False
     for track_idx in state.armed_tracks:
         key = (track_idx, loop_idx)
@@ -775,6 +809,7 @@ def _auto_start_and_gc(state: AppState, affected_track: int, loop_idx: int) -> A
             track = state.tracks[track_idx]
             if track is not None and not track.loops[loop_idx].is_empty:
                 new_playing.add(key)
+                new_active.add(key)
                 changed = True
     if changed:
         offsets = dict(state.loop_measure_offsets)
@@ -785,6 +820,7 @@ def _auto_start_and_gc(state: AppState, affected_track: int, loop_idx: int) -> A
         state = dataclasses.replace(
             state,
             playing_loops=frozenset(new_playing),
+            active_loops=frozenset(new_active),
             loop_measure_offsets=tuple(offsets.items()),
         )
     return _drop_fully_empty_tracks(state, (affected_track,))
@@ -802,8 +838,9 @@ def _set_step_pitch(
     if step_idx >= loop.step_count:
         return state
     old = loop.steps[step_idx]
+    eff_vel = velocity if state.vel_sensitive else 100
     new_step = dataclasses.replace(old, on=True, pitch=pitch,
-                                   velocity=max(1, min(127, velocity)))
+                                   velocity=max(1, min(127, eff_vel)))
     new_steps = loop.steps[:step_idx] + (new_step,) + loop.steps[step_idx + 1:]
     new_loop = dataclasses.replace(loop, steps=new_steps)
     new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
@@ -895,7 +932,8 @@ def _toggle_step(
     if step_idx >= len(old_steps):
         return state
     old_step = old_steps[step_idx]
-    new_step = StepNote.off() if old_step.on else StepNote(on=True, velocity=velocity)
+    eff_vel = velocity if state.vel_sensitive else 100
+    new_step = StepNote.off() if old_step.on else StepNote(on=True, velocity=eff_vel)
     new_steps = old_steps[:step_idx] + (new_step,) + old_steps[step_idx + 1:]
     new_loop = dataclasses.replace(loop, steps=new_steps)
     new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
@@ -949,10 +987,10 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
         armed = state.saved_armed_tracks if state.saved_armed_tracks is not None else state.armed_tracks
         return dataclasses.replace(state, mode=Mode.SESSION, instrument_active_ctrl="",
                                    armed_tracks=armed, saved_armed_tracks=None)
-    if event.key == 4:  # SK5: CLEAR — shift only
+    if event.key == 4:  # SK5: MONO/VEL toggle (normal) | CLEAR (shift)
         if state.shift_held:
             return _clear_armed_loops(state)
-        return state
+        return dataclasses.replace(state, vel_sensitive=not state.vel_sensitive)
     return state
 
 

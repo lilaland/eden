@@ -84,7 +84,8 @@ class DrumEngine(TrackEngine):
         sample = self._samples.get(self._sample_name)
         if sample is None:
             return
-        self._trigger_queue.append((sample, float(np.clip(velocity, 0.0, 1.0))))
+        vol = getattr(track_state, "volume", 1.0) if track_state is not None else 1.0
+        self._trigger_queue.append((sample, float(np.clip(velocity * vol, 0.0, 1.0))))
 
     def fill_block(self, buf: np.ndarray, n_frames: int) -> None:
         while True:

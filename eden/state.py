@@ -39,6 +39,7 @@ class Loop:
     bars: int = 1
     numerator: int = 4
     step_size: int = 16          # note value denominator: 4/8/16/32
+    volume: float = 1.0          # per-loop mix volume 0.0–1.0
 
     @property
     def is_empty(self) -> bool:
@@ -60,6 +61,7 @@ class DrumTrack:
     name: str
     sample_name: str
     loops: tuple[Loop, ...]  # always 16 loops
+    volume: float = 1.0      # track mix volume 0.0–1.0
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,11 @@ class AppState:
     saved_armed_tracks: Optional[tuple[int, ...]] = None  # restored on exit from new-slot INSTRUMENT
     metronome_held: bool = False
     tap_times: tuple[float, ...] = ()  # recent Shift+Metronome tap timestamps
+    # Velocity mode: False = mono (always 100), True = use actual pad velocity
+    vel_sensitive: bool = False
+    # SESSION volume control
+    session_active_ctrl: str = ""    # "" | "VOL"
+    session_selected_row: int = 0    # 0 = track row (pads 0-15), 1 = loop row (pads 16-31)
     # Synth step/keyboard editor state (ephemeral, not persisted)
     step_cursor: int = 0            # absolute step index of the highlighted step
     pitch_window_offset: int = 0    # first scale degree shown in the pitch row
