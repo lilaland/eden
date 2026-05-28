@@ -64,10 +64,19 @@ class DrumTrack:
 
 @dataclass(frozen=True)
 class SynthTrack:
-    """M3 scaffold — reducers raise NotImplementedError."""
+    """Polyphonic subtractive synth track."""
 
     name: str
     loops: tuple[Loop, ...]
+    osc_type: str = "saw"          # saw / square / sine / triangle
+    amp_attack: float = 0.005
+    amp_decay: float = 0.1
+    amp_sustain: float = 0.7
+    amp_release: float = 0.2
+    filter_cutoff: float = 8000.0  # Hz
+    filter_res: float = 0.2        # 0.0–0.99
+    volume: float = 0.8
+    max_voices: int = 8
 
 
 @dataclass(frozen=True)

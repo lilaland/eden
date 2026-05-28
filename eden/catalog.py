@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-# ── Type list (M1: DRUMS only; M3: KEYS; M5: SAMPLER) ─────────────────────────
+# ── Type list ─────────────────────────────────────────────────────────────────
 
-INSTRUMENT_TYPES: tuple[str, ...] = ("DRUMS",)
+INSTRUMENT_TYPES: tuple[str, ...] = ("DRUMS", "KEYS")
 
 # ── Drum catalog ───────────────────────────────────────────────────────────────
 
@@ -98,6 +98,16 @@ _VARIATION_KEYS: dict[str, str] = {
     "Rock":   "rock",
 }
 
+# ── Keys (synth) catalog ──────────────────────────────────────────────────────
+
+_KEYS_OSC_NAMES: tuple[str, ...] = ("Saw", "Square", "Sine", "Tri")
+_KEYS_ENGINE_KEY: dict[str, str] = {
+    "Saw": "saw", "Square": "square", "Sine": "sine", "Tri": "triangle",
+}
+_KEYS_TRACK_NAMES: dict[str, str] = {
+    "Saw": "SAW", "Square": "SQR", "Sine": "SINE", "Tri": "TRI",
+}
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 
@@ -105,6 +115,8 @@ def get_categories(type_idx: int) -> tuple[str, ...]:
     """Return category list for the given type index."""
     if type_idx == 0:  # DRUMS
         return DRUM_CATEGORIES
+    if type_idx == 1:  # KEYS — osc type is the "category"
+        return _KEYS_OSC_NAMES
     return ()
 
 
@@ -112,14 +124,14 @@ def get_variations(type_idx: int, cat_idx: int) -> tuple[str, ...]:
     """Return variation list for the given type/category indices."""
     if type_idx == 0:  # DRUMS — same variation set for every category
         return DRUM_VARIATIONS
-    return ()
+    return ()  # KEYS has no variations
 
 
 def get_track_params(type_idx: int, cat_idx: int, var_idx: int) -> tuple[str, str]:
-    """Return (track_display_name, sample_file_stem) for the current selection.
+    """Return (track_display_name, type_param) for the current selection.
 
-    Sample stem follows the pattern ``{category_key}_{variation_key}``,
-    e.g. ``kick_techno``, ``snare_house``.
+    For DRUMS: type_param is the sample file stem, e.g. ``kick_techno``.
+    For KEYS:  type_param is the osc_type engine key, e.g. ``saw``.
     """
     if type_idx == 0:  # DRUMS
         cats = DRUM_CATEGORIES
@@ -129,4 +141,7 @@ def get_track_params(type_idx: int, cat_idx: int, var_idx: int) -> tuple[str, st
         cat_key = _DRUM_SAMPLE_KEYS[cat]
         var_key = _VARIATION_KEYS[var]
         return _DRUM_TRACK_NAMES[cat], f"{cat_key}_{var_key}"
-    return "EMPTY", "empty"
+    if type_idx == 1:  # KEYS
+        osc = _KEYS_OSC_NAMES[cat_idx % len(_KEYS_OSC_NAMES)]
+        return _KEYS_TRACK_NAMES[osc], _KEYS_ENGINE_KEY[osc]
+    return "EMPTY", ""

@@ -431,12 +431,14 @@ def _new_slot_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
 
 
 def _create_new_slot_track(state: AppState) -> AppState:
-    """Create a DrumTrack at the selected empty slot using the current picker values."""
+    """Create a track at the selected empty slot using the current picker values."""
     pad = state.selected_track
-    name, sample = catalog.get_track_params(
-        state.new_slot_type_idx, state.new_slot_cat_idx, state.new_slot_var_idx
-    )
-    new_track = DrumTrack(name=name, sample_name=sample, loops=default_track_loops())
+    type_idx = state.new_slot_type_idx
+    name, param = catalog.get_track_params(type_idx, state.new_slot_cat_idx, state.new_slot_var_idx)
+    if type_idx == 1:  # KEYS → SynthTrack
+        new_track = SynthTrack(name=name, loops=default_track_loops(), osc_type=param)
+    else:  # DRUMS → DrumTrack
+        new_track = DrumTrack(name=name, sample_name=param, loops=default_track_loops())
     new_tracks = state.tracks[:pad] + (new_track,) + state.tracks[pad + 1:]
     return dataclasses.replace(
         state,
@@ -449,13 +451,10 @@ def _cycle_loop_count(state: AppState) -> AppState:
     """Cycle loop_count for the selected_loop of the selected_track.
 
     Cycle order: 0 (∞) → 1 → 2 → 4 → 8 → 0 (∞)
-    Only implemented for DrumTrack; raises NotImplementedError for M3 types.
     """
     track = state.tracks[state.selected_track]
-    if track is None or not isinstance(track, DrumTrack):
+    if track is None:
         return state
-    if isinstance(track, (SynthTrack, SampleTrack)):
-        raise NotImplementedError("SynthTrack/SampleTrack loop cycling is M3")
 
     _cycle_map = {0: 1, 1: 2, 2: 4, 4: 8, 8: 0}
     loop_idx = state.selected_loop
@@ -595,12 +594,12 @@ def _resize_loop_to(loop: Loop, bars: int, numer: int, size: int) -> Loop:
 def _apply_to_armed_loops(
     state: AppState, transform: Callable[[Loop], Loop]
 ) -> AppState:
-    """Apply transform to selected_loop of every armed DrumTrack. Returns new state."""
+    """Apply transform to selected_loop of every armed track. Returns new state."""
     new_state = state
     loop_idx = state.selected_loop
     for track_idx in state.armed_tracks:
         track = new_state.tracks[track_idx]
-        if track is None or not isinstance(track, DrumTrack):
+        if track is None:
             continue
         loop = track.loops[loop_idx]
         new_loop = transform(loop)
@@ -704,9 +703,9 @@ def _adjust_size(state: AppState, delta: int) -> AppState:
 
 
 def _ensure_loop_length(state: AppState, track_idx: int, loop_idx: int, min_steps: int) -> AppState:
-    """Extend a DrumTrack loop to at least min_steps, growing bars as needed."""
+    """Extend a track's loop to at least min_steps, growing bars as needed."""
     track = state.tracks[track_idx]
-    if track is None or not isinstance(track, DrumTrack):
+    if track is None:
         return state
     loop = track.loops[loop_idx]
     if loop.step_count >= min_steps:
@@ -785,8 +784,6 @@ def _toggle_step(
     track = state.tracks[track_idx]
     if track is None:
         return state
-    if isinstance(track, (SynthTrack, SampleTrack)):
-        raise NotImplementedError("SynthTrack/SampleTrack step editing is M3")
     loop = track.loops[loop_idx]
     old_steps = loop.steps
     if step_idx >= len(old_steps):
@@ -813,15 +810,23 @@ def _instrument_transport(state: AppState, event: TransportPressed) -> AppState:
     return state
 
 
+def _is_synth_armed(state: AppState) -> bool:
+    """True if the first armed track is a SynthTrack."""
+    if not state.armed_tracks:
+        return False
+    return isinstance(state.tracks[state.armed_tracks[0]], SynthTrack)
+
+
 def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
-    if event.key == 0:  # SK1: BARS — toggle active ctrl
-        new_ctrl = "" if state.instrument_active_ctrl == "BARS" else "BARS"
+    synth = _is_synth_armed(state)
+    if event.key == 0:  # SK1
+        new_ctrl = "" if state.instrument_active_ctrl == ("OSC" if synth else "BARS") else ("OSC" if synth else "BARS")
         return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-    if event.key == 1:  # SK2: NUMER — toggle active ctrl
-        new_ctrl = "" if state.instrument_active_ctrl == "NUMER" else "NUMER"
+    if event.key == 1:  # SK2
+        new_ctrl = "" if state.instrument_active_ctrl == ("CUTOFF" if synth else "NUMER") else ("CUTOFF" if synth else "NUMER")
         return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-    if event.key == 2:  # SK3: SIZE — toggle active ctrl
-        new_ctrl = "" if state.instrument_active_ctrl == "SIZE" else "SIZE"
+    if event.key == 2:  # SK3
+        new_ctrl = "" if state.instrument_active_ctrl == ("RESO" if synth else "SIZE") else ("RESO" if synth else "SIZE")
         return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
     if event.key == 3:  # SK4: BACK — GC empty armed tracks, return to SESSION
         state = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
@@ -859,15 +864,64 @@ def _clamp_playback_after_shrink(
     return state
 
 
+_OSC_TYPES = ("saw", "square", "sine", "triangle")
+
+
+def _adjust_synth_param(state: AppState, fn) -> AppState:
+    """Apply fn(SynthTrack) → SynthTrack for all armed SynthTracks."""
+    new_state = state
+    for idx in state.armed_tracks:
+        track = new_state.tracks[idx]
+        if not isinstance(track, SynthTrack):
+            continue
+        new_track = fn(track)
+        if new_track is track:
+            continue
+        new_tracks = new_state.tracks[:idx] + (new_track,) + new_state.tracks[idx + 1:]
+        new_state = dataclasses.replace(new_state, tracks=new_tracks)
+    return new_state
+
+
+def _adjust_synth_osc(state: AppState, delta: int) -> AppState:
+    def cycle(track: SynthTrack) -> SynthTrack:
+        idx = _OSC_TYPES.index(track.osc_type) if track.osc_type in _OSC_TYPES else 0
+        new_idx = (idx + (1 if delta > 0 else -1)) % len(_OSC_TYPES)
+        return dataclasses.replace(track, osc_type=_OSC_TYPES[new_idx])
+    return _adjust_synth_param(state, cycle)
+
+
+def _adjust_synth_cutoff(state: AppState, delta: int) -> AppState:
+    factor = 1.05 if delta > 0 else 1.0 / 1.05
+    def adjust(track: SynthTrack) -> SynthTrack:
+        new_cutoff = max(20.0, min(18000.0, track.filter_cutoff * factor))
+        return dataclasses.replace(track, filter_cutoff=round(new_cutoff, 1))
+    return _adjust_synth_param(state, adjust)
+
+
+def _adjust_synth_reso(state: AppState, delta: int) -> AppState:
+    step = 0.02 if delta > 0 else -0.02
+    def adjust(track: SynthTrack) -> SynthTrack:
+        new_reso = round(max(0.0, min(0.99, track.filter_res + step)), 3)
+        return dataclasses.replace(track, filter_res=new_reso)
+    return _adjust_synth_param(state, adjust)
+
+
 def _instrument_encoder(state: AppState, event: EncoderTurned) -> AppState:
     if event.encoder != 9:
         return state
-    if state.instrument_active_ctrl == "BARS":
+    ctrl = state.instrument_active_ctrl
+    if ctrl == "BARS":
         return _adjust_bars(state, event.delta)
-    if state.instrument_active_ctrl == "NUMER":
+    if ctrl == "NUMER":
         return _adjust_numer(state, event.delta)
-    if state.instrument_active_ctrl == "SIZE":
+    if ctrl == "SIZE":
         return _adjust_size(state, event.delta)
+    if ctrl == "OSC":
+        return _adjust_synth_osc(state, event.delta)
+    if ctrl == "CUTOFF":
+        return _adjust_synth_cutoff(state, event.delta)
+    if ctrl == "RESO":
+        return _adjust_synth_reso(state, event.delta)
     return state
 
 
@@ -929,11 +983,11 @@ def _drop_fully_empty_tracks(
 
 
 def _clear_armed_loops(state: AppState) -> AppState:
-    """Clear all steps in selected_loop for every armed DrumTrack. Pure."""
+    """Clear all steps in selected_loop for every armed track. Pure."""
     new_state = state
     for track_idx in state.armed_tracks:
         track = new_state.tracks[track_idx]
-        if track is None or not isinstance(track, DrumTrack):
+        if track is None:
             continue
         loop = track.loops[new_state.selected_loop]
         blank_steps = tuple(StepNote.off() for _ in range(loop.step_count))

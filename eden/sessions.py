@@ -7,7 +7,7 @@ import os
 from typing import Optional
 
 from eden.state import (
-    AppState, DrumTrack, Loop, StepNote, Mode, InstrumentSubmode,
+    AppState, DrumTrack, SynthTrack, Loop, StepNote, Mode, InstrumentSubmode,
     default_loop, default_track_loops,
 )
 
@@ -103,7 +103,22 @@ def _track_to_dict(track) -> Optional[dict]:
             "sample_name": track.sample_name,
             "loops": [_loop_to_dict(lp) for lp in track.loops],
         }
-    return None  # SynthTrack/SampleTrack — M3+
+    if isinstance(track, SynthTrack):
+        return {
+            "type": "synth",
+            "name": track.name,
+            "osc_type": track.osc_type,
+            "amp_attack": track.amp_attack,
+            "amp_decay": track.amp_decay,
+            "amp_sustain": track.amp_sustain,
+            "amp_release": track.amp_release,
+            "filter_cutoff": track.filter_cutoff,
+            "filter_res": track.filter_res,
+            "volume": track.volume,
+            "max_voices": track.max_voices,
+            "loops": [_loop_to_dict(lp) for lp in track.loops],
+        }
+    return None
 
 
 def _dict_to_track(d: Optional[dict]):
@@ -116,6 +131,24 @@ def _dict_to_track(d: Optional[dict]):
         while len(loops) < 16:
             loops += (default_loop(),)
         return DrumTrack(name=d["name"], sample_name=d["sample_name"], loops=loops[:16])
+    if t == "synth":
+        raw_loops = d.get("loops", [])
+        loops = tuple(_dict_to_loop(l) for l in raw_loops)
+        while len(loops) < 16:
+            loops += (default_loop(),)
+        return SynthTrack(
+            name=d["name"],
+            loops=loops[:16],
+            osc_type=d.get("osc_type", "saw"),
+            amp_attack=d.get("amp_attack", 0.005),
+            amp_decay=d.get("amp_decay", 0.1),
+            amp_sustain=d.get("amp_sustain", 0.7),
+            amp_release=d.get("amp_release", 0.2),
+            filter_cutoff=d.get("filter_cutoff", 8000.0),
+            filter_res=d.get("filter_res", 0.2),
+            volume=d.get("volume", 0.8),
+            max_voices=d.get("max_voices", 8),
+        )
     return None
 
 

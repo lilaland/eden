@@ -370,7 +370,10 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
             main_line1 = "EMPTY"
         elif len(armed) == 1:
             t = state.tracks[armed[0]]
-            main_line1 = t.name if t is not None else "EMPTY"
+            if isinstance(t, SynthTrack):
+                main_line1 = f"{t.name} [{t.osc_type}]"
+            else:
+                main_line1 = t.name if t is not None else "EMPTY"
         else:
             t0 = state.tracks[armed[0]]
             t1 = state.tracks[armed[1]]
@@ -408,19 +411,35 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
         page_label = "P" if (is_interleaved and first_spb > 32) else ("B" if is_interleaved else "P")
         main_line2 = f"{page_label}{view_m + 1}/{max_pages} L{state.selected_loop + 1}"
 
-        # Bar colors — no control is disabled in dual-arm
-        bars_color = _OLED_ACTIVE if state.instrument_active_ctrl == "BARS" else _OLED_DIM
-        numer_color = _OLED_ACTIVE if state.instrument_active_ctrl == "NUMER" else _OLED_DIM
-        size_color = _OLED_ACTIVE if state.instrument_active_ctrl == "SIZE" else _OLED_DIM
-
+        ctrl = state.instrument_active_ctrl
         _set(OLED_MAIN_LINE1, main_line1)
         _set(OLED_MAIN_LINE2, main_line2)
-        _set(OLED_BTN1_TITLE, "BARS", bars_color)
-        _set(OLED_BTN1_VALUE, str(first_bars))
-        _set(OLED_BTN2_TITLE, "NUMER", numer_color)
-        _set(OLED_BTN2_VALUE, str(first_numer))
-        _set(OLED_BTN3_TITLE, "SIZE", size_color)
-        _set(OLED_BTN3_VALUE, f"1/{first_size}")
+
+        # SK controls depend on primary armed track type
+        first_track = state.tracks[armed[0]] if armed else None
+        if isinstance(first_track, SynthTrack):
+            osc_color    = _OLED_ACTIVE if ctrl == "OSC"    else _OLED_DIM
+            cutoff_color = _OLED_ACTIVE if ctrl == "CUTOFF" else _OLED_DIM
+            reso_color   = _OLED_ACTIVE if ctrl == "RESO"   else _OLED_DIM
+            cutoff_hz = first_track.filter_cutoff
+            cutoff_str = f"{int(cutoff_hz)}Hz" if cutoff_hz < 1000 else f"{cutoff_hz/1000:.1f}k"
+            _set(OLED_BTN1_TITLE, "OSC", osc_color)
+            _set(OLED_BTN1_VALUE, first_track.osc_type.upper()[:4])
+            _set(OLED_BTN2_TITLE, "CUTOFF", cutoff_color)
+            _set(OLED_BTN2_VALUE, cutoff_str)
+            _set(OLED_BTN3_TITLE, "RESO", reso_color)
+            _set(OLED_BTN3_VALUE, f"{first_track.filter_res:.2f}")
+        else:
+            bars_color  = _OLED_ACTIVE if ctrl == "BARS"  else _OLED_DIM
+            numer_color = _OLED_ACTIVE if ctrl == "NUMER" else _OLED_DIM
+            size_color  = _OLED_ACTIVE if ctrl == "SIZE"  else _OLED_DIM
+            _set(OLED_BTN1_TITLE, "BARS", bars_color)
+            _set(OLED_BTN1_VALUE, str(first_bars))
+            _set(OLED_BTN2_TITLE, "NUMER", numer_color)
+            _set(OLED_BTN2_VALUE, str(first_numer))
+            _set(OLED_BTN3_TITLE, "SIZE", size_color)
+            _set(OLED_BTN3_VALUE, f"1/{first_size}")
+
         _set(OLED_BTN4_TITLE, "< BACK", _OLED_DIM)
         _set(OLED_BTN5_TITLE, "CLEAR", _OLED_DIM)
         _set(OLED_BTN5_VALUE, "SHIFT+")
