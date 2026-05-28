@@ -15,24 +15,30 @@ from eden.state import (
     default_state, default_loop, default_track_loops,
 )
 from eden.theme import (
-    PAD_INACTIVE, PAD_DRUM, PAD_SYNTH, PAD_PLAYHEAD, ACCENT_GOLD,
+    PAD_INACTIVE, PAD_OFF, PAD_DRUM, PAD_SYNTH, PAD_PLAYHEAD, ACCENT_GOLD,
     PAD_PINK, PAD_ARMED, PAD_NEW_SLOT,
 )
-from eden.render import render_pads, render_oled, render_button_leds
+from eden.render import render_oled, render_pads, render_button_leds
 from controller_map import (
     OLED_MAIN_LINE1, OLED_MAIN_LINE2,
     OLED_BTN1_TITLE, OLED_BTN2_TITLE, OLED_BTN3_TITLE,
     OLED_BTN4_TITLE, OLED_BTN5_TITLE,
+    OLED_BTN1_VALUE, OLED_BTN2_VALUE, OLED_BTN3_VALUE,
     OLED_BTN4_VALUE, OLED_BTN5_VALUE,
     NATIVE_LED_PLAY, NATIVE_LED_STOP, NATIVE_LED_INST, NATIVE_LED_SONG,
 )
+
+
+def _t(oled: dict, slot: int) -> str:
+    """Extract text from an OLED render entry (text, r, g, b)."""
+    return oled[slot][0]
 
 
 # ── Fixtures / helpers ────────────────────────────────────────────────────────
 
 
 def armed_single_state() -> AppState:
-    """INSTRUMENT mode, single arm on track 0, playhead=3."""
+    """INSTRUMENT mode, single arm on track 0, playhead=6 (col 3 at SIZE=16, ticks_per_step=2)."""
     s = default_state()
     # Give track 0 a 32-step loop at selected_loop=0
     t0 = s.tracks[0]
@@ -46,7 +52,7 @@ def armed_single_state() -> AppState:
         instrument_submode=InstrumentSubmode.STEPS,
         armed_tracks=(0,),
         tracks=new_tracks,
-        playhead=3,
+        playhead=6,
         is_playing=True,
     )
 
@@ -231,6 +237,124 @@ def test_render_pads_instrument_single_top_row_maps_step_16():
     assert pads[16] != PAD_PLAYHEAD
 
 
+# ── render_pads — INSTRUMENT single-arm interleaved (size=32) ────────────────
+
+
+def _interleaved_state() -> AppState:
+    """Single-arm INSTRUMENT with step_size=32 (32 steps per bar) → interleaved view."""
+    s = default_state()
+    t0 = s.tracks[0]
+    # 1 bar, 4 beats, 1/32 → 32 steps; step 0 on
+    loop32 = Loop(steps=(True,) + tuple(False for _ in range(31)), bars=1, numerator=4, step_size=32)
+    new_loops = (loop32,) + t0.loops[1:]
+    new_t0 = dataclasses.replace(t0, loops=new_loops)
+    return dataclasses.replace(
+        s,
+        mode=Mode.INSTRUMENT,
+        instrument_submode=InstrumentSubmode.STEPS,
+        armed_tracks=(0,),
+        tracks=(new_t0,) + s.tracks[1:],
+        selected_loop=0,
+        is_playing=False,
+        playhead=0,
+        playing_loops=frozenset(),  # clear default_state's pre-playing loops
+    )
+
+
+def test_render_pads_interleaved_pad0_is_step0():
+    """Interleaved: pad 0 (row 0, col 0) → step 0 (on-beat)."""
+    s = _interleaved_state()
+    pads = render_pads(s)
+    # step 0 is True → active color, not PAD_INACTIVE
+    assert pads[0] != PAD_INACTIVE
+
+
+def test_render_pads_interleaved_pad16_is_step1():
+    """Interleaved: pad 16 (row 1, col 0) → step 1 (half-step). Step 1 is False → inactive."""
+    s = _interleaved_state()
+    pads = render_pads(s)
+    assert pads[16] == PAD_INACTIVE
+
+
+def test_render_pads_interleaved_pad1_is_step2():
+    """Interleaved: pad 1 (row 0, col 1) → step 2. Step 2 is False → inactive."""
+    s = _interleaved_state()
+    pads = render_pads(s)
+    assert pads[1] == PAD_INACTIVE
+
+
+def test_render_pads_interleaved_step1_active_shows_on_pad16():
+    """Interleaved: step 1 (half-step) active → appears on pad 16 (row 1, col 0)."""
+    s = _interleaved_state()
+    t0 = s.tracks[0]
+    loop = t0.loops[0]
+    # Turn on step 1
+    new_steps = (True, True) + loop.steps[2:]
+    new_loop = dataclasses.replace(loop, steps=new_steps)
+    new_loops = (new_loop,) + t0.loops[1:]
+    new_t0 = dataclasses.replace(t0, loops=new_loops)
+    s = dataclasses.replace(s, tracks=(new_t0,) + s.tracks[1:])
+    pads = render_pads(s)
+    assert pads[16] != PAD_INACTIVE
+
+
+def test_render_pads_interleaved_playhead_at_step0_highlights_pad0():
+    """Interleaved playing: effective_step=0 → PAD_PLAYHEAD at pad 0."""
+    s = _interleaved_state()
+    key = (0, 0)
+    s = dataclasses.replace(
+        s,
+        is_playing=True,
+        playhead=0,
+        playing_loops=frozenset({key}),
+        loop_measure_offsets=((key, 0),),
+    )
+    pads = render_pads(s)
+    assert pads[0] == PAD_PLAYHEAD
+
+
+def test_render_pads_interleaved_playhead_at_tick1_highlights_pad16():
+    """Interleaved: tick 1 → row=1,col=0 → pad 16 (half-step of beat 1)."""
+    s = _interleaved_state()
+    key = (0, 0)
+    s = dataclasses.replace(
+        s,
+        is_playing=True,
+        playhead=1,
+        playing_loops=frozenset({key}),
+        loop_measure_offsets=((key, 0),),
+    )
+    pads = render_pads(s)
+    # Tick 1: col=1//2=0, row=1%2=1 → pad 16 (row 1, col 0)
+    assert pads[16] == PAD_PLAYHEAD
+    # Pad 0 (row 0, col 0) is step 0 — active color but NOT playhead this tick
+    assert pads[0] != PAD_PLAYHEAD
+    # Pad 1 (row 0, col 1) — not current column
+    assert pads[1] != PAD_PLAYHEAD
+
+
+def test_render_pads_interleaved_step_beyond_count_is_inactive():
+    """Interleaved: pads beyond step_count are PAD_INACTIVE."""
+    s = _interleaved_state()
+    # step_count=32, so all 32 pads map to steps 0-31, none beyond
+    # Use a shorter loop to test: 1 bar, numer=2, size=32 → 16 steps
+    t0 = s.tracks[0]
+    short_loop = Loop(steps=tuple(False for _ in range(16)), bars=1, numerator=2, step_size=32)
+    new_loops = (short_loop,) + t0.loops[1:]
+    new_t0 = dataclasses.replace(t0, loops=new_loops)
+    s = dataclasses.replace(s, tracks=(new_t0,) + s.tracks[1:])
+    pads = render_pads(s)
+    # steps_per_bar = 2 * 8 = 16... not > 16, falls back to normal view
+    # Use numer=3, size=32 → steps_per_bar=24 > 16, step_count=24
+    medium_loop = Loop(steps=tuple(False for _ in range(24)), bars=1, numerator=3, step_size=32)
+    new_loops2 = (medium_loop,) + t0.loops[1:]
+    new_t0b = dataclasses.replace(t0, loops=new_loops2)
+    s2 = dataclasses.replace(s, tracks=(new_t0b,) + s.tracks[1:])
+    pads2 = render_pads(s2)
+    # steps_per_bar=24: pad 12 → step 24 (>= 24) → PAD_OFF (fully dark, not selectable)
+    assert pads2[12] == PAD_OFF  # row 0, col 12 → step 24 >= 24
+
+
 # ── render_pads — INSTRUMENT dual-arm ────────────────────────────────────────
 
 
@@ -256,108 +380,203 @@ def test_render_pads_instrument_dual_top_pad16_reflects_track1_step0():
 def test_render_oled_session_main_line1_track_name():
     """Test 16: SESSION mode MAIN_LINE1 = track name for default state."""
     oled = render_oled(default_state())
-    assert oled[OLED_MAIN_LINE1] == "KICK"
+    assert _t(oled, OLED_MAIN_LINE1) == "KICK"
 
 
 def test_render_oled_session_btn1_is_mute():
     """Test 17: SESSION mode BTN1_TITLE = 'MUTE' when selected track is not muted."""
     oled = render_oled(default_state())
-    assert oled[OLED_BTN1_TITLE] == "MUTE"
+    assert _t(oled, OLED_BTN1_TITLE) == "MUTE"
 
 
 def test_render_oled_session_btn1_is_unmute_when_muted():
     """BTN1_TITLE = 'UNMUTE' when selected track is muted."""
     s = dataclasses.replace(default_state(), muted_tracks=frozenset({0}))
     oled = render_oled(s)
-    assert oled[OLED_BTN1_TITLE] == "UNMUTE"
+    assert _t(oled, OLED_BTN1_TITLE) == "UNMUTE"
 
 
 def test_render_oled_session_btn2_is_unsolo_when_soloed():
     """BTN2_TITLE = 'UNSOLO' when selected track is soloed."""
     s = dataclasses.replace(default_state(), soloed_tracks=frozenset({0}))
     oled = render_oled(s)
-    assert oled[OLED_BTN2_TITLE] == "UNSOLO"
+    assert _t(oled, OLED_BTN2_TITLE) == "UNSOLO"
 
 
 def test_render_oled_session_btn2_is_solo_when_not_soloed():
     """BTN2_TITLE = 'SOLO' when selected track is not soloed."""
     oled = render_oled(default_state())
-    assert oled[OLED_BTN2_TITLE] == "SOLO"
+    assert _t(oled, OLED_BTN2_TITLE) == "SOLO"
 
 
 def test_render_oled_session_btn4_is_arm1_when_unarmed():
     """Test 18: SESSION mode BTN4_TITLE = 'ARM1' when nothing armed."""
     oled = render_oled(default_state())
-    assert oled[OLED_BTN4_TITLE] == "ARM1"
+    assert _t(oled, OLED_BTN4_TITLE) == "ARM1"
 
 
 def test_render_oled_session_arm1_shows_name_slot_loop():
     """ARM1 set: BTN4_TITLE = track name, BTN4_VALUE = 'S{slot} L{loop}'."""
     s = dataclasses.replace(default_state(), armed_tracks=(0,), selected_loop=2)
     oled = render_oled(s)
-    assert oled[OLED_BTN4_TITLE] == "KICK"
-    assert oled[OLED_BTN4_VALUE] == "S1 L3"
+    assert _t(oled, OLED_BTN4_TITLE) == "KICK"
+    assert _t(oled, OLED_BTN4_VALUE) == "S1 L3"
 
 
 def test_render_oled_session_arm2_shows_name_slot_loop():
     """ARM2 set: BTN5_TITLE = track name, BTN5_VALUE = 'S{slot} L{loop}'."""
     s = dataclasses.replace(default_state(), armed_tracks=(0, 1), selected_loop=0)
     oled = render_oled(s)
-    assert oled[OLED_BTN5_TITLE] == "SNARE"
-    assert oled[OLED_BTN5_VALUE] == "S2 L1"
+    assert _t(oled, OLED_BTN5_TITLE) == "SNARE"
+    assert _t(oled, OLED_BTN5_VALUE) == "S2 L1"
 
 
 def test_render_oled_session_btn5_is_arm2_when_unarmed():
     """BTN5_TITLE = 'ARM2' when no arm2 is set."""
     oled = render_oled(default_state())
-    assert oled[OLED_BTN5_TITLE] == "ARM2"
+    assert _t(oled, OLED_BTN5_TITLE) == "ARM2"
 
 
 def test_render_oled_instrument_single_arm_main_line1():
     """Test 19: INSTRUMENT single-arm MAIN_LINE1 = 'KICK'."""
     oled = render_oled(armed_single_state())
-    assert oled[OLED_MAIN_LINE1] == "KICK"
+    assert _t(oled, OLED_MAIN_LINE1) == "KICK"
 
 
 def test_render_oled_instrument_dual_arm_main_line1():
     """Test 20: INSTRUMENT dual-arm MAIN_LINE1 = 'KICK+SNARE'."""
     oled = render_oled(armed_dual_state())
-    assert oled[OLED_MAIN_LINE1] == "KICK+SNARE"
+    assert _t(oled, OLED_MAIN_LINE1) == "KICK+SNARE"
 
 
 def test_render_oled_instrument_btn4_is_back():
     """Test 21: INSTRUMENT mode BTN4_TITLE = '< BACK'."""
     oled = render_oled(armed_single_state())
-    assert oled[OLED_BTN4_TITLE] == "< BACK"
+    assert _t(oled, OLED_BTN4_TITLE) == "< BACK"
 
 
 def test_render_oled_session_loop_count_zero_shows_inf():
     """Test 22: loop_count=0 → 'inf' appears in MAIN_LINE2."""
-    # default state has loop_count=0 on all loops
     oled = render_oled(default_state())
-    assert "inf" in oled[OLED_MAIN_LINE2]
+    assert "inf" in _t(oled, OLED_MAIN_LINE2)
 
 
 def test_render_oled_session_arm1_updates_main_line2():
     """ARM1 set → MAIN_LINE2 shows ARM: <name> for immediate OLED feedback."""
     s = dataclasses.replace(default_state(), armed_tracks=(0,))
     oled = render_oled(s)
-    assert "ARM" in oled[OLED_MAIN_LINE2]
-    assert "KICK" in oled[OLED_MAIN_LINE2]
+    assert "ARM" in _t(oled, OLED_MAIN_LINE2)
+    assert "KICK" in _t(oled, OLED_MAIN_LINE2)
 
 
 def test_render_oled_session_arm2_updates_main_line2():
     """ARM1+ARM2 set → MAIN_LINE2 shows ARM: <name1>+<name2>."""
     s = dataclasses.replace(default_state(), armed_tracks=(0, 1))
     oled = render_oled(s)
-    assert "KICK" in oled[OLED_MAIN_LINE2]
-    assert "SNARE" in oled[OLED_MAIN_LINE2]
+    assert "KICK" in _t(oled, OLED_MAIN_LINE2)
+    assert "SNARE" in _t(oled, OLED_MAIN_LINE2)
 
 
 def test_render_oled_session_no_arm_shows_loop():
     """No arms → MAIN_LINE2 shows loop info (not arm info)."""
     oled = render_oled(default_state())
-    assert "LOOP" in oled[OLED_MAIN_LINE2]
+    assert "LOOP" in _t(oled, OLED_MAIN_LINE2)
+
+
+# ── render_oled — bar colors ──────────────────────────────────────────────────
+
+from eden.render import _OLED_MUTED, _OLED_SOLOED, _OLED_DIM, _OLED_ARMED, _OLED_ACTIVE
+
+
+def _color(oled: dict, slot: int) -> tuple:
+    return oled[slot][1:]
+
+
+def test_render_oled_session_mute_bar_color_when_not_muted():
+    """BTN1 bar is dim when track is not muted."""
+    oled = render_oled(default_state())
+    assert _color(oled, OLED_BTN1_TITLE) == _OLED_DIM
+
+
+def test_render_oled_session_mute_bar_color_when_muted():
+    """BTN1 bar is coral when track is muted."""
+    s = dataclasses.replace(default_state(), muted_tracks=frozenset({0}))
+    oled = render_oled(s)
+    assert _color(oled, OLED_BTN1_TITLE) == _OLED_MUTED
+
+
+def test_render_oled_session_solo_bar_color_when_not_soloed():
+    """BTN2 bar is dim when track is not soloed."""
+    oled = render_oled(default_state())
+    assert _color(oled, OLED_BTN2_TITLE) == _OLED_DIM
+
+
+def test_render_oled_session_solo_bar_color_when_soloed():
+    """BTN2 bar is amber when track is soloed."""
+    s = dataclasses.replace(default_state(), soloed_tracks=frozenset({0}))
+    oled = render_oled(s)
+    assert _color(oled, OLED_BTN2_TITLE) == _OLED_SOLOED
+
+
+def test_render_oled_session_arm1_bar_color_when_armed():
+    """BTN4 bar is orange when track is armed."""
+    s = dataclasses.replace(default_state(), armed_tracks=(0,))
+    oled = render_oled(s)
+    assert _color(oled, OLED_BTN4_TITLE) == _OLED_ARMED
+
+
+def test_render_oled_instrument_bars_bar_dim_when_inactive():
+    """SK1 (BARS) bar is dim when not active control."""
+    oled = render_oled(armed_single_state())
+    assert _color(oled, OLED_BTN1_TITLE) == _OLED_DIM
+
+
+def test_render_oled_instrument_bars_bar_active_when_selected():
+    """SK1 (BARS) bar is gold when instrument_active_ctrl == 'BARS'."""
+    s = dataclasses.replace(armed_single_state(), instrument_active_ctrl="BARS")
+    oled = render_oled(s)
+    assert _color(oled, OLED_BTN1_TITLE) == _OLED_ACTIVE
+
+
+def test_render_oled_instrument_numer_bar_active_when_selected():
+    """SK2 (NUMER) bar is gold when instrument_active_ctrl == 'NUMER'."""
+    s = dataclasses.replace(armed_single_state(), instrument_active_ctrl="NUMER")
+    oled = render_oled(s)
+    assert _color(oled, OLED_BTN2_TITLE) == _OLED_ACTIVE
+
+
+def test_render_oled_instrument_size_bar_active_when_selected():
+    """SK3 (SIZE) bar is gold when instrument_active_ctrl == 'SIZE'."""
+    s = dataclasses.replace(armed_single_state(), instrument_active_ctrl="SIZE")
+    oled = render_oled(s)
+    assert _color(oled, OLED_BTN3_TITLE) == _OLED_ACTIVE
+
+
+def test_render_oled_instrument_bars_count_in_value():
+    """SK1 VALUE shows bars count of the first armed loop (default 1 bar)."""
+    s = armed_single_state()
+    oled = render_oled(s)
+    assert _t(oled, OLED_BTN1_VALUE) == "1"
+
+
+def test_render_oled_instrument_numer_in_value():
+    """SK2 VALUE shows numerator (default 4)."""
+    s = armed_single_state()
+    oled = render_oled(s)
+    assert _t(oled, OLED_BTN2_VALUE) == "4"
+
+
+def test_render_oled_instrument_size_in_value():
+    """SK3 VALUE shows size as '1/{size}' (default '1/16')."""
+    s = armed_single_state()
+    oled = render_oled(s)
+    assert _t(oled, OLED_BTN3_VALUE) == "1/16"
+
+
+def test_render_oled_instrument_bars_not_disabled_in_dual_arm():
+    """SK1 (BARS) bar is dim (not disabled) in dual-arm — all controls are available."""
+    oled = render_oled(armed_dual_state())
+    assert _color(oled, OLED_BTN1_TITLE) == _OLED_DIM
 
 
 # ── render_button_leds ────────────────────────────────────────────────────────

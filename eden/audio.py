@@ -284,13 +284,25 @@ class StepScheduler:
                 continue  # SynthTrack/SampleTrack — skip silently
 
             for loop_idx, loop in enumerate(track.loops):
-                if (track_idx, loop_idx) not in state.playing_loops:
+                key = (track_idx, loop_idx)
+                if key not in state.playing_loops:
                     continue
-                measure_offset = offsets.get((track_idx, loop_idx), 0)
-                effective_step = playhead + measure_offset * 16
-                if effective_step >= len(loop.steps):
-                    continue
-                if loop.steps[effective_step]:
+                # Bresenham timing: distribute spb steps evenly over 32 ticks.
+                # step_in_bar = playhead * spb // 32 gives a new step index each
+                # time the value changes — no silence, no double-fires.
+                # Exception: spb > 32 (SIZE=32, numer>4) uses 32-step pages.
+                spb = loop.steps_per_bar
+                if spb > 32:
+                    step_in_bar = playhead
+                    stride = 32
+                else:
+                    step_in_bar = playhead * spb // 32
+                    if step_in_bar == (playhead - 1) * spb // 32:
+                        continue  # same step as last tick — skip
+                    stride = spb
+                offset = offsets.get(key, 0)
+                effective_step = step_in_bar + offset * stride
+                if effective_step < loop.step_count and loop.steps[effective_step]:
                     self._player.trigger(track.sample_name, 1.0)
                     break
 

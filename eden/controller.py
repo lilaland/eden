@@ -62,6 +62,7 @@ from eden.events import (
     ShiftChanged,
     SoftkeyPressed,
     TouchbarMoved,
+    ArrowPressed,
 )
 
 # ─── Native-mode transport CC table (PROTOCOL.md §8) ─────────────────────────
@@ -416,6 +417,14 @@ class AtomSQ:
                     self._event_queue.put(ShiftChanged(held=held))
                 if self._cb_shift:
                     self._cb_shift(held)
+                return
+
+            # Arrow keys: CC 90 = left, CC 102 = right, channel 0.  [SNIFF]
+            if cc == 90 or cc == 102:
+                direction = "LEFT" if cc == 90 else "RIGHT"
+                pressed = (value == 127)
+                if self._event_queue:
+                    self._event_queue.put(ArrowPressed(direction=direction, pressed=pressed))
                 return
 
             if cc in _MODE_BTN_CC:

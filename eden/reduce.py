@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import Callable
 
+import eden.catalog as catalog
 from eden.state import (
     AppState,
     DrumTrack,
@@ -17,6 +19,7 @@ from eden.state import (
     default_track_loops,
 )
 from eden.events import (
+    ArrowPressed,
     ClockTicked,
     EncoderTurned,
     Event,
@@ -30,25 +33,6 @@ from eden.events import (
 )
 
 
-# Predefined name/sample pairs for each of the 16 track slots.
-_TRACK_DEFAULTS: tuple[tuple[str, str], ...] = (
-    ("KICK",  "kick"),
-    ("SNARE", "snare"),
-    ("HAT",   "hihat_closed"),
-    ("CLAP",  "clap"),
-    ("RIDE",  "ride"),
-    ("CRASH", "crash"),
-    ("TOM1",  "tom_hi"),
-    ("TOM2",  "tom_lo"),
-    ("PERC1", "perc1"),
-    ("PERC2", "perc2"),
-    ("BASS",  "bass"),
-    ("LEAD",  "lead"),
-    ("PAD",   "pad"),
-    ("FX1",   "fx1"),
-    ("FX2",   "fx2"),
-    ("FX3",   "fx3"),
-)
 
 
 # ── Top-level dispatch ────────────────────────────────────────────────────────
@@ -74,7 +58,7 @@ def reduce(state: AppState, event: Event) -> AppState:
 def _on_clock_ticked(state: AppState) -> AppState:
     if not state.is_playing:
         return state
-    new_playhead = (state.playhead + 1) % 16
+    new_playhead = (state.playhead + 1) % 32
     state = dataclasses.replace(state, playhead=new_playhead)
     if new_playhead == 0:
         state = _handle_loop_wrap(state)
@@ -82,7 +66,11 @@ def _on_clock_ticked(state: AppState) -> AppState:
 
 
 def _handle_loop_wrap(state: AppState) -> AppState:
-    """Advance measure offsets on each 16-step wrap; decrement plays_remaining only on full loop completion."""
+    """Advance offsets on each 16-step wrap; decrement plays_remaining only on full loop completion.
+
+    For interleaved loops (step_size > 16), offsets track bar index — one bar per 16-tick cycle.
+    For normal loops, offsets track 16-step page index.
+    """
     remaining = dict(state.plays_remaining)
     offsets = dict(state.loop_measure_offsets)
     loops_to_stop: set[tuple[int, int]] = set()
@@ -95,16 +83,23 @@ def _handle_loop_wrap(state: AppState) -> AppState:
             continue
 
         loop = track.loops[loop_idx]
-        measure_count = loop.step_count // 16
 
-        if measure_count > 1:
+        if loop.step_size > 16:
+            if loop.steps_per_bar > 32:
+                cycle_count = max(1, (loop.step_count + 31) // 32)
+            else:
+                cycle_count = loop.bars
+        else:
+            cycle_count = loop.bars
+
+        if cycle_count > 1:
             current = offsets.get(key, 0)
-            nxt = (current + 1) % measure_count
+            nxt = (current + 1) % cycle_count
             offsets[key] = nxt
             if nxt != 0:
                 continue  # mid-loop, don't count a play yet
 
-        # 1-measure loop OR just completed all measures → count one play
+        # 1-cycle loop OR just completed all cycles → count one play
         if key not in remaining:
             continue  # infinite loop
         count = remaining[key] - 1
@@ -130,6 +125,17 @@ def _on_mode_button(state: AppState, event: ModeButtonPressed) -> AppState:
     if not event.pressed:
         return state
     if event.button == "INST":
+        if state.tracks[state.selected_track] is None:
+            # Empty slot — create track from picker and enter INSTRUMENT,
+            # saving current arm state to restore when returning to SESSION.
+            state = _create_new_slot_track(state)
+            return dataclasses.replace(
+                state,
+                armed_tracks=(state.selected_track,),
+                saved_armed_tracks=state.armed_tracks,
+                mode=Mode.INSTRUMENT,
+                instrument_submode=InstrumentSubmode.STEPS,
+            )
         if state.armed_tracks:
             # Already armed — just switch to INSTRUMENT view.
             return dataclasses.replace(state, mode=Mode.INSTRUMENT)
@@ -142,7 +148,8 @@ def _on_mode_button(state: AppState, event: ModeButtonPressed) -> AppState:
         )
     if event.button == "SONG":
         state = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
-        return dataclasses.replace(state, mode=Mode.SESSION)
+        armed = state.saved_armed_tracks if state.saved_armed_tracks is not None else state.armed_tracks
+        return dataclasses.replace(state, mode=Mode.SESSION, armed_tracks=armed, saved_armed_tracks=None)
     # EDIT, USER, BACK, FORWARD — no-op for M1/M2
     return state
 
@@ -165,21 +172,22 @@ def _reduce_session(state: AppState, event: Event) -> AppState:
 def _session_pad_pressed(state: AppState, event: PadPressed) -> AppState:
     pad = event.pad_index
     if pad < 16:
-        # Bottom row: select track; auto-select loop 0; create DrumTrack if slot is empty.
-        # GC the previously selected track if it has no content and we're moving away from it.
+        # Bottom row: select track; auto-select loop 0.
+        # Empty slots show the new-instrument picker — track is created only on SK5 CREATE.
         if pad != state.selected_track:
             state = _drop_fully_empty_tracks(state, (state.selected_track,))
         track = state.tracks[pad]
         if track is None:
-            name, sample = _TRACK_DEFAULTS[pad]
-            new_track = DrumTrack(name=name, sample_name=sample, loops=default_track_loops())
-            new_tracks = state.tracks[:pad] + (new_track,) + state.tracks[pad + 1:]
+            # Select empty slot and reset the new-instrument picker indices.
             return dataclasses.replace(
                 state,
-                tracks=new_tracks,
                 selected_track=pad,
                 selected_loop=0,
                 arm_pads_offer_loop=None,
+                new_slot_type_idx=0,
+                new_slot_cat_idx=0,
+                new_slot_var_idx=0,
+                new_slot_active_ctrl="",
             )
         return dataclasses.replace(
             state,
@@ -237,7 +245,10 @@ def _session_transport(state: AppState, event: TransportPressed) -> AppState:
 
 def _session_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
     t = state.selected_track
-    # If ARM PADS offer is active, SK5 accepts it
+    # New-instrument picker: empty slot selected → repurpose SK1-SK5.
+    if state.tracks[t] is None:
+        return _new_slot_softkey(state, event)
+    # ARM PADS offer: SK5 accepts
     if event.key == 4 and state.arm_pads_offer_loop is not None:
         return dataclasses.replace(
             state,
@@ -268,6 +279,39 @@ def _session_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
     if event.key == 4:  # SK5: ARM2 — add to dual-arm list
         return _arm_dual(state)
     return state
+
+
+def _new_slot_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
+    """Handle softkeys while the new-instrument picker is open."""
+    if event.key == 0:  # SK1: activate/deactivate TYPE ctrl
+        new_ctrl = "" if state.new_slot_active_ctrl == "TYPE" else "TYPE"
+        return dataclasses.replace(state, new_slot_active_ctrl=new_ctrl)
+    if event.key == 1:  # SK2: activate/deactivate CAT ctrl
+        new_ctrl = "" if state.new_slot_active_ctrl == "CAT" else "CAT"
+        return dataclasses.replace(state, new_slot_active_ctrl=new_ctrl)
+    if event.key == 2:  # SK3: activate/deactivate VAR ctrl
+        new_ctrl = "" if state.new_slot_active_ctrl == "VAR" else "VAR"
+        return dataclasses.replace(state, new_slot_active_ctrl=new_ctrl)
+    if event.key == 3:  # SK4: BACK — deactivate any active ctrl
+        return dataclasses.replace(state, new_slot_active_ctrl="")
+    if event.key == 4:  # SK5: CREATE — instantiate the track
+        return _create_new_slot_track(state)
+    return state
+
+
+def _create_new_slot_track(state: AppState) -> AppState:
+    """Create a DrumTrack at the selected empty slot using the current picker values."""
+    pad = state.selected_track
+    name, sample = catalog.get_track_params(
+        state.new_slot_type_idx, state.new_slot_cat_idx, state.new_slot_var_idx
+    )
+    new_track = DrumTrack(name=name, sample_name=sample, loops=default_track_loops())
+    new_tracks = state.tracks[:pad] + (new_track,) + state.tracks[pad + 1:]
+    return dataclasses.replace(
+        state,
+        tracks=new_tracks,
+        new_slot_active_ctrl="",
+    )
 
 
 def _cycle_loop_count(state: AppState) -> AppState:
@@ -328,8 +372,42 @@ def _arm_dual(state: AppState) -> AppState:
 
 def _session_encoder(state: AppState, event: EncoderTurned) -> AppState:
     if event.encoder == 9:
+        # New-instrument picker active: jog changes the selected control.
+        if state.tracks[state.selected_track] is None and state.new_slot_active_ctrl:
+            return _new_slot_encoder(state, event)
         new_bpm = max(60.0, min(200.0, state.tempo_bpm + event.delta))
         return dataclasses.replace(state, tempo_bpm=float(new_bpm))
+    return state
+
+
+def _new_slot_encoder(state: AppState, event: EncoderTurned) -> AppState:
+    """Jog the active new-slot picker control."""
+    delta = 1 if event.delta > 0 else -1
+    ctrl = state.new_slot_active_ctrl
+    if ctrl == "TYPE":
+        types = catalog.INSTRUMENT_TYPES
+        new_idx = (state.new_slot_type_idx + delta) % len(types)
+        # Reset downstream indices when type changes.
+        return dataclasses.replace(
+            state,
+            new_slot_type_idx=new_idx,
+            new_slot_cat_idx=0,
+            new_slot_var_idx=0,
+        )
+    if ctrl == "CAT":
+        cats = catalog.get_categories(state.new_slot_type_idx)
+        if cats:
+            new_idx = (state.new_slot_cat_idx + delta) % len(cats)
+            return dataclasses.replace(
+                state,
+                new_slot_cat_idx=new_idx,
+                new_slot_var_idx=0,
+            )
+    if ctrl == "VAR":
+        vars_ = catalog.get_variations(state.new_slot_type_idx, state.new_slot_cat_idx)
+        if vars_:
+            new_idx = (state.new_slot_var_idx + delta) % len(vars_)
+            return dataclasses.replace(state, new_slot_var_idx=new_idx)
     return state
 
 
@@ -347,21 +425,169 @@ def _reduce_instrument(state: AppState, event: Event) -> AppState:
         return _instrument_encoder(state, event)
     if isinstance(event, TouchbarMoved):
         return _instrument_touchbar(state, event)
+    if isinstance(event, ArrowPressed):
+        return _instrument_arrow(state, event)
     return state
 
 
+_STEP_SIZES: tuple[int, ...] = (4, 8, 16, 32)
+
+
+def _resize_loop_to(loop: Loop, bars: int, numer: int, size: int) -> Loop:
+    """Resize a loop to bars*numer*(size//4) steps.
+
+    When step_size changes, existing steps are remapped to the new resolution:
+    old step i → new step i * (new_spu / old_spu), where spu = steps-per-beat.
+    This preserves musical position (e.g. 16→32 spreads each step to its even slot,
+    leaving odd slots empty for new subdivisions; 32→16 quantizes to nearest).
+    When only bars/numer change, steps are extended or truncated unchanged.
+    """
+    new_count = bars * numer * (size // 4)
+    if size != loop.step_size:
+        old_spu = loop.step_size // 4
+        new_spu = size // 4
+        new_steps: list[bool] = [False] * new_count
+        for i, active in enumerate(loop.steps):
+            if active:
+                new_i = i * new_spu // old_spu
+                if 0 <= new_i < new_count:
+                    new_steps[new_i] = True
+        return dataclasses.replace(loop, steps=tuple(new_steps), bars=bars, numerator=numer, step_size=size)
+    current = loop.steps
+    if new_count > len(current):
+        new_steps_t = current + (False,) * (new_count - len(current))
+    else:
+        new_steps_t = current[:new_count]
+    return dataclasses.replace(loop, steps=new_steps_t, bars=bars, numerator=numer, step_size=size)
+
+
+def _apply_to_armed_loops(
+    state: AppState, transform: Callable[[Loop], Loop]
+) -> AppState:
+    """Apply transform to selected_loop of every armed DrumTrack. Returns new state."""
+    new_state = state
+    loop_idx = state.selected_loop
+    for track_idx in state.armed_tracks:
+        track = new_state.tracks[track_idx]
+        if track is None or not isinstance(track, DrumTrack):
+            continue
+        loop = track.loops[loop_idx]
+        new_loop = transform(loop)
+        if new_loop is loop:
+            continue
+        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+        new_track = dataclasses.replace(track, loops=new_loops)
+        new_tracks = (
+            new_state.tracks[:track_idx]
+            + (new_track,)
+            + new_state.tracks[track_idx + 1:]
+        )
+        new_state = dataclasses.replace(new_state, tracks=new_tracks)
+    return new_state
+
+
+def _max_view_pages(state: AppState) -> int:
+    """Max display pages across all armed loops.
+    Interleaved view (step_size > 16): one page per bar.
+    Normal view: one page per 16 steps (ceiling division).
+    """
+    m = 1
+    for idx in state.armed_tracks:
+        track = state.tracks[idx]
+        if track is not None:
+            lp = track.loops[state.selected_loop]
+            if lp.step_size > 16:
+                if lp.steps_per_bar > 32:
+                    m = max(m, max(1, (lp.step_count + 31) // 32))
+                else:
+                    m = max(m, lp.bars)
+            else:
+                m = max(m, max(1, (lp.step_count + 15) // 16))
+    return m
+
+
+def _clamp_all_armed_playback(state: AppState) -> AppState:
+    """Clamp playback offsets for all armed loops after a potential shrink."""
+    for track_idx in state.armed_tracks:
+        track = state.tracks[track_idx]
+        if track is None:
+            continue
+        loop_idx = state.selected_loop
+        loop = track.loops[loop_idx]
+        state = _clamp_playback_after_shrink(state, track_idx, loop_idx, loop.step_count)
+    return state
+
+
+def _adjust_bars(state: AppState, delta: int) -> AppState:
+    """Add or remove one bar from all armed loops."""
+    step = 1 if delta > 0 else -1
+
+    def transform(loop: Loop) -> Loop:
+        new_bars = max(1, min(8, loop.bars + step))
+        if new_bars == loop.bars:
+            return loop
+        return _resize_loop_to(loop, new_bars, loop.numerator, loop.step_size)
+
+    new_state = _apply_to_armed_loops(state, transform)
+    new_state = _clamp_all_armed_playback(new_state)
+    max_pages = _max_view_pages(new_state)
+    view = min(new_state.instrument_view_measure, max(0, max_pages - 1))
+    return dataclasses.replace(new_state, instrument_view_measure=view)
+
+
+def _adjust_numer(state: AppState, delta: int) -> AppState:
+    """Change numerator (beats per bar) on all armed loops."""
+    step = 1 if delta > 0 else -1
+
+    def transform(loop: Loop) -> Loop:
+        new_numer = max(1, min(16, loop.numerator + step))
+        if new_numer == loop.numerator:
+            return loop
+        return _resize_loop_to(loop, loop.bars, new_numer, loop.step_size)
+
+    new_state = _apply_to_armed_loops(state, transform)
+    new_state = _clamp_all_armed_playback(new_state)
+    max_pages = _max_view_pages(new_state)
+    view = min(new_state.instrument_view_measure, max(0, max_pages - 1))
+    return dataclasses.replace(new_state, instrument_view_measure=view)
+
+
+def _adjust_size(state: AppState, delta: int) -> AppState:
+    """Change step_size on all armed loops."""
+    def transform(loop: Loop) -> Loop:
+        try:
+            idx = _STEP_SIZES.index(loop.step_size)
+        except ValueError:
+            idx = 2  # default to 16
+        new_idx = max(0, min(len(_STEP_SIZES) - 1, idx + (1 if delta > 0 else -1)))
+        new_size = _STEP_SIZES[new_idx]
+        if new_size == loop.step_size:
+            return loop
+        return _resize_loop_to(loop, loop.bars, loop.numerator, new_size)
+
+    new_state = _apply_to_armed_loops(state, transform)
+    new_state = _clamp_all_armed_playback(new_state)
+    max_pages = _max_view_pages(new_state)
+    view = min(new_state.instrument_view_measure, max(0, max_pages - 1))
+    return dataclasses.replace(new_state, instrument_view_measure=view)
+
+
 def _ensure_loop_length(state: AppState, track_idx: int, loop_idx: int, min_steps: int) -> AppState:
-    """Extend a DrumTrack loop to at least min_steps (in 16-step increments)."""
+    """Extend a DrumTrack loop to at least min_steps, growing bars as needed."""
     track = state.tracks[track_idx]
     if track is None or not isinstance(track, DrumTrack):
         return state
     loop = track.loops[loop_idx]
     if loop.step_count >= min_steps:
         return state
-    new_length = ((min_steps - 1) // 16 + 1) * 16
-    extra = tuple(False for _ in range(new_length - loop.step_count))
-    new_steps = loop.steps + extra
-    new_loop = dataclasses.replace(loop, steps=new_steps)
+    steps_per_bar = loop.numerator * (loop.step_size // 4)
+    if steps_per_bar == 0:
+        return state
+    new_bars = max(loop.bars, (min_steps + steps_per_bar - 1) // steps_per_bar)
+    new_bars = min(new_bars, 8)
+    if new_bars == loop.bars:
+        return state
+    new_loop = _resize_loop_to(loop, new_bars, loop.numerator, loop.step_size)
     new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
     new_track = dataclasses.replace(track, loops=new_loops)
     new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
@@ -375,8 +601,16 @@ def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
 
     if len(state.armed_tracks) == 1:
         affected_track = state.armed_tracks[0]
-        # step = view_measure*16 + pad (pad 0-15 = bottom row, 16-31 = top row)
-        step_idx = view_m * 16 + pad
+        track = state.tracks[affected_track]
+        loop = track.loops[loop_idx] if track is not None else None
+        if loop is not None and loop.step_size > 16:
+            # Interleaved: row 0 = even steps, row 1 = odd steps within page
+            col = pad % 16
+            row = pad // 16
+            page_size = 32 if loop.steps_per_bar > 32 else loop.steps_per_bar
+            step_idx = view_m * page_size + col * 2 + row
+        else:
+            step_idx = view_m * 16 + pad
         state = _ensure_loop_length(state, affected_track, loop_idx, step_idx + 1)
         new_state = _toggle_step(state, affected_track, loop_idx, step_idx)
     else:
@@ -399,7 +633,16 @@ def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
                 new_playing.add(key)
                 changed = True
     if changed:
-        new_state = dataclasses.replace(new_state, playing_loops=frozenset(new_playing))
+        offsets = dict(new_state.loop_measure_offsets)
+        for track_idx in new_state.armed_tracks:
+            key = (track_idx, loop_idx)
+            if key in new_playing and key not in offsets:
+                offsets[key] = 0
+        new_state = dataclasses.replace(
+            new_state,
+            playing_loops=frozenset(new_playing),
+            loop_measure_offsets=tuple(offsets.items()),
+        )
 
     return _drop_fully_empty_tracks(new_state, (affected_track,))
 
@@ -437,19 +680,20 @@ def _instrument_transport(state: AppState, event: TransportPressed) -> AppState:
 
 
 def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
-    if event.key == 0:  # SK1: STEPS — activate jogwheel (single-arm only)
-        if len(state.armed_tracks) > 1:
-            return state  # disabled in dual-arm
-        new_ctrl = "" if state.instrument_active_ctrl == "STEPS" else "STEPS"
+    if event.key == 0:  # SK1: BARS — toggle active ctrl
+        new_ctrl = "" if state.instrument_active_ctrl == "BARS" else "BARS"
         return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-    if event.key == 1:  # SK2: MEASURES — activate jogwheel for measure count
-        new_ctrl = "" if state.instrument_active_ctrl == "MEASURES" else "MEASURES"
+    if event.key == 1:  # SK2: NUMER — toggle active ctrl
+        new_ctrl = "" if state.instrument_active_ctrl == "NUMER" else "NUMER"
         return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-    if event.key == 2:  # SK3: PADS — placeholder
-        return state
+    if event.key == 2:  # SK3: SIZE — toggle active ctrl
+        new_ctrl = "" if state.instrument_active_ctrl == "SIZE" else "SIZE"
+        return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
     if event.key == 3:  # SK4: BACK — GC empty armed tracks, return to SESSION
         state = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
-        return dataclasses.replace(state, mode=Mode.SESSION, instrument_active_ctrl="")
+        armed = state.saved_armed_tracks if state.saved_armed_tracks is not None else state.armed_tracks
+        return dataclasses.replace(state, mode=Mode.SESSION, instrument_active_ctrl="",
+                                   armed_tracks=armed, saved_armed_tracks=None)
     if event.key == 4:  # SK5: CLEAR — shift only
         if state.shift_held:
             return _clear_armed_loops(state)
@@ -457,65 +701,54 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
     return state
 
 
-def _max_arm_measures(state: AppState) -> int:
-    """Return the highest measure count across all armed loops."""
-    m = 1
-    for idx in state.armed_tracks:
-        track = state.tracks[idx]
-        if track is not None:
-            m = max(m, track.loops[state.selected_loop].step_count // 16)
-    return m
-
-
-def _adjust_measures(state: AppState, delta: int) -> AppState:
-    """Add or remove one measure (16 steps) from all armed DrumTrack loops. delta sign only matters."""
-    step = 1 if delta > 0 else -1
-    new_state = state
-    for track_idx in state.armed_tracks:
-        track = new_state.tracks[track_idx]
-        if track is None or not isinstance(track, DrumTrack):
-            continue
-        loop = track.loops[new_state.selected_loop]
-        current_measures = loop.step_count // 16
-        new_measures = max(1, min(8, current_measures + step))
-        if new_measures == current_measures:
-            continue
-        if new_measures > current_measures:
-            added = tuple(False for _ in range((new_measures - current_measures) * 16))
-            new_steps = loop.steps + added
+def _clamp_playback_after_shrink(
+    state: AppState, track_idx: int, loop_idx: int, new_step_count: int
+) -> AppState:
+    """If a playing loop's current offset is past the new end, reset to 0."""
+    key = (track_idx, loop_idx)
+    if key not in state.playing_loops:
+        return state
+    offsets = dict(state.loop_measure_offsets)
+    current = offsets.get(key, 0)
+    track = state.tracks[track_idx]
+    loop = track.loops[loop_idx] if track is not None else None
+    if loop is not None and loop.step_size > 16:
+        if loop.steps_per_bar > 32:
+            new_max = max(0, (new_step_count + 31) // 32 - 1)
         else:
-            new_steps = loop.steps[:new_measures * 16]
-        new_loop = dataclasses.replace(loop, steps=new_steps)
-        new_loops = (
-            track.loops[:new_state.selected_loop]
-            + (new_loop,)
-            + track.loops[new_state.selected_loop + 1:]
-        )
-        new_track = dataclasses.replace(track, loops=new_loops)
-        new_tracks = (
-            new_state.tracks[:track_idx]
-            + (new_track,)
-            + new_state.tracks[track_idx + 1:]
-        )
-        new_state = dataclasses.replace(new_state, tracks=new_tracks)
-    # Clamp view_measure to new max
-    max_m = _max_arm_measures(new_state)
-    view = min(new_state.instrument_view_measure, max(0, max_m - 1))
-    return dataclasses.replace(new_state, instrument_view_measure=view)
+            new_max = max(0, loop.bars - 1)
+    else:
+        new_max = max(0, loop.bars - 1) if loop is not None else 0
+    if current > new_max:
+        offsets[key] = 0
+        return dataclasses.replace(state, loop_measure_offsets=tuple(offsets.items()))
+    return state
 
 
 def _instrument_encoder(state: AppState, event: EncoderTurned) -> AppState:
     if event.encoder != 9:
         return state
-    if state.instrument_active_ctrl == "MEASURES":
-        return _adjust_measures(state, event.delta)
-    # "STEPS" active: scaffold only, no resize for M1/M2
+    if state.instrument_active_ctrl == "BARS":
+        return _adjust_bars(state, event.delta)
+    if state.instrument_active_ctrl == "NUMER":
+        return _adjust_numer(state, event.delta)
+    if state.instrument_active_ctrl == "SIZE":
+        return _adjust_size(state, event.delta)
     return state
 
 
 def _instrument_touchbar(state: AppState, event: TouchbarMoved) -> AppState:
-    max_m = _max_arm_measures(state)
+    max_m = _max_view_pages(state)
     view = max(0, min(max_m - 1, int(event.position * max_m)))
+    return dataclasses.replace(state, instrument_view_measure=view)
+
+
+def _instrument_arrow(state: AppState, event: ArrowPressed) -> AppState:
+    if not event.pressed:
+        return state
+    max_pages = _max_view_pages(state)
+    delta = 1 if event.direction == "RIGHT" else -1
+    view = max(0, min(max_pages - 1, state.instrument_view_measure + delta))
     return dataclasses.replace(state, instrument_view_measure=view)
 
 
@@ -569,8 +802,8 @@ def _clear_armed_loops(state: AppState) -> AppState:
         if track is None or not isinstance(track, DrumTrack):
             continue
         loop = track.loops[new_state.selected_loop]
-        blank = default_loop(loop.step_count)
-        new_loop = dataclasses.replace(loop, steps=blank.steps)
+        blank_steps = tuple(False for _ in range(loop.step_count))
+        new_loop = dataclasses.replace(loop, steps=blank_steps)
         new_loops = (
             track.loops[:new_state.selected_loop]
             + (new_loop,)

@@ -39,26 +39,10 @@ from eden.reduce import reduce
 from eden.render import render_pads, render_oled, render_button_leds
 from eden.state import default_state, AppState
 from eden.events import ClockTicked, SoftkeyPressed, TouchbarMoved
-from eden.theme import ACCENT_GOLD
-
-try:
-    from controller_map import (
-        OLED_BTN1_TITLE, OLED_BTN2_TITLE, OLED_BTN3_TITLE,
-        OLED_BTN4_TITLE, OLED_BTN5_TITLE, OLED_BTN6_TITLE,
-    )
-except ImportError:
-    # Fallback slot IDs from PROTOCOL.md §5
-    OLED_BTN1_TITLE = 0x00; OLED_BTN2_TITLE = 0x01; OLED_BTN3_TITLE = 0x02
-    OLED_BTN4_TITLE = 0x08; OLED_BTN5_TITLE = 0x09; OLED_BTN6_TITLE = 0x0A
 
 # UNVERIFIED: pad LED addressing — pad_index → note offset confirmed in v0 probe.py
 # UNVERIFIED: ATM SQ Control port requirement — all LED/OLED output must go to Control port
 _PAD_NOTE_OFFSET = 36
-
-_OLED_SOFTKEY_TITLE_SLOTS = {
-    OLED_BTN1_TITLE, OLED_BTN2_TITLE, OLED_BTN3_TITLE,
-    OLED_BTN4_TITLE, OLED_BTN5_TITLE, OLED_BTN6_TITLE,
-}
 
 
 class EdenApp:
@@ -70,14 +54,14 @@ class EdenApp:
 
         self._controller = AtomSQ(event_queue=self._eq)
         self._audio = SamplePlayer(sample_dir=sample_dir)
-        self._clock = SequencerClock(bpm=bpm, steps=16, ppq=4, event_queue=self._eq)
+        self._clock = SequencerClock(bpm=bpm, steps=32, ppq=8, event_queue=self._eq)
         self._scheduler = StepScheduler(player=self._audio, state_ref=self._state_ref)
 
         # Render delta state: compare against previous render to send only diffs.
         self._last_pad_colors: tuple[tuple[int, int, int], ...] = tuple(
             (0, 0, 0) for _ in range(32)
         )
-        self._last_oled: dict[int, str] = {}
+        self._last_oled: dict[int, tuple[str, int, int, int]] = {}
         self._last_leds: dict[int, bool] = {}
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
@@ -147,12 +131,9 @@ class EdenApp:
 
     def _send_oled_diffs(self) -> None:
         new_oled = render_oled(self._state)
-        for slot, text in new_oled.items():
-            if self._last_oled.get(slot) != text:
-                if slot in _OLED_SOFTKEY_TITLE_SLOTS:
-                    r, g, b = ACCENT_GOLD
-                else:
-                    r = g = b = 0x7F
+        for slot, entry in new_oled.items():
+            if self._last_oled.get(slot) != entry:
+                text, r, g, b = entry
                 self._controller.write_oled(slot, text, r, g, b)
         # Clear any slots that were in last render but not in new render.
         for slot in self._last_oled:

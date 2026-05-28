@@ -24,6 +24,9 @@ class Loop:
     steps: tuple[bool, ...]  # 16 or 32 booleans
     loop_count: int = 0      # 0=∞, 1/2/4/8=plays per cycle (configured)
     # TODO M3+: add plays_remaining tracking
+    bars: int = 1
+    numerator: int = 4
+    step_size: int = 16      # note value denominator: 4/8/16/32
 
     @property
     def is_empty(self) -> bool:
@@ -32,6 +35,10 @@ class Loop:
     @property
     def step_count(self) -> int:
         return len(self.steps)
+
+    @property
+    def steps_per_bar(self) -> int:
+        return self.numerator * (self.step_size // 4)
 
 
 @dataclass(frozen=True)
@@ -87,7 +94,13 @@ class AppState:
     loop_measure_offsets: tuple[tuple[tuple[int, int], int], ...] = ()
     # ((track_idx, loop_idx), current_measure_index) — only for playing multi-measure loops
     instrument_view_measure: int = 0   # which measure page the pad grid shows
-    instrument_active_ctrl: str = ""   # "" | "STEPS" | "MEASURES"
+    instrument_active_ctrl: str = ""   # "" | "BARS" | "NUMER" | "SIZE"
+    # New-slot selection state (SESSION mode, empty track selected)
+    new_slot_type_idx: int = 0         # index into catalog.INSTRUMENT_TYPES
+    new_slot_cat_idx: int = 0          # index into categories for current type
+    new_slot_var_idx: int = 0          # index into variations for current category
+    new_slot_active_ctrl: str = ""     # "" | "TYPE" | "CAT" | "VAR"
+    saved_armed_tracks: Optional[tuple[int, ...]] = None  # restored on exit from new-slot INSTRUMENT
 
 
 # ── Factory functions ─────────────────────────────────────────────────────────

@@ -83,51 +83,51 @@ def test_clock_advances_playhead_session():
     assert result.playhead == 1
 
 
-def test_clock_wraps_at_16_in_session():
-    """Playhead wraps 15→0 in SESSION mode (16-step)."""
-    state = dataclasses.replace(_playing_session(), playhead=15)
+def test_clock_wraps_at_32_in_session():
+    """Playhead wraps 31→0 in SESSION mode (32-tick bar)."""
+    state = dataclasses.replace(_playing_session(), playhead=31)
     result = reduce(state, ClockTicked())
     assert result.playhead == 0
 
 
-def test_clock_wraps_at_16_in_dual_arm_instrument():
-    """Playhead wraps 15→0 in dual-arm INSTRUMENT mode (16-step)."""
+def test_clock_wraps_at_32_in_dual_arm_instrument():
+    """Playhead wraps 31→0 in dual-arm INSTRUMENT mode (32-tick bar)."""
     state = dataclasses.replace(
         _armed_instrument(armed=(0, 1)),
         is_playing=True,
-        playhead=15,
+        playhead=31,
     )
     result = reduce(state, ClockTicked())
     assert result.playhead == 0
 
 
-def test_clock_wraps_at_16_in_single_arm_instrument_with_16step_loop():
-    """Playhead wraps 15→0 in single-arm INSTRUMENT when the loop is 16-step."""
+def test_clock_wraps_at_32_in_single_arm_instrument_with_16step_loop():
+    """Playhead wraps 31→0 for any loop size (32-tick bar)."""
     state = dataclasses.replace(
         _armed_instrument(armed=(0,)),
         is_playing=True,
-        playhead=15,
+        playhead=31,
     )
     result = reduce(state, ClockTicked())
-    assert result.playhead == 0  # wraps at 16, not 32
+    assert result.playhead == 0
 
 
-def test_clock_always_wraps_at_16_for_multi_measure_loop():
-    """Global playhead always wraps at 16 even when a playing loop has >16 steps."""
+def test_clock_always_wraps_at_32_for_multi_measure_loop():
+    """Global playhead wraps at 32 (one bar) even when a playing loop spans multiple bars."""
     state = default_state()
-    # Make track 0 loop 0 a 32-step loop and put it in playing_loops
+    # Make track 0 loop 0 a 32-step SIZE=16 loop spanning 2 bars
     t0 = state.tracks[0]
-    long_loop = Loop(steps=tuple(i % 2 == 0 for i in range(32)))
+    long_loop = Loop(steps=tuple(i % 2 == 0 for i in range(32)), bars=2)
     new_loops = (long_loop,) + t0.loops[1:]
     t0_new = dataclasses.replace(t0, loops=new_loops)
     state = dataclasses.replace(
         state,
         tracks=(t0_new,) + state.tracks[1:],
         is_playing=True,
-        playhead=15,
+        playhead=31,
     )
     result = reduce(state, ClockTicked())
-    assert result.playhead == 0  # wraps at 16, not 32
+    assert result.playhead == 0
     # Measure offset for (0,0) advances to 1 on wrap
     offsets = dict(result.loop_measure_offsets)
     assert offsets.get((0, 0), 0) == 1
@@ -209,14 +209,37 @@ def test_session_pad_bottom_row_selects_track_15():
     assert result.selected_track == 15
 
 
-def test_session_pad_bottom_row_creates_instrument_for_empty_slot():
-    """Pressing an empty track slot creates a new DrumTrack at that slot."""
+def test_session_pad_bottom_row_selects_empty_slot_without_creating_track():
+    """Pressing an empty track slot selects it and opens the new-instrument picker."""
     state = default_state()
     assert state.tracks[2] is None
     result = reduce(state, PadPressed(pad_index=2, velocity=100))
+    assert result.tracks[2] is None          # track NOT created yet
+    assert result.selected_track == 2        # slot is selected
+    assert result.new_slot_active_ctrl == "" # picker visible but no ctrl active
+
+
+def test_session_new_slot_sk5_creates_track():
+    """SK5 (CREATE) in new-instrument picker creates a DrumTrack at the selected slot."""
     from eden.state import DrumTrack
+    from eden.events import SoftkeyPressed
+    state = default_state()
+    state = reduce(state, PadPressed(pad_index=2, velocity=100))  # select empty slot
+    assert state.tracks[2] is None
+    result = reduce(state, SoftkeyPressed(key=4))  # SK5 = CREATE
     assert isinstance(result.tracks[2], DrumTrack)
-    assert result.selected_track == 2
+    assert result.tracks[2].name == "KICK"   # default: type=DRUMS, cat=Kick, var=Techno
+
+
+def test_session_new_slot_encoder_changes_category():
+    """Enc9 jog changes category when CAT ctrl is active in new-instrument picker."""
+    from eden.events import SoftkeyPressed, EncoderTurned
+    state = default_state()
+    state = reduce(state, PadPressed(pad_index=2, velocity=100))
+    state = reduce(state, SoftkeyPressed(key=1))    # activate CAT ctrl
+    assert state.new_slot_active_ctrl == "CAT"
+    result = reduce(state, EncoderTurned(encoder=9, delta=1))
+    assert result.new_slot_cat_idx == 1             # moved from Kick to Snare
 
 
 def test_session_pad_top_row_adds_to_playing():
@@ -276,13 +299,12 @@ def test_session_pad_top_row_initializes_plays_remaining_when_loop_count_set():
 
 def test_plays_remaining_decrements_on_wrap():
     """plays_remaining decrements when playhead wraps to 0."""
-    # Set up: track 0, loop 0 playing with loop_count=2
     s = dataclasses.replace(
         default_state(),
         selected_track=0,
         playing_loops=frozenset({(0, 0)}),
         plays_remaining=(((0, 0), 2),),
-        playhead=15,
+        playhead=31,
         is_playing=True,
     )
     result = reduce(s, ClockTicked())
@@ -298,7 +320,7 @@ def test_plays_remaining_stops_loop_at_zero():
         selected_track=0,
         playing_loops=frozenset({(0, 0)}),
         plays_remaining=(((0, 0), 1),),
-        playhead=15,
+        playhead=31,
         is_playing=True,
     )
     result = reduce(s, ClockTicked())
@@ -378,15 +400,25 @@ def test_sk4_sets_arm1_stays_in_session():
 
 def test_sk4_replaces_arm1_with_different_track():
     """SK4 on a different track replaces arm1."""
-    state = dataclasses.replace(default_state(), selected_track=2, armed_tracks=(0,))
+    # Use track 1 (snare, not empty) as the new arm1 target.
+    state = dataclasses.replace(default_state(), selected_track=1, armed_tracks=(0,))
     result = reduce(state, SoftkeyPressed(key=3))
-    assert result.armed_tracks == (2,)
+    assert result.armed_tracks == (1,)
     assert result.mode is Mode.SESSION
+
+
+def _state_with_track2() -> AppState:
+    """default_state() with an extra DrumTrack at slot 2 for multi-arm tests."""
+    from eden.state import DrumTrack, default_track_loops
+    s = default_state()
+    t2 = DrumTrack(name="HAT", sample_name="clhat_techno", loops=default_track_loops())
+    new_tracks = s.tracks[:2] + (t2,) + s.tracks[3:]
+    return dataclasses.replace(s, tracks=new_tracks)
 
 
 def test_sk4_replaces_arm1_preserves_arm2():
     """SK4 replacing arm1 keeps arm2 if arm2 differs from the new arm1."""
-    state = dataclasses.replace(default_state(), selected_track=2, armed_tracks=(0, 1))
+    state = dataclasses.replace(_state_with_track2(), selected_track=2, armed_tracks=(0, 1))
     result = reduce(state, SoftkeyPressed(key=3))
     assert result.armed_tracks == (2, 1)
 
@@ -415,7 +447,7 @@ def test_sk5_sets_arm2_stays_in_session():
 
 def test_sk5_replaces_arm2_with_different_track():
     """SK5 on a new track replaces arm2."""
-    state = dataclasses.replace(default_state(), selected_track=2, armed_tracks=(0, 1))
+    state = dataclasses.replace(_state_with_track2(), selected_track=2, armed_tracks=(0, 1))
     result = reduce(state, SoftkeyPressed(key=4))
     assert result.armed_tracks == (0, 2)
 
@@ -704,82 +736,14 @@ def test_dual_arm_track2_all_empty_stays_armed():
     assert after_toggle.mode is Mode.INSTRUMENT
 
 
-# ── Instrument SK2: MEASURES ──────────────────────────────────────────────────
-
-
-def test_instrument_sk2_activates_measures_ctrl():
-    """SK2 toggles instrument_active_ctrl to 'MEASURES'."""
-    state = _armed_instrument(armed=(0,))
-    result = reduce(state, SoftkeyPressed(key=1))
-    assert result.instrument_active_ctrl == "MEASURES"
-    # Pressing again deactivates
-    result2 = reduce(result, SoftkeyPressed(key=1))
-    assert result2.instrument_active_ctrl == ""
-
-
-def test_instrument_measures_jogwheel_adds_measure():
-    """Jogwheel right while MEASURES active adds a 16-step measure."""
-    state = _armed_instrument(armed=(0,))
-    state = dataclasses.replace(state, instrument_active_ctrl="MEASURES")
-    assert state.tracks[0].loops[1].step_count == 16
-    result = reduce(state, EncoderTurned(encoder=9, delta=1))
-    assert result.tracks[0].loops[1].step_count == 32
-
-
-def test_instrument_measures_jogwheel_removes_measure():
-    """Jogwheel left while MEASURES active removes the last measure."""
-    state = _armed_instrument(armed=(0,))
-    state = dataclasses.replace(state, instrument_active_ctrl="MEASURES")
-    # First extend to 32 steps
-    state = reduce(state, EncoderTurned(encoder=9, delta=1))
-    assert state.tracks[0].loops[1].step_count == 32
-    # Then shrink back
-    result = reduce(state, EncoderTurned(encoder=9, delta=-1))
-    assert result.tracks[0].loops[1].step_count == 16
-
-
-def test_instrument_measures_min_is_1():
-    """Measure count cannot go below 1."""
-    state = _armed_instrument(armed=(0,))
-    state = dataclasses.replace(state, instrument_active_ctrl="MEASURES")
-    result = reduce(state, EncoderTurned(encoder=9, delta=-5))
-    assert result.tracks[0].loops[1].step_count == 16  # stays at 1 measure
-
-
-def test_instrument_measures_max_is_8():
-    """Measure count caps at 8 (128 steps)."""
-    state = _armed_instrument(armed=(0,))
-    state = dataclasses.replace(state, instrument_active_ctrl="MEASURES")
-    # Each call adds 1 measure; apply 10 times to confirm we cap at 8
-    for _ in range(10):
-        state = reduce(state, EncoderTurned(encoder=9, delta=1))
-    assert state.tracks[0].loops[1].step_count == 128
-
-
-def test_instrument_measures_applies_to_both_armed_tracks():
-    """MEASURES jogwheel extends both armed tracks simultaneously."""
-    state = _armed_instrument(armed=(0, 1))
-    state = dataclasses.replace(state, instrument_active_ctrl="MEASURES")
-    result = reduce(state, EncoderTurned(encoder=9, delta=1))
-    assert result.tracks[0].loops[1].step_count == 32
-    assert result.tracks[1].loops[1].step_count == 32
-
-
-def test_instrument_sk1_disabled_in_dual_arm():
-    """SK1/STEPS is disabled (no-op) when two tracks are armed."""
-    state = _armed_instrument(armed=(0, 1))
-    result = reduce(state, SoftkeyPressed(key=0))
-    assert result.instrument_active_ctrl == ""
-
-
 def test_instrument_touchbar_sets_view_measure():
     """TouchbarMoved updates instrument_view_measure proportionally."""
     state = _armed_instrument(armed=(0,))
-    # Extend to 4 measures
-    state = dataclasses.replace(state, instrument_active_ctrl="MEASURES")
+    # Extend to 4 bars
+    state = dataclasses.replace(state, instrument_active_ctrl="BARS")
     for _ in range(3):
         state = reduce(state, EncoderTurned(encoder=9, delta=1))
-    assert state.tracks[0].loops[1].step_count == 64  # 4 measures
+    assert state.tracks[0].loops[1].step_count == 64  # 4 bars * 4 beats * 4 = 64
     state = dataclasses.replace(state, instrument_active_ctrl="")
     # TouchbarMoved at 0.75 → should select measure 3 (of 4)
     result = reduce(state, TouchbarMoved(position=0.75))
@@ -789,8 +753,8 @@ def test_instrument_touchbar_sets_view_measure():
 def test_instrument_pad_uses_view_measure():
     """Pad press in INSTRUMENT mode uses instrument_view_measure to offset step index."""
     state = _armed_instrument(armed=(0,))
-    state = dataclasses.replace(state, instrument_active_ctrl="MEASURES")
-    state = reduce(state, EncoderTurned(encoder=9, delta=1))  # extend to 32 steps
+    state = dataclasses.replace(state, instrument_active_ctrl="BARS")
+    state = reduce(state, EncoderTurned(encoder=9, delta=1))  # extend to 2 bars = 32 steps
     state = dataclasses.replace(state, instrument_active_ctrl="", instrument_view_measure=1)
     # Press pad 0 with view_measure=1 → should toggle step 16 (not step 0)
     result = reduce(state, PadPressed(pad_index=0, velocity=100))
@@ -804,9 +768,188 @@ def test_instrument_pad_auto_extends_loop_when_editing_beyond_length():
     # Loop 1 has 16 steps. Set view_measure=1 and press pad 0 → step 16.
     state = dataclasses.replace(state, instrument_view_measure=1)
     result = reduce(state, PadPressed(pad_index=0, velocity=100))
-    # Loop should have been extended to 32 steps
+    # Loop should have been extended to at least 32 steps (2 bars)
     assert result.tracks[0].loops[1].step_count == 32
     assert result.tracks[0].loops[1].steps[16] is True
+
+
+# ── BARS control ─────────────────────────────────────────────────────────────
+
+
+def test_instrument_sk0_activates_bars_ctrl():
+    state = _armed_instrument(armed=(0,))
+    result = reduce(state, SoftkeyPressed(key=0))
+    assert result.instrument_active_ctrl == "BARS"
+    result2 = reduce(result, SoftkeyPressed(key=0))
+    assert result2.instrument_active_ctrl == ""
+
+
+def test_instrument_bars_jogwheel_extends():
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="BARS")
+    assert state.tracks[0].loops[1].bars == 1
+    result = reduce(state, EncoderTurned(encoder=9, delta=1))
+    assert result.tracks[0].loops[1].bars == 2
+    assert result.tracks[0].loops[1].step_count == 32
+
+
+def test_instrument_bars_jogwheel_shrinks():
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="BARS")
+    state = reduce(state, EncoderTurned(encoder=9, delta=1))
+    result = reduce(state, EncoderTurned(encoder=9, delta=-1))
+    assert result.tracks[0].loops[1].bars == 1
+    assert result.tracks[0].loops[1].step_count == 16
+
+
+def test_instrument_bars_min_is_1():
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="BARS")
+    result = reduce(state, EncoderTurned(encoder=9, delta=-1))
+    assert result.tracks[0].loops[1].bars == 1
+
+
+def test_instrument_bars_max_is_8():
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="BARS")
+    for _ in range(10):
+        state = reduce(state, EncoderTurned(encoder=9, delta=1))
+    assert state.tracks[0].loops[1].bars == 8
+    assert state.tracks[0].loops[1].step_count == 128
+
+
+def test_instrument_bars_applies_to_both_armed_tracks():
+    state = _armed_instrument(armed=(0, 1))
+    state = dataclasses.replace(state, instrument_active_ctrl="BARS")
+    result = reduce(state, EncoderTurned(encoder=9, delta=1))
+    assert result.tracks[0].loops[1].bars == 2
+    assert result.tracks[1].loops[1].bars == 2
+
+
+def test_instrument_bars_works_in_dual_arm():
+    """BARS is not disabled in dual-arm mode."""
+    state = _armed_instrument(armed=(0, 1))
+    result = reduce(state, SoftkeyPressed(key=0))
+    assert result.instrument_active_ctrl == "BARS"
+
+
+# ── NUMER control ─────────────────────────────────────────────────────────────
+
+
+def test_instrument_sk1_activates_numer_ctrl():
+    state = _armed_instrument(armed=(0,))
+    result = reduce(state, SoftkeyPressed(key=1))
+    assert result.instrument_active_ctrl == "NUMER"
+    result2 = reduce(result, SoftkeyPressed(key=1))
+    assert result2.instrument_active_ctrl == ""
+
+
+def test_instrument_numer_jogwheel_changes_numerator():
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="NUMER")
+    assert state.tracks[0].loops[1].numerator == 4
+    result = reduce(state, EncoderTurned(encoder=9, delta=1))
+    assert result.tracks[0].loops[1].numerator == 5
+    assert result.tracks[0].loops[1].step_count == 20  # 1*5*(16//4)=20
+
+
+def test_instrument_numer_jogwheel_three_four():
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="NUMER")
+    result = reduce(state, EncoderTurned(encoder=9, delta=-1))
+    assert result.tracks[0].loops[1].numerator == 3
+    assert result.tracks[0].loops[1].step_count == 12  # 1*3*4=12
+
+
+def test_instrument_numer_min_is_1():
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="NUMER")
+    for _ in range(5):
+        state = reduce(state, EncoderTurned(encoder=9, delta=-1))
+    assert state.tracks[0].loops[1].numerator == 1
+
+
+def test_instrument_numer_max_is_16():
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="NUMER")
+    for _ in range(20):
+        state = reduce(state, EncoderTurned(encoder=9, delta=1))
+    assert state.tracks[0].loops[1].numerator == 16
+
+
+# ── SIZE control ──────────────────────────────────────────────────────────────
+
+
+def test_instrument_sk2_activates_size_ctrl():
+    state = _armed_instrument(armed=(0,))
+    result = reduce(state, SoftkeyPressed(key=2))
+    assert result.instrument_active_ctrl == "SIZE"
+    result2 = reduce(result, SoftkeyPressed(key=2))
+    assert result2.instrument_active_ctrl == ""
+
+
+def test_instrument_size_jogwheel_increases_resolution():
+    """step_size 16 → 32 doubles total steps."""
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="SIZE")
+    assert state.tracks[0].loops[1].step_size == 16
+    result = reduce(state, EncoderTurned(encoder=9, delta=1))
+    assert result.tracks[0].loops[1].step_size == 32
+    assert result.tracks[0].loops[1].step_count == 32  # 1*4*8=32
+
+
+def test_instrument_size_jogwheel_decreases_resolution():
+    """step_size 16 → 8 halves total steps."""
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="SIZE")
+    result = reduce(state, EncoderTurned(encoder=9, delta=-1))
+    assert result.tracks[0].loops[1].step_size == 8
+    assert result.tracks[0].loops[1].step_count == 8  # 1*4*2=8
+
+
+def test_instrument_size_min_is_4():
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="SIZE")
+    for _ in range(5):
+        state = reduce(state, EncoderTurned(encoder=9, delta=-1))
+    assert state.tracks[0].loops[1].step_size == 4
+
+
+def test_instrument_size_max_is_32():
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="SIZE")
+    for _ in range(5):
+        state = reduce(state, EncoderTurned(encoder=9, delta=1))
+    assert state.tracks[0].loops[1].step_size == 32
+
+
+# ── Playhead reset on shrink ──────────────────────────────────────────────────
+
+
+def test_bars_shrink_resets_playing_measure_offset():
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="BARS")
+    state = reduce(state, EncoderTurned(encoder=9, delta=1))  # 2 bars
+    key = (0, 1)
+    state = dataclasses.replace(
+        state, playing_loops=frozenset({key}), loop_measure_offsets=((key, 1),)
+    )
+    result = reduce(state, EncoderTurned(encoder=9, delta=-1))  # back to 1 bar
+    assert result.tracks[0].loops[1].bars == 1
+    assert dict(result.loop_measure_offsets).get(key, 0) == 0
+
+
+def test_size_shrink_resets_playing_measure_offset():
+    state = _armed_instrument(armed=(0,))
+    state = dataclasses.replace(state, instrument_active_ctrl="SIZE")
+    state = reduce(state, EncoderTurned(encoder=9, delta=1))  # size=32, step_count=32
+    key = (0, 1)
+    state = dataclasses.replace(
+        state, playing_loops=frozenset({key}), loop_measure_offsets=((key, 1),)
+    )
+    result = reduce(state, EncoderTurned(encoder=9, delta=-1))  # back to size=16, step_count=16
+    assert result.tracks[0].loops[1].step_count == 16
+    assert dict(result.loop_measure_offsets).get(key, 0) == 0
 
 
 # ── Garbage collection of empty tracks ───────────────────────────────────────
@@ -815,8 +958,9 @@ def test_instrument_pad_auto_extends_loop_when_editing_beyond_length():
 def test_session_pad_switch_gcs_empty_track():
     """Pressing a different bottom pad nulls out the previous selected track if all its loops are empty."""
     s = default_state()
-    # Track 2 is None; press pad 2 to create it (all-empty DrumTrack).
+    # Select empty slot 2, then CREATE the track via SK5.
     s = reduce(s, PadPressed(pad_index=2, velocity=100))
+    s = reduce(s, SoftkeyPressed(key=4))  # SK5 = CREATE
     assert s.tracks[2] is not None
     assert s.selected_track == 2
     # Now press pad 0 — track 2 has no steps, so it should be GC'd back to None.
@@ -841,7 +985,8 @@ def test_session_pad_same_pad_no_gc():
 def test_session_pad_switch_gcs_muted_empty_track():
     """GC of an empty track also removes it from muted_tracks."""
     s = default_state()
-    s = reduce(s, PadPressed(pad_index=2, velocity=100))  # create empty track 2
+    s = reduce(s, PadPressed(pad_index=2, velocity=100))  # select empty slot 2
+    s = reduce(s, SoftkeyPressed(key=4))                  # SK5 = CREATE
     s = dataclasses.replace(s, muted_tracks=frozenset({2}))
     s = reduce(s, PadPressed(pad_index=0, velocity=100))  # switch away → GC track 2
     assert s.tracks[2] is None
@@ -851,7 +996,7 @@ def test_session_pad_switch_gcs_muted_empty_track():
 def test_instrument_back_gcs_empty_armed_track():
     """BACK from INSTRUMENT nulls the armed slot when no steps were added."""
     s = default_state()
-    # Create an empty track at slot 2 and enter INSTRUMENT on it.
+    # Select empty slot 2 and enter INSTRUMENT — track is created automatically.
     s = reduce(s, PadPressed(pad_index=2, velocity=100))
     s = reduce(s, ModeButtonPressed(button="INST", pressed=True))
     assert s.mode is Mode.INSTRUMENT
@@ -880,17 +1025,54 @@ def test_song_button_from_instrument_gcs_empty_armed_track():
     assert s.tracks[2] is None
 
 
+def test_inst_from_empty_slot_creates_track_immediately():
+    """Pressing INST on an empty slot creates the track without needing SK5."""
+    s = default_state()
+    s = reduce(s, PadPressed(pad_index=2, velocity=100))
+    s = reduce(s, ModeButtonPressed(button="INST", pressed=True))
+    assert s.mode is Mode.INSTRUMENT
+    assert s.tracks[2] is not None
+    assert s.armed_tracks == (2,)
+
+
+def test_inst_from_empty_slot_saves_and_restores_armed_tracks():
+    """Armed tracks before entering INST from empty slot are restored on BACK."""
+    s = dataclasses.replace(default_state(), armed_tracks=(0, 1))
+    s = reduce(s, PadPressed(pad_index=2, velocity=100))
+    s = reduce(s, ModeButtonPressed(button="INST", pressed=True))
+    assert s.armed_tracks == (2,)
+    assert s.saved_armed_tracks == (0, 1)
+    # BACK → previous arm state restored
+    s = reduce(s, SoftkeyPressed(key=3))
+    assert s.mode is Mode.SESSION
+    assert s.armed_tracks == (0, 1)
+    assert s.saved_armed_tracks is None
+
+
+def test_inst_from_empty_slot_song_restores_armed_tracks():
+    """SONG button also restores saved arm state when returning to SESSION."""
+    s = dataclasses.replace(default_state(), armed_tracks=(0,))
+    s = reduce(s, PadPressed(pad_index=2, velocity=100))
+    s = reduce(s, ModeButtonPressed(button="INST", pressed=True))
+    # Add a step so track 2 is not GC'd
+    s = reduce(s, PadPressed(pad_index=0, velocity=100))
+    s = reduce(s, ModeButtonPressed(button="SONG", pressed=True))
+    assert s.mode is Mode.SESSION
+    assert s.armed_tracks == (0,)
+    assert s.saved_armed_tracks is None
+
+
 # ── Immutability ──────────────────────────────────────────────────────────────
 
 
 def test_reduce_does_not_mutate_input_state():
     """reduce() never mutates the input state object after a step toggle."""
     state = _armed_instrument(armed=(0,))
-    # Capture original steps tuple for track 0 loop 1 (the selected empty loop)
     original_steps = state.tracks[0].loops[1].steps
 
     _ = reduce(state, PadPressed(pad_index=0, velocity=100))
 
-    # Input state must be entirely unchanged
     assert state.tracks[0].loops[1].steps == original_steps
     assert state.tracks[0].loops[1].steps[0] is False
+
+

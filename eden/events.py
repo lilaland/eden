@@ -56,3 +56,9 @@ class SoftkeyPressed(Event):
 @dataclass(frozen=True)
 class TouchbarMoved(Event):
     position: float  # 0.0 = left end, 1.0 = right end (pitchwheel -8192 → +8191)
+
+
+@dataclass(frozen=True)
+class ArrowPressed(Event):
+    direction: str   # "LEFT" | "RIGHT"
+    pressed: bool
