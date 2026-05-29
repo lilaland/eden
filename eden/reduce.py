@@ -36,8 +36,13 @@ from eden.events import (
     TapTempoPressed,
     TouchbarMoved,
     TransportPressed,
+    InstrumentUndo,
+    InstrumentReset,
 )
-from eden.scales import SCALE_NAMES, degree_to_pitch, pitch_to_degree
+from eden.scales import (
+    SCALES, SCALE_NAMES, degree_to_pitch, pitch_to_degree,
+    white_idx_to_midi, black_key_at,
+)
 
 
 
@@ -206,6 +211,7 @@ def _on_session_loaded(state: AppState, event: SessionLoaded) -> AppState:
         instrument_active_ctrl="",
         new_slot_active_ctrl="",
         saved_armed_tracks=None,
+        pitch_window_offset=_free_piano_init_offset(event.tracks),
     )
     if event.immediate or not state.playing_loops:
         return dataclasses.replace(
@@ -442,20 +448,34 @@ def _new_slot_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
     return state
 
 
+def _free_piano_init_offset(tracks: tuple) -> int:
+    """Return the pitch_window_offset that puts the root's octave-C as leftmost key
+    for the first FREE SynthTrack found, or 0 if none."""
+    for track in tracks:
+        if isinstance(track, SynthTrack) and not track.quantized:
+            return (track.root_note // 12) * 7
+    return 0
+
+
 def _create_new_slot_track(state: AppState) -> AppState:
     """Create a track at the selected empty slot using the current picker values."""
     pad = state.selected_track
     type_idx = state.new_slot_type_idx
     name, param = catalog.get_track_params(type_idx, state.new_slot_cat_idx, state.new_slot_var_idx)
     if type_idx == 1:  # KEYS → SynthTrack
-        new_track = SynthTrack(name=name, loops=default_track_loops(), osc_type=param)
+        quantized = (state.new_slot_var_idx == 0)  # 0=QUANT, 1=FREE
+        new_track = SynthTrack(name=name, loops=default_track_loops(), osc_type=param,
+                               quantized=quantized)
+        init_offset = _free_piano_init_offset((new_track,))
     else:  # DRUMS → DrumTrack
         new_track = DrumTrack(name=name, sample_name=param, loops=default_track_loops())
+        init_offset = state.pitch_window_offset  # drums don't use pitch_window_offset
     new_tracks = state.tracks[:pad] + (new_track,) + state.tracks[pad + 1:]
     return dataclasses.replace(
         state,
         tracks=new_tracks,
         new_slot_active_ctrl="",
+        pitch_window_offset=init_offset,
     )
 
 
@@ -579,9 +599,59 @@ def _new_slot_encoder(state: AppState, event: EncoderTurned) -> AppState:
 # ── Instrument mode ───────────────────────────────────────────────────────────
 
 
+def _instrument_undo(state: AppState) -> AppState:
+    """Restore tracks+cursor from the last recording snapshot."""
+    if state.undo_snapshot is None:
+        return state
+    return dataclasses.replace(state, tracks=state.undo_snapshot,
+                               step_cursor=state.undo_cursor,
+                               undo_snapshot=None)
+
+
+def _instrument_reset(state: AppState) -> AppState:
+    """Reset selected loop across all armed tracks to an empty 1-bar default."""
+    loop_idx = state.selected_loop
+    new_state = state
+    for track_idx in state.armed_tracks:
+        track = new_state.tracks[track_idx]
+        if track is None:
+            continue
+        new_loop = default_loop()
+        new_loops = (track.loops[:loop_idx] + (new_loop,)
+                     + track.loops[loop_idx + 1:])
+        new_track = dataclasses.replace(track, loops=new_loops)
+        new_tracks = (new_state.tracks[:track_idx] + (new_track,)
+                      + new_state.tracks[track_idx + 1:])
+        new_state = dataclasses.replace(new_state, tracks=new_tracks)
+    # Remove loop from playback since it's now empty
+    new_playing = frozenset(
+        k for k in new_state.playing_loops
+        if k[0] not in new_state.armed_tracks or k[1] != loop_idx
+    )
+    new_active = frozenset(
+        k for k in new_state.active_loops
+        if k[0] not in new_state.armed_tracks or k[1] != loop_idx
+    )
+    return dataclasses.replace(new_state, step_cursor=0,
+                               playing_loops=new_playing,
+                               active_loops=new_active,
+                               undo_snapshot=None)
+
+
 def _reduce_instrument(state: AppState, event: Event) -> AppState:
+    if isinstance(event, InstrumentUndo):
+        return _instrument_undo(state)
+    if isinstance(event, InstrumentReset):
+        return _instrument_reset(state)
     if isinstance(event, PadPressed):
         return _instrument_pad_pressed(state, event)
+    if isinstance(event, PadReleased):
+        # Only FREE piano mode cares about pad release (hold-based duration)
+        if state.armed_tracks:
+            track = state.tracks[state.armed_tracks[0]]
+            if isinstance(track, SynthTrack) and not track.quantized:
+                return _piano_pad_released(state, event, state.armed_tracks[0])
+        return state
     if isinstance(event, TransportPressed):
         return _instrument_transport(state, event)
     if isinstance(event, SoftkeyPressed):
@@ -761,6 +831,12 @@ def _ensure_loop_length(state: AppState, track_idx: int, loop_idx: int, min_step
     return dataclasses.replace(state, tracks=new_tracks)
 
 
+def _save_undo(state: AppState) -> AppState:
+    """Snapshot current tracks + cursor for single-level undo."""
+    return dataclasses.replace(state, undo_snapshot=state.tracks,
+                               undo_cursor=state.step_cursor)
+
+
 def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
     pad = event.pad_index
     loop_idx = state.selected_loop
@@ -772,6 +848,8 @@ def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
 
         # SynthTrack gets its own dual-row pad logic in both submodes.
         if isinstance(track, SynthTrack):
+            if not track.quantized:
+                return _piano_pad_pressed(state, event, affected_track)
             if state.instrument_submode == InstrumentSubmode.STEPS:
                 return _synth_steps_pad_pressed(state, event, affected_track)
             if state.instrument_submode == InstrumentSubmode.PADS:
@@ -828,7 +906,7 @@ def _auto_start_and_gc(state: AppState, affected_track: int, loop_idx: int) -> A
 
 def _set_step_pitch(
     state: AppState, track_idx: int, loop_idx: int, step_idx: int,
-    pitch: int, velocity: int,
+    pitch: int, velocity: int, gate: float | None = None,
 ) -> AppState:
     """Set pitch on a step (turning it on). Returns new state."""
     track = state.tracks[track_idx]
@@ -839,8 +917,10 @@ def _set_step_pitch(
         return state
     old = loop.steps[step_idx]
     eff_vel = velocity if state.vel_sensitive else 100
-    new_step = dataclasses.replace(old, on=True, pitch=pitch,
-                                   velocity=max(1, min(127, eff_vel)))
+    kw: dict = {"on": True, "pitch": pitch, "velocity": max(1, min(127, eff_vel))}
+    if gate is not None:
+        kw["gate"] = gate
+    new_step = dataclasses.replace(old, **kw)
     new_steps = loop.steps[:step_idx] + (new_step,) + loop.steps[step_idx + 1:]
     new_loop = dataclasses.replace(loop, steps=new_steps)
     new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
@@ -868,6 +948,7 @@ def _synth_steps_pad_pressed(
     Top row (pad 16-31): select step as cursor + toggle on/off.
     Bottom row (pad 0-15): set pitch for cursor step, turn on, advance cursor.
     """
+    state = _save_undo(state)
     pad = event.pad_index
     loop_idx = state.selected_loop
     view_m = state.instrument_view_measure
@@ -885,6 +966,7 @@ def _synth_steps_pad_pressed(
         # Bottom row: pitch entry for current cursor step
         degree = state.pitch_window_offset + pad
         pitch = degree_to_pitch(track.root_note, track.scale, degree)
+        pitch = max(0, min(127, pitch + state.octave_offset * 12))
         step_idx = state.step_cursor
         state = _ensure_loop_length(state, track_idx, loop_idx, step_idx + 1)
         new_state = _set_step_pitch(state, track_idx, loop_idx, step_idx,
@@ -905,6 +987,7 @@ def _synth_pads_pad_pressed(
       pad 16-31 → degrees pitch_window_offset+16 … +31
     Each press records the pitch at the current step cursor and advances it.
     """
+    state = _save_undo(state)
     loop_idx = state.selected_loop
     track = state.tracks[track_idx]
     if track is None:
@@ -912,12 +995,83 @@ def _synth_pads_pad_pressed(
 
     degree = state.pitch_window_offset + event.pad_index
     pitch = degree_to_pitch(track.root_note, track.scale, degree)
+    pitch = max(0, min(127, pitch + state.octave_offset * 12))
     step_idx = state.step_cursor
     state = _ensure_loop_length(state, track_idx, loop_idx, step_idx + 1)
     new_state = _set_step_pitch(state, track_idx, loop_idx, step_idx,
                                 pitch, event.velocity)
     new_state = _advance_step_cursor(new_state, track_idx, loop_idx)
     return _auto_start_and_gc(new_state, track_idx, loop_idx)
+
+
+def _piano_pad_pressed(
+    state: AppState, event: PadPressed, track_idx: int,
+) -> AppState:
+    """
+    SynthTrack FREE (piano keyboard) mode handler.
+
+    Row 0 (pad 0-15): white keys — C D E F G A B repeating
+    Row 1 (pad 16-31): black keys — C# D# (dead) F# G# A# (dead) repeating
+    Dead positions (E#/B#) produce no note.
+    """
+    state = _save_undo(state)
+    loop_idx = state.selected_loop
+    track = state.tracks[track_idx]
+    if track is None:
+        return state
+
+    pad = event.pad_index
+    offset = state.pitch_window_offset
+    if pad < 16:
+        pitch = white_idx_to_midi(offset + pad)
+    else:
+        pitch = black_key_at(offset + (pad - 16))
+        if pitch is None:
+            return state  # dead key (E# / B# position)
+
+    pitch = max(0, min(127, pitch + state.octave_offset * 12))
+    step_idx = state.step_cursor
+    state = _ensure_loop_length(state, track_idx, loop_idx, step_idx + 1)
+    # Write note with placeholder gate=1.0; duration is committed on pad release
+    new_state = _set_step_pitch(state, track_idx, loop_idx, step_idx,
+                                pitch, event.velocity, gate=1.0)
+    # Cursor does NOT advance here — it advances when the pad is released
+    return _auto_start_and_gc(new_state, track_idx, loop_idx)
+
+
+def _piano_pad_released(
+    state: AppState, event: PadReleased, track_idx: int,
+) -> AppState:
+    """
+    Commit note duration on pad release: update gate from hold time, advance cursor.
+    """
+    loop_idx = state.selected_loop
+    track = state.tracks[track_idx]
+    if track is None:
+        return state
+    loop = track.loops[loop_idx]
+    step_size = loop.step_size
+    step_dur_secs = 60.0 / max(1.0, state.tempo_bpm) / (step_size / 4.0)
+    gate = max(0.1, event.hold_seconds / step_dur_secs)
+
+    step_idx = state.step_cursor
+    if step_idx < loop.step_count:
+        old_step = loop.steps[step_idx]
+        if old_step.on:
+            new_step = dataclasses.replace(old_step, gate=gate)
+            new_steps = loop.steps[:step_idx] + (new_step,) + loop.steps[step_idx + 1:]
+            new_loop = dataclasses.replace(loop, steps=new_steps)
+            new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+            new_track = dataclasses.replace(track, loops=new_loops)
+            new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+            state = dataclasses.replace(state, tracks=new_tracks)
+
+    advance = max(1, round(gate))
+    next_cursor = step_idx + advance
+    state = _ensure_loop_length(state, track_idx, loop_idx, next_cursor + 1)
+    step_count = state.tracks[track_idx].loops[loop_idx].step_count
+    next_cursor = next_cursor % max(1, step_count)
+    return dataclasses.replace(state, step_cursor=next_cursor)
 
 
 def _toggle_step(
@@ -962,35 +1116,45 @@ def _is_synth_armed(state: AppState) -> bool:
 
 
 def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
-    synth = _is_synth_armed(state)
-    shift = state.shift_held
-    if event.key == 0:  # SK1: OSC (normal) | SCALE (shift) | BARS (drum)
-        if synth:
-            ctrl = "SCALE" if shift else "OSC"
-        else:
-            ctrl = "BARS"
-        new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
-        return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-    if event.key == 1:  # SK2: CUTOFF (normal) | ROOT (shift) | NUMER (drum)
-        if synth:
-            ctrl = "ROOT" if shift else "CUTOFF"
-        else:
-            ctrl = "NUMER"
-        new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
-        return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-    if event.key == 2:  # SK3: RESO | SIZE
-        ctrl = "RESO" if synth else "SIZE"
-        new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
-        return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-    if event.key == 3:  # SK4: BACK — GC empty armed tracks, return to SESSION
+    first_track = state.tracks[state.armed_tracks[0]] if state.armed_tracks else None
+    synth = isinstance(first_track, SynthTrack)
+    if event.key == 3:  # SK4: BACK — universal
         state = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
         armed = state.saved_armed_tracks if state.saved_armed_tracks is not None else state.armed_tracks
         return dataclasses.replace(state, mode=Mode.SESSION, instrument_active_ctrl="",
                                    armed_tracks=armed, saved_armed_tracks=None)
-    if event.key == 4:  # SK5: MONO/VEL toggle (normal) | CLEAR (shift)
-        if state.shift_held:
-            return _clear_armed_loops(state)
-        return dataclasses.replace(state, vel_sensitive=not state.vel_sensitive)
+    if synth:
+        if event.key == 0:  # SK1: SCALE (normal) | OSC (shift)
+            ctrl = "OSC" if state.shift_held else "SCALE"
+            new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
+            return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+        if event.key == 1:  # SK2: ROOT (normal) | CUTOFF (shift)
+            ctrl = "CUTOFF" if state.shift_held else "ROOT"
+            new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
+            return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+        if event.key == 2:  # SK3: RANGE (normal) | LEN/BARS (shift)
+            ctrl = "BARS" if state.shift_held else "RANGE"
+            new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
+            return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+        if event.key == 4:  # SK5: OCTAVE (normal) | vel_sensitive toggle (shift)
+            if state.shift_held:
+                return dataclasses.replace(state, vel_sensitive=not state.vel_sensitive)
+            new_ctrl = "" if state.instrument_active_ctrl == "OCTAVE" else "OCTAVE"
+            return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+    else:
+        if event.key == 0:
+            new_ctrl = "" if state.instrument_active_ctrl == "BARS" else "BARS"
+            return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+        if event.key == 1:
+            new_ctrl = "" if state.instrument_active_ctrl == "NUMER" else "NUMER"
+            return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+        if event.key == 2:
+            new_ctrl = "" if state.instrument_active_ctrl == "SIZE" else "SIZE"
+            return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+        if event.key == 4:  # SK5: MONO/VEL toggle (normal) | CLEAR (shift)
+            if state.shift_held:
+                return _clear_armed_loops(state)
+            return dataclasses.replace(state, vel_sensitive=not state.vel_sensitive)
     return state
 
 
@@ -1076,9 +1240,23 @@ def _adjust_synth_root(state: AppState, delta: int) -> AppState:
 
 
 def _shift_pitch_window(state: AppState, button: str) -> AppState:
-    """Shift the pitch window by 8 scale degrees (+/-). Clamped to ±96."""
-    delta = 8 if button == "+" else -8
-    new_offset = max(-24, min(96, state.pitch_window_offset + delta))
+    """Shift the pitch window.
+
+    FREE piano: +/- slides the 16-column window one white key at a time.
+    + slides right (lower index), - slides left (higher index).
+    QUANT: jumps one scale-octave. Drums: 8 degrees.
+    """
+    track = state.tracks[state.armed_tracks[0]] if state.armed_tracks else None
+    if isinstance(track, SynthTrack) and not track.quantized:
+        d = 1 if button == "+" else -1
+        new_offset = max(0, min(59, state.pitch_window_offset + d))
+        return dataclasses.replace(state, pitch_window_offset=new_offset)
+    if isinstance(track, SynthTrack):
+        scale_len = len(SCALES.get(track.scale, SCALES["chromatic"]))
+    else:
+        scale_len = 8
+    delta = scale_len if button == "+" else -scale_len
+    new_offset = max(-48, min(108, state.pitch_window_offset + delta))
     return dataclasses.replace(state, pitch_window_offset=new_offset)
 
 
@@ -1086,6 +1264,20 @@ def _instrument_encoder(state: AppState, event: EncoderTurned) -> AppState:
     if event.encoder != 9:
         return state
     ctrl = state.instrument_active_ctrl
+    if ctrl == "RANGE":
+        # QUANT: 1 scale degree; FREE piano: 1 white key column
+        # FREE encoder: CW (delta>0) scrolls window right (lower notes into view)
+        d = 1 if event.delta > 0 else -1
+        track = state.tracks[state.armed_tracks[0]] if state.armed_tracks else None
+        if isinstance(track, SynthTrack) and not track.quantized:
+            new_offset = max(0, min(59, state.pitch_window_offset - d))
+        else:
+            new_offset = max(-48, min(108, state.pitch_window_offset + d))
+        return dataclasses.replace(state, pitch_window_offset=new_offset)
+    if ctrl == "OCTAVE":
+        d = 1 if event.delta > 0 else -1
+        new_oct = max(-4, min(4, state.octave_offset + d))
+        return dataclasses.replace(state, octave_offset=new_oct)
     if ctrl == "BARS":
         return _adjust_bars(state, event.delta)
     if ctrl == "NUMER":

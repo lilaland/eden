@@ -81,6 +81,7 @@ class SynthTrack:
     max_voices: int = 8
     root_note: int = 60            # MIDI root pitch (default C4)
     scale: str = "chromatic"       # key in scales.SCALES
+    quantized: bool = True         # True = scale-degree step editor; False = piano keyboard
 
 
 @dataclass(frozen=True)
@@ -135,7 +136,11 @@ class AppState:
     session_selected_row: int = 0    # 0 = track row (pads 0-15), 1 = loop row (pads 16-31)
     # Synth step/keyboard editor state (ephemeral, not persisted)
     step_cursor: int = 0            # absolute step index of the highlighted step
-    pitch_window_offset: int = 0    # first scale degree shown in the pitch row
+    pitch_window_offset: int = 0    # scale-degree offset (quantized) or semitone offset (free)
+    octave_offset: int = 0          # additional ±N octave transpose (applied on top of window)
+    # Single-level undo for INSTRUMENT mode recording actions
+    undo_snapshot: Optional[tuple] = None  # tracks tuple before last edit
+    undo_cursor: int = 0                   # step_cursor at time of snapshot
     # Session management (M2)
     active_session_slot: int = 0            # 0-7 → A-H, which slot is currently loaded
     active_loops: frozenset[tuple[int, int]] = frozenset()  # loops that auto-start on session load

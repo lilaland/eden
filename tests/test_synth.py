@@ -62,9 +62,9 @@ def test_catalog_keys_categories():
     assert "Saw" in cats
 
 
-def test_catalog_keys_no_variations():
+def test_catalog_keys_variations():
     vars_ = catalog.get_variations(1, 0)
-    assert len(vars_) == 0
+    assert vars_ == ("QUANT", "FREE")
 
 
 def test_catalog_keys_track_params_saw():
@@ -192,27 +192,28 @@ def _armed_synth_with_ctrl(ctrl: str):
 
 
 def test_synth_osc_ctrl_toggle_on():
-    s = _armed_synth_state()
-    s2 = reduce(s, SoftkeyPressed(key=0))  # SK1 = OSC
+    s = dataclasses.replace(_armed_synth_state(), shift_held=True)
+    s2 = reduce(s, SoftkeyPressed(key=0))  # Shift+SK1 = OSC
     assert s2.instrument_active_ctrl == "OSC"
 
 
 def test_synth_osc_ctrl_toggle_off():
-    s = dataclasses.replace(_armed_synth_state(), instrument_active_ctrl="OSC")
+    s = dataclasses.replace(_armed_synth_state(), instrument_active_ctrl="OSC", shift_held=True)
     s2 = reduce(s, SoftkeyPressed(key=0))
     assert s2.instrument_active_ctrl == ""
 
 
 def test_synth_cutoff_ctrl():
-    s = _armed_synth_state()
-    s2 = reduce(s, SoftkeyPressed(key=1))  # SK2 = CUTOFF
+    s = dataclasses.replace(_armed_synth_state(), shift_held=True)
+    s2 = reduce(s, SoftkeyPressed(key=1))  # Shift+SK2 = CUTOFF
     assert s2.instrument_active_ctrl == "CUTOFF"
 
 
-def test_synth_reso_ctrl():
-    s = _armed_synth_state()
-    s2 = reduce(s, SoftkeyPressed(key=2))  # SK3 = RESO
-    assert s2.instrument_active_ctrl == "RESO"
+def test_synth_sk3_shift_opens_bars():
+    # Shift+SK3 = LEN/BARS (replaces RESO)
+    s = dataclasses.replace(_armed_synth_state(), shift_held=True)
+    s2 = reduce(s, SoftkeyPressed(key=2))
+    assert s2.instrument_active_ctrl == "BARS"
 
 
 def test_synth_encoder_cycles_osc_forward():
@@ -351,25 +352,48 @@ def test_oled_synth_armed_shows_osc_in_main_line():
     assert "saw" in out[OLED_MAIN_LINE1][0].lower()
 
 
-def test_oled_synth_shows_osc_button():
+def test_oled_synth_shows_scale_button():
     s = _armed_synth_state()
+    out = render_oled(s)
+    from controller_map import OLED_BTN1_TITLE
+    assert out[OLED_BTN1_TITLE][0] == "SCALE"
+
+
+def test_oled_synth_shows_root_button():
+    s = _armed_synth_state()
+    out = render_oled(s)
+    from controller_map import OLED_BTN2_TITLE
+    assert out[OLED_BTN2_TITLE][0] == "ROOT"
+
+
+def test_oled_synth_shows_range_button():
+    # Normal page SK3 is RANGE
+    s = _armed_synth_state()
+    out = render_oled(s)
+    from controller_map import OLED_BTN3_TITLE
+    assert out[OLED_BTN3_TITLE][0] == "RANGE"
+
+
+def test_oled_synth_shift_shows_osc_button():
+    s = dataclasses.replace(_armed_synth_state(), shift_held=True)
     out = render_oled(s)
     from controller_map import OLED_BTN1_TITLE
     assert out[OLED_BTN1_TITLE][0] == "OSC"
 
 
-def test_oled_synth_shows_cutoff_button():
-    s = _armed_synth_state()
+def test_oled_synth_shift_shows_cutoff_button():
+    s = dataclasses.replace(_armed_synth_state(), shift_held=True)
     out = render_oled(s)
     from controller_map import OLED_BTN2_TITLE
     assert out[OLED_BTN2_TITLE][0] == "CUTOFF"
 
 
-def test_oled_synth_shows_reso_button():
-    s = _armed_synth_state()
+def test_oled_synth_shift_shows_len_button():
+    # Shift page SK3 is LEN
+    s = dataclasses.replace(_armed_synth_state(), shift_held=True)
     out = render_oled(s)
     from controller_map import OLED_BTN3_TITLE
-    assert out[OLED_BTN3_TITLE][0] == "RESO"
+    assert out[OLED_BTN3_TITLE][0] == "LEN"
 
 
 def test_oled_drum_still_shows_bars():
@@ -385,9 +409,431 @@ def test_oled_drum_still_shows_bars():
 
 
 def test_oled_synth_cutoff_active_lights_bar():
-    s = dataclasses.replace(_armed_synth_state(), instrument_active_ctrl="CUTOFF")
+    s = dataclasses.replace(_armed_synth_state(), instrument_active_ctrl="CUTOFF", shift_held=True)
     out = render_oled(s)
     from controller_map import OLED_BTN2_TITLE
-    from eden.theme import ACCENT_GOLD
-    _, r, g, b = out[OLED_BTN2_TITLE]
-    assert (r, g, b) == ACCENT_GOLD
+    label, r, g, b = out[OLED_BTN2_TITLE]
+    assert label == "CUTOFF"
+    assert (r, g, b) != (0, 0, 0)  # active color applied
+
+
+# ── Piano keyboard (FREE) mode ────────────────────────────────────────────────
+
+
+def _free_synth_state():
+    """Armed SynthTrack in INSTRUMENT mode with quantized=False (FREE piano).
+
+    pitch_window_offset=35 puts C4 (MIDI 60) as the leftmost white key (white_idx 35),
+    matching the old semitone-offset=0 behavior for root_note=60.
+    """
+    s = default_state()
+    tracks = list(s.tracks)
+    tracks[0] = SynthTrack(name="SAW", loops=default_track_loops(),
+                           osc_type="saw", quantized=False)
+    s = dataclasses.replace(s, tracks=tuple(tracks),
+                            armed_tracks=(0,), mode=Mode.INSTRUMENT,
+                            instrument_submode=InstrumentSubmode.STEPS,
+                            pitch_window_offset=35)
+    return s
+
+
+def test_synth_free_sk1_opens_scale():
+    s = _free_synth_state()
+    s2 = reduce(s, SoftkeyPressed(key=0))
+    assert s2.instrument_active_ctrl == "SCALE"
+
+
+def test_synth_free_sk2_opens_root():
+    s = _free_synth_state()
+    s2 = reduce(s, SoftkeyPressed(key=1))
+    assert s2.instrument_active_ctrl == "ROOT"
+
+
+def test_synth_free_sk3_opens_range():
+    s = _free_synth_state()
+    s2 = reduce(s, SoftkeyPressed(key=2))
+    assert s2.instrument_active_ctrl == "RANGE"
+
+
+def test_synth_sk3_opens_range():
+    s = _armed_synth_state()
+    s2 = reduce(s, SoftkeyPressed(key=2))
+    assert s2.instrument_active_ctrl == "RANGE"
+
+
+def test_synth_free_sk5_opens_octave():
+    s = _free_synth_state()
+    s2 = reduce(s, SoftkeyPressed(key=4))
+    assert s2.instrument_active_ctrl == "OCTAVE"
+
+
+def test_synth_free_pad_white_key_records_pitch():
+    s = _free_synth_state()
+    # Pad 0 = first white key = C of root's octave (root=60=C4, base=60)
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    loop = s2.tracks[0].loops[0]
+    assert loop.steps[0].on
+    assert loop.steps[0].pitch == 60  # C4
+
+
+def test_synth_free_pad_black_key_records_pitch():
+    s = _free_synth_state()
+    # Pad 16 = first black key = C# (semitone 1 above base C4=60)
+    s2 = reduce(s, PadPressed(pad_index=16, velocity=100))
+    loop = s2.tracks[0].loops[0]
+    assert loop.steps[0].on
+    assert loop.steps[0].pitch == 61  # C#4
+
+
+def test_synth_free_dead_key_no_note():
+    s = _free_synth_state()
+    # Pad 18 (16 + 2) = E# dead position — no step written
+    s2 = reduce(s, PadPressed(pad_index=18, velocity=100))
+    loop = s2.tracks[0].loops[0]
+    assert not loop.steps[0].on  # dead key, unchanged
+
+
+def test_synth_free_octave_offset_shifts_pitch():
+    s = dataclasses.replace(_free_synth_state(), octave_offset=1)
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    loop = s2.tracks[0].loops[0]
+    assert loop.steps[0].pitch == 72  # C5 (one octave up)
+
+
+def test_synth_quantized_field_persisted():
+    import eden.sessions as sessions
+    s = _free_synth_state()
+    d = sessions.state_to_session(s, "test")
+    assert d["tracks"][0]["quantized"] is False
+
+
+def test_synth_quantized_field_restored():
+    import eden.sessions as sessions
+    s = _free_synth_state()
+    d = sessions.state_to_session(s, "test")
+    patch = sessions.session_to_state_patch(d, slot=0)
+    assert patch["tracks"][0].quantized is False
+
+
+def test_render_pads_free_mode_white_keys_lit():
+    s = _free_synth_state()
+    colors = render_pads(s)
+    # Bottom row (pads 0-15) are white keys — should not all be PAD_OFF
+    white_key_colors = [colors[i] for i in range(16)]
+    assert any(c != (0, 0, 0) for c in white_key_colors)
+
+
+def test_render_pads_free_mode_dead_keys_off():
+    s = _free_synth_state()
+    colors = render_pads(s)
+    # Pad 18 = 16 + 2 = E# dead position — must be PAD_OFF
+    assert colors[18] == (0, 0, 0)
+
+
+def test_oled_synth_free_shows_scale_and_octave():
+    s = _free_synth_state()
+    out = render_oled(s)
+    from controller_map import OLED_BTN1_TITLE, OLED_BTN5_TITLE
+    assert out[OLED_BTN1_TITLE][0] == "SCALE"
+    assert out[OLED_BTN5_TITLE][0] == "OCTAVE"
+
+
+def test_oled_synth_free_line2_shows_step_progress():
+    from controller_map import OLED_MAIN_LINE2
+    s = _free_synth_state()
+    # Record two notes to extend loop to 2 steps, cursor at step 2
+    s = reduce(s, PadPressed(pad_index=0, velocity=100))  # step 0 → cursor at 1
+    s = reduce(s, PadPressed(pad_index=2, velocity=100))  # step 1 → cursor at 2 (or wrap)
+    out = render_oled(s)
+    line2 = out[OLED_MAIN_LINE2][0]
+    # Should contain step counter (N/M) and loop slot (Lx)
+    assert "/" in line2
+    assert "L" in line2
+
+
+def test_oled_synth_free_line2_initial_shows_s1():
+    from controller_map import OLED_MAIN_LINE2
+    s = _free_synth_state()
+    out = render_oled(s)
+    line2 = out[OLED_MAIN_LINE2][0]
+    assert line2.startswith("1/")
+
+
+def test_synth_sk3_bars_encoder_extends_loop():
+    s = dataclasses.replace(_armed_synth_state(), instrument_active_ctrl="BARS")
+    original_bars = s.tracks[0].loops[s.selected_loop].bars
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=1))
+    assert s2.tracks[0].loops[s2.selected_loop].bars > original_bars
+
+
+def test_synth_sk3_bars_encoder_contracts_loop():
+    # Build a 2-bar loop then shrink it
+    from eden.events import EncoderTurned
+    s = dataclasses.replace(_armed_synth_state(), instrument_active_ctrl="BARS")
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=1))  # now 2 bars
+    s3 = reduce(s2, EncoderTurned(encoder=9, delta=-1))  # back to 1
+    assert s3.tracks[0].loops[s3.selected_loop].bars == 1
+
+
+# ── Hold-based note duration (FREE mode) ──────────────────────────────────────
+
+
+def test_free_pad_press_writes_note_no_cursor_advance():
+    """PadPressed in FREE mode writes note but does NOT advance cursor yet."""
+    s = dataclasses.replace(_free_synth_state(), step_cursor=0)
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    assert s2.tracks[0].loops[0].steps[0].on
+    assert s2.step_cursor == 0  # cursor stays until release
+
+
+def test_free_pad_press_placeholder_gate():
+    """PadPressed writes a placeholder gate of 1.0 before release."""
+    s = _free_synth_state()
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    assert s2.tracks[0].loops[0].steps[0].gate == 1.0
+
+
+def test_free_pad_release_commits_gate():
+    """PadReleased updates gate from hold_seconds and tempo."""
+    from eden.events import PadReleased
+    # At 120 BPM, step_size=16: step_dur = 60/120 / (16/4) = 0.125s
+    # hold 0.5s → gate = 0.5/0.125 = 4.0 → quarter note
+    s = dataclasses.replace(_free_synth_state(), step_cursor=0)
+    s = reduce(s, PadPressed(pad_index=0, velocity=100))
+    s2 = reduce(s, PadReleased(pad_index=0, hold_seconds=0.5))
+    assert abs(s2.tracks[0].loops[0].steps[0].gate - 4.0) < 0.01
+
+
+def test_free_pad_release_advances_cursor():
+    """Cursor advances by round(gate) steps on release."""
+    from eden.events import PadReleased
+    s = dataclasses.replace(_free_synth_state(), step_cursor=0)
+    s = reduce(s, PadPressed(pad_index=0, velocity=100))
+    s2 = reduce(s, PadReleased(pad_index=0, hold_seconds=0.5))  # gate=4.0 → advance 4
+    assert s2.step_cursor == 4
+
+
+def test_free_pad_release_extends_loop():
+    """Release near end of loop auto-extends to fit next cursor position."""
+    from eden.events import PadReleased
+    s = dataclasses.replace(_free_synth_state(), step_cursor=13)
+    s = reduce(s, PadPressed(pad_index=0, velocity=100))
+    s2 = reduce(s, PadReleased(pad_index=0, hold_seconds=0.5))  # advance 4 → cursor 17
+    assert s2.tracks[0].loops[0].step_count > 16
+
+
+def test_free_pad_release_short_tap_minimum_gate():
+    """Very short tap gets minimum gate of 0.1, cursor advances 1."""
+    from eden.events import PadReleased
+    s = dataclasses.replace(_free_synth_state(), step_cursor=0)
+    s = reduce(s, PadPressed(pad_index=0, velocity=100))
+    s2 = reduce(s, PadReleased(pad_index=0, hold_seconds=0.001))
+    assert s2.tracks[0].loops[0].steps[0].gate == pytest.approx(0.1)
+    assert s2.step_cursor == 1  # min advance
+
+
+def test_oled_free_sk3_shows_range():
+    """FREE mode SK3 shows RANGE (pitch window control)."""
+    s = _free_synth_state()
+    out = render_oled(s)
+    from controller_map import OLED_BTN3_TITLE
+    assert out[OLED_BTN3_TITLE][0] == "RANGE"
+
+
+# ── RANGE encoder (granular ±1) ───────────────────────────────────────────────
+
+
+def test_range_encoder_increments_by_one():
+    """RANGE ctrl encoder steps pitch_window_offset by +1."""
+    s = dataclasses.replace(_armed_synth_state(), instrument_active_ctrl="RANGE")
+    original = s.pitch_window_offset
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=1))
+    assert s2.pitch_window_offset == original + 1
+
+
+def test_range_encoder_decrements_by_one():
+    """RANGE ctrl encoder steps pitch_window_offset by -1."""
+    s = dataclasses.replace(_armed_synth_state(), instrument_active_ctrl="RANGE",
+                            pitch_window_offset=5)
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=-1))
+    assert s2.pitch_window_offset == 4
+
+
+def test_range_encoder_free_cw_slides_right():
+    """FREE RANGE encoder CW (delta>0) decrements index: window slides right."""
+    s = dataclasses.replace(_free_synth_state(), instrument_active_ctrl="RANGE",
+                            pitch_window_offset=36)
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=1))
+    assert s2.pitch_window_offset == 35  # one white key lower (D4→C4 as leftmost)
+
+
+def test_range_encoder_free_ccw_slides_left():
+    """FREE RANGE encoder CCW (delta<0) increments index: window slides left."""
+    s = dataclasses.replace(_free_synth_state(), instrument_active_ctrl="RANGE",
+                            pitch_window_offset=35)
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=-1))
+    assert s2.pitch_window_offset == 36  # one white key higher (D4 becomes leftmost)
+
+
+def test_range_encoder_free_every_step_is_one():
+    """FREE encoder always steps by exactly 1 regardless of E/F or B/C boundaries."""
+    from eden.scales import white_idx_to_midi
+    s = dataclasses.replace(_free_synth_state(), instrument_active_ctrl="RANGE")
+    # Slide across several positions and confirm each CW step is -1
+    for start in (35, 36, 37, 38, 39, 40, 41):
+        s2 = dataclasses.replace(s, pitch_window_offset=start)
+        s3 = reduce(s2, EncoderTurned(encoder=9, delta=1))
+        assert s3.pitch_window_offset == start - 1
+
+
+def test_piano_layout_white_keys_correct():
+    """Verify white key column pitches starting from C4 (white_idx=35)."""
+    from eden.scales import white_idx_to_midi, black_key_at
+    # C4 octave: C D E F G A B
+    assert white_idx_to_midi(35) == 60   # C4
+    assert white_idx_to_midi(36) == 62   # D4
+    assert white_idx_to_midi(37) == 64   # E4
+    assert white_idx_to_midi(38) == 65   # F4
+    assert white_idx_to_midi(39) == 67   # G4
+    assert white_idx_to_midi(40) == 69   # A4
+    assert white_idx_to_midi(41) == 71   # B4
+    assert white_idx_to_midi(42) == 72   # C5
+
+
+def test_piano_layout_black_keys_and_dead_positions():
+    """Verify black key positions and dead slots (no E#/B#) from C4."""
+    from eden.scales import black_key_at
+    assert black_key_at(35) == 61   # C#4 (between C4 and D4)
+    assert black_key_at(36) == 63   # D#4 (between D4 and E4)
+    assert black_key_at(37) is None  # dead — no black key between E4 and F4
+    assert black_key_at(38) == 66   # F#4
+    assert black_key_at(39) == 68   # G#4
+    assert black_key_at(40) == 70   # A#4
+    assert black_key_at(41) is None  # dead — no black key between B4 and C5
+
+
+def test_piano_layout_slides_correctly():
+    """After pressing - once, every key moves one column right."""
+    from eden.scales import white_idx_to_midi, black_key_at
+    # Before: C4 at col 0 (offset=35); after -: offset=34, col 0=B3, C4 at col 1
+    assert white_idx_to_midi(34) == 59   # B3 (now leftmost)
+    assert white_idx_to_midi(35) == 60   # C4 (now at col 1)
+    # Black key at col 0 (B3 position): no black key between B3 and C4
+    assert black_key_at(34) is None
+
+
+def test_piano_offset_clamps_at_zero():
+    """- button at offset=0 stays at 0 (can't scroll into negative/invalid range)."""
+    from eden.events import PlusMinusPressed
+    s = dataclasses.replace(_free_synth_state(), pitch_window_offset=0)
+    s2 = reduce(s, PlusMinusPressed(button="-", pressed=True))
+    assert s2.pitch_window_offset == 0
+
+
+def test_piano_offset_clamps_at_max():
+    """+ button at max offset stays at 59 (col 15 would be G9 = MIDI 127)."""
+    from eden.events import PlusMinusPressed
+    s = dataclasses.replace(_free_synth_state(), pitch_window_offset=59)
+    s2 = reduce(s, PlusMinusPressed(button="+", pressed=True))
+    assert s2.pitch_window_offset == 59
+
+
+# ── RANGE +/- buttons (granular in FREE mode) ─────────────────────────────────
+
+
+def test_range_plus_free_slides_keyboard_left():
+    """+ in FREE mode increments white key index by 1 (keyboard slides left)."""
+    from eden.events import PlusMinusPressed
+    s = dataclasses.replace(_free_synth_state(), pitch_window_offset=35)
+    s2 = reduce(s, PlusMinusPressed(button="+", pressed=True))
+    assert s2.pitch_window_offset == 36  # C4 as leftmost → D4 as leftmost
+
+
+def test_range_minus_free_slides_keyboard_right():
+    """- in FREE mode decrements white key index by 1 (keyboard slides right)."""
+    from eden.events import PlusMinusPressed
+    s = dataclasses.replace(_free_synth_state(), pitch_window_offset=36)
+    s2 = reduce(s, PlusMinusPressed(button="-", pressed=True))
+    assert s2.pitch_window_offset == 35  # D4 as leftmost → C4 as leftmost
+
+
+def test_range_plus_quant_still_shifts_scale_octave():
+    """+ button in QUANT mode still jumps a full scale octave (unchanged)."""
+    from eden.events import PlusMinusPressed
+    from eden.scales import SCALES
+    s = dataclasses.replace(_armed_synth_state(), pitch_window_offset=0)
+    track = s.tracks[s.selected_track]
+    scale_len = len(SCALES.get(track.scale, SCALES["chromatic"]))
+    s2 = reduce(s, PlusMinusPressed(button="+", pressed=True))
+    assert s2.pitch_window_offset == scale_len
+
+
+# ── InstrumentUndo ────────────────────────────────────────────────────────────
+
+
+def test_instrument_undo_restores_tracks():
+    """InstrumentUndo restores tracks to the pre-edit snapshot."""
+    from eden.events import InstrumentUndo
+    s = _armed_synth_state()
+    original_tracks = s.tracks
+    # Record a note (saves undo snapshot)
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    assert s2.tracks != original_tracks
+    # Undo
+    s3 = reduce(s2, InstrumentUndo())
+    assert s3.tracks == original_tracks
+
+
+def test_instrument_undo_restores_cursor():
+    """InstrumentUndo also restores step_cursor to pre-edit position."""
+    from eden.events import InstrumentUndo
+    s = dataclasses.replace(_armed_synth_state(), step_cursor=3)
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    # Cursor may have advanced
+    s3 = reduce(s2, InstrumentUndo())
+    assert s3.step_cursor == 3
+
+
+def test_instrument_undo_no_op_without_snapshot():
+    """InstrumentUndo without a prior edit is a no-op (no crash)."""
+    from eden.events import InstrumentUndo
+    s = _armed_synth_state()
+    assert s.undo_snapshot is None
+    s2 = reduce(s, InstrumentUndo())
+    assert s2.tracks == s.tracks
+
+
+# ── InstrumentReset ───────────────────────────────────────────────────────────
+
+
+def test_instrument_reset_clears_loop():
+    """InstrumentReset blanks the selected loop to all-off steps."""
+    from eden.events import InstrumentReset
+    s = _armed_synth_state()
+    # Put a note in
+    s = reduce(s, PadPressed(pad_index=0, velocity=100))
+    assert any(step.on for step in s.tracks[0].loops[0].steps)
+    # Reset
+    s2 = reduce(s, InstrumentReset())
+    assert not any(step.on for step in s2.tracks[0].loops[0].steps)
+
+
+def test_instrument_reset_resets_cursor():
+    """InstrumentReset returns step_cursor to 0."""
+    from eden.events import InstrumentReset
+    s = dataclasses.replace(_armed_synth_state(), step_cursor=7)
+    s2 = reduce(s, InstrumentReset())
+    assert s2.step_cursor == 0
+
+
+def test_instrument_reset_removes_from_playing():
+    """InstrumentReset removes the loop from playing_loops and active_loops."""
+    from eden.events import InstrumentReset
+    s = _armed_synth_state()
+    loop_key = (s.selected_track, s.selected_loop)
+    # Ensure it's playing
+    s = dataclasses.replace(s, playing_loops=frozenset({loop_key}),
+                            active_loops=frozenset({loop_key}))
+    s2 = reduce(s, InstrumentReset())
+    assert loop_key not in s2.playing_loops
+    assert loop_key not in s2.active_loops

@@ -122,6 +122,7 @@ def _track_to_dict(track) -> Optional[dict]:
             "max_voices": track.max_voices,
             "root_note": track.root_note,
             "scale": track.scale,
+            "quantized": track.quantized,
             "loops": [_loop_to_dict(lp) for lp in track.loops],
         }
     return None
@@ -157,6 +158,7 @@ def _dict_to_track(d: Optional[dict]):
             max_voices=d.get("max_voices", 8),
             root_note=d.get("root_note", 60),
             scale=d.get("scale", "chromatic"),
+            quantized=d.get("quantized", True),
         )
     return None
 

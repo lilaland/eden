@@ -39,9 +39,9 @@ from eden.audio import AudioMixer, StateRef, StepScheduler
 from eden.clock import SequencerClock
 from eden.reduce import reduce
 from eden.render import render_pads, render_oled, render_button_leds
-from eden.scales import degree_to_pitch
+from eden.scales import degree_to_pitch, white_idx_to_midi, black_key_at
 from eden.state import default_state, AppState, DrumTrack, SynthTrack, InstrumentSubmode, Mode
-from eden.events import ClockTicked, PadPressed, PlusMinusPressed, SessionLoaded, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
+from eden.events import ClockTicked, InstrumentReset, InstrumentUndo, PadPressed, PadReleased, PlusMinusPressed, SessionLoaded, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
 from eden.state import Mode
 import eden.sessions as sessions
 
@@ -86,6 +86,9 @@ class EdenApp:
         )
         self._last_oled: dict[int, tuple[str, int, int, int]] = {}
         self._last_leds: dict[int, bool] = {}
+
+        # FREE piano mode: track pad-down timestamps for hold-duration recording
+        self._free_pad_down_times: dict[int, float] = {}
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -133,6 +136,25 @@ class EdenApp:
             if isinstance(event, SoftkeyPressed) and event.key == 3 and self._state.metronome_held:
                 event = TapTempoPressed(timestamp=time.time())
 
+            # FREE piano mode: record pad-down timestamp; enrich PadReleased with hold time.
+            if isinstance(event, PadPressed) and self._is_free_piano_mode():
+                self._free_pad_down_times[event.pad_index] = time.time()
+            if isinstance(event, PadReleased) and self._is_free_piano_mode():
+                down_time = self._free_pad_down_times.pop(event.pad_index, time.time())
+                event = PadReleased(pad_index=event.pad_index,
+                                    hold_seconds=time.time() - down_time)
+
+            # Shift+STOP in INSTRUMENT: undo (tap) or reset (hold ≥ 1s).
+            if (isinstance(event, TransportPressed) and event.button == "STOP"
+                    and self._state.shift_held
+                    and self._state.mode == Mode.INSTRUMENT):
+                if event.pressed:
+                    self._stop_press_time: float = time.time()
+                    continue  # consumed; wait for release
+                else:
+                    held = time.time() - getattr(self, "_stop_press_time", time.time())
+                    event = InstrumentReset() if held >= 1.0 else InstrumentUndo()  # type: ignore[assignment]
+
             # A-H slot press: SESSION mode only → immediate display switch.
             if isinstance(event, SongSlotPressed) and event.pressed:
                 if (self._state.mode == Mode.SESSION and
@@ -163,6 +185,13 @@ class EdenApp:
             if isinstance(event, PadPressed) and self._state.mode == Mode.INSTRUMENT:
                 self._maybe_trigger_synth_preview(event)
 
+    def _is_free_piano_mode(self) -> bool:
+        """True when INSTRUMENT mode is active with an unquantized SynthTrack armed."""
+        if self._state.mode != Mode.INSTRUMENT or not self._state.armed_tracks:
+            return False
+        track = self._state.tracks[self._state.armed_tracks[0]]
+        return isinstance(track, SynthTrack) and not track.quantized
+
     def _maybe_trigger_synth_preview(self, event: PadPressed) -> None:
         """Fire a short preview note when recording a pitch in synth pad modes."""
         if not self._state.armed_tracks:
@@ -171,14 +200,28 @@ class EdenApp:
         track = self._state.tracks[track_idx]
         if not isinstance(track, SynthTrack):
             return
-        submode = self._state.instrument_submode
-        if submode == InstrumentSubmode.PADS:
-            degree = self._state.pitch_window_offset + event.pad_index
-        elif submode == InstrumentSubmode.STEPS and event.pad_index < 16:
-            degree = self._state.pitch_window_offset + event.pad_index
+        pad = event.pad_index
+        if not track.quantized:
+            # FREE piano keyboard mode — same index arithmetic as reduce/_piano_pad_pressed
+            offset = self._state.pitch_window_offset
+            if pad < 16:
+                pitch = white_idx_to_midi(offset + pad)
+                if pitch < 0 or pitch > 127:
+                    return
+            else:
+                pitch = black_key_at(offset + (pad - 16))
+                if pitch is None or pitch < 0 or pitch > 127:
+                    return  # dead key or out of range
         else:
-            return
-        pitch = degree_to_pitch(track.root_note, track.scale, degree)
+            submode = self._state.instrument_submode
+            if submode == InstrumentSubmode.PADS:
+                degree = self._state.pitch_window_offset + pad
+            elif submode == InstrumentSubmode.STEPS and pad < 16:
+                degree = self._state.pitch_window_offset + pad
+            else:
+                return
+            pitch = degree_to_pitch(track.root_note, track.scale, degree)
+        pitch = max(0, min(127, pitch + self._state.octave_offset * 12))
         engine = self._mixer.get_engine(track_idx)
         if engine is None:
             return

@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import eden.catalog as catalog
 import eden.sessions as sessions
-from eden.scales import degree_to_pitch, pitch_to_degree, pitch_name, SCALE_SHORT, is_root
+from eden.scales import (
+    degree_to_pitch, pitch_to_degree, pitch_name, SCALE_SHORT, is_root,
+    note_in_scale, white_idx_to_midi, black_key_at,
+)
 from eden.state import (
     AppState, Mode, InstrumentSubmode, Loop, DrumTrack, SynthTrack, SampleTrack, Track,
 )
@@ -16,7 +19,7 @@ from eden.theme import (
     PAD_ACTIVE, PAD_PLAYHEAD, PAD_INACTIVE, PAD_SELECTED, PAD_OFF,
     ACCENT_GOLD, ACCENT_CORAL, BG_DARK,
     PAD_DRUM, PAD_SYNTH, PAD_SAMPLE, PAD_NEW_SLOT,
-    PAD_PINK, PAD_ARMED,
+    PAD_PINK, PAD_ARMED, NOTE_COLORS,
 )
 from controller_map import (
     OLED_MAIN_LINE1, OLED_MAIN_LINE2,
@@ -145,7 +148,38 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
 
                 # ── SynthTrack: dual-row layout ───────────────────────────────
                 if isinstance(track, SynthTrack):
-                    if state.instrument_submode == InstrumentSubmode.PADS:
+                    if not track.quantized:
+                        # FREE piano: pitch_window_offset = white key index of leftmost pad
+                        woff = state.pitch_window_offset
+                        # Bottom row (pads 0-15): white keys
+                        for col in range(16):
+                            pitch = white_idx_to_midi(woff + col)
+                            if pitch < 0 or pitch > 127:
+                                pads[col] = PAD_OFF
+                                continue
+                            root_semi = pitch % 12
+                            in_scale = note_in_scale(pitch, track.root_note, track.scale)
+                            if root_semi == track.root_note % 12:
+                                pads[col] = ACCENT_GOLD
+                            elif in_scale:
+                                pads[col] = color
+                            else:
+                                pads[col] = _dim(PAD_INACTIVE)
+                        # Top row (pads 16-31): black keys (None = dead pad, no key here)
+                        for col in range(16):
+                            pitch = black_key_at(woff + col)
+                            if pitch is None or pitch < 0 or pitch > 127:
+                                pads[col + 16] = PAD_OFF
+                            else:
+                                root_semi = pitch % 12
+                                in_scale = note_in_scale(pitch, track.root_note, track.scale)
+                                if root_semi == track.root_note % 12:
+                                    pads[col + 16] = _dim(ACCENT_GOLD)
+                                elif in_scale:
+                                    pads[col + 16] = _dim(color)
+                                else:
+                                    pads[col + 16] = PAD_INACTIVE
+                    elif state.instrument_submode == InstrumentSubmode.PADS:
                         # PADS mode: all 32 pads = scale degrees (keyboard)
                         for pad_idx in range(32):
                             degree = state.pitch_window_offset + pad_idx
@@ -477,7 +511,20 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
         view_m = state.instrument_view_measure
         first_spb = first_numer * (first_size // 4)
         page_label = "P" if (is_interleaved and first_spb > 32) else ("B" if is_interleaved else "P")
-        main_line2 = f"{page_label}{view_m + 1}/{max_pages} L{state.selected_loop + 1}"
+
+        # OLED line2: FREE synth → write-head fraction; QUANT synth/drum → page progress
+        first_track_for_line2 = state.tracks[armed[0]] if armed else None
+        if (isinstance(first_track_for_line2, SynthTrack)
+                and not is_interleaved
+                and not first_track_for_line2.quantized):
+            # FREE piano mode: show write-head position "N/total Lx"
+            loop_for_line2 = first_track_for_line2.loops[state.selected_loop]
+            step_count = loop_for_line2.step_count
+            cursor = state.step_cursor % step_count if step_count > 0 else 0
+            main_line2 = f"{cursor + 1}/{step_count} L{state.selected_loop + 1}"
+        else:
+            # QUANT step mode and drums: show which page/measure you're on
+            main_line2 = f"{page_label}{view_m + 1}/{max_pages} L{state.selected_loop + 1}"
 
         ctrl = state.instrument_active_ctrl
         _set(OLED_MAIN_LINE1, main_line1)
@@ -487,20 +534,10 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
         first_track = state.tracks[armed[0]] if armed else None
         if isinstance(first_track, SynthTrack):
             shift = state.shift_held
+            scale_short = SCALE_SHORT.get(first_track.scale, first_track.scale[:5].upper())
+            root_color_val = NOTE_COLORS.get(first_track.root_note % 12, _OLED_DIM)
             if shift:
-                # Shift page: SCALE / ROOT / RESO
-                scale_color = _OLED_ACTIVE if ctrl == "SCALE" else _OLED_DIM
-                root_color  = _OLED_ACTIVE if ctrl == "ROOT"  else _OLED_DIM
-                reso_color  = _OLED_ACTIVE if ctrl == "RESO"  else _OLED_DIM
-                scale_short = SCALE_SHORT.get(first_track.scale, first_track.scale[:5].upper())
-                _set(OLED_BTN1_TITLE, "SCALE", scale_color)
-                _set(OLED_BTN1_VALUE, scale_short)
-                _set(OLED_BTN2_TITLE, "ROOT", root_color)
-                _set(OLED_BTN2_VALUE, pitch_name(first_track.root_note))
-                _set(OLED_BTN3_TITLE, "RESO", reso_color)
-                _set(OLED_BTN3_VALUE, f"{first_track.filter_res:.2f}")
-            else:
-                # Normal page: OSC / CUTOFF / RESO
+                # Shift page: OSC / CUTOFF / RESO / (BACK) / VEL
                 osc_color    = _OLED_ACTIVE if ctrl == "OSC"    else _OLED_DIM
                 cutoff_color = _OLED_ACTIVE if ctrl == "CUTOFF" else _OLED_DIM
                 reso_color   = _OLED_ACTIVE if ctrl == "RESO"   else _OLED_DIM
@@ -510,8 +547,27 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
                 _set(OLED_BTN1_VALUE, first_track.osc_type.upper()[:4])
                 _set(OLED_BTN2_TITLE, "CUTOFF", cutoff_color)
                 _set(OLED_BTN2_VALUE, cutoff_str)
-                _set(OLED_BTN3_TITLE, "RESO", reso_color)
-                _set(OLED_BTN3_VALUE, f"{first_track.filter_res:.2f}")
+                _set(OLED_BTN3_TITLE, "LEN", _OLED_ACTIVE if ctrl == "BARS" else _OLED_DIM)
+                _set(OLED_BTN3_VALUE, f"{first_bars}bar" + ("s" if first_bars != 1 else ""))
+                vel_color = _OLED_ACTIVE if state.vel_sensitive else _OLED_DIM
+                _set(OLED_BTN5_TITLE, "VEL" if state.vel_sensitive else "MONO", vel_color)
+            else:
+                # Normal page: SCALE / ROOT / RANGE / (BACK) / OCTAVE
+                scale_color  = _OLED_ACTIVE if ctrl == "SCALE"  else _OLED_DIM
+                root_color   = _OLED_ACTIVE if ctrl == "ROOT"   else root_color_val
+                range_color  = _OLED_ACTIVE if ctrl == "RANGE"  else _OLED_DIM
+                octave_color = _OLED_ACTIVE if ctrl == "OCTAVE" else _OLED_DIM
+                _set(OLED_BTN1_TITLE, "SCALE", scale_color)
+                _set(OLED_BTN1_VALUE, scale_short)
+                _set(OLED_BTN2_TITLE, "ROOT", root_color)
+                _set(OLED_BTN2_VALUE, pitch_name(first_track.root_note))
+                _set(OLED_BTN3_TITLE, "RANGE", range_color)
+                rng = state.pitch_window_offset
+                _set(OLED_BTN3_VALUE, f"+{rng}" if rng >= 0 else str(rng))
+                oct_val = state.octave_offset
+                oct_str = f"+{oct_val}" if oct_val >= 0 else str(oct_val)
+                _set(OLED_BTN5_TITLE, "OCTAVE", octave_color)
+                _set(OLED_BTN5_VALUE, oct_str)
         else:
             bars_color  = _OLED_ACTIVE if ctrl == "BARS"  else _OLED_DIM
             numer_color = _OLED_ACTIVE if ctrl == "NUMER" else _OLED_DIM
@@ -522,14 +578,16 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
             _set(OLED_BTN2_VALUE, str(first_numer))
             _set(OLED_BTN3_TITLE, "SIZE", size_color)
             _set(OLED_BTN3_VALUE, f"1/{first_size}")
+            _set(OLED_BTN4_TITLE, "< BACK", _OLED_DIM)
+            if state.shift_held:
+                _set(OLED_BTN5_TITLE, "CLEAR", _OLED_DIM)
+                _set(OLED_BTN5_VALUE, "SHIFT+")
+            else:
+                vel_color = _OLED_ACTIVE if state.vel_sensitive else _OLED_DIM
+                _set(OLED_BTN5_TITLE, "VEL" if state.vel_sensitive else "MONO", vel_color)
 
-        _set(OLED_BTN4_TITLE, "< BACK", _OLED_DIM)
-        if state.shift_held:
-            _set(OLED_BTN5_TITLE, "CLEAR", _OLED_DIM)
-            _set(OLED_BTN5_VALUE, "SHIFT+")
-        else:
-            vel_color = _OLED_ACTIVE if state.vel_sensitive else _OLED_DIM
-            _set(OLED_BTN5_TITLE, "VEL" if state.vel_sensitive else "MONO", vel_color)
+        if isinstance(first_track, SynthTrack):
+            _set(OLED_BTN4_TITLE, "< BACK", _OLED_DIM)
 
     return out
 

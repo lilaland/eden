@@ -18,6 +18,7 @@ class PadPressed(Event):
 @dataclass(frozen=True)
 class PadReleased(Event):
     pad_index: int
+    hold_seconds: float = 0.0  # filled by app layer for FREE piano mode
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,16 @@ class EncoderTurned(Event):
 class TransportPressed(Event):
     button: str   # "PLAY" | "STOP" | "REC" | "METRO"
     pressed: bool
+
+
+@dataclass(frozen=True)
+class InstrumentUndo(Event):
+    pass  # Undo last recording action in INSTRUMENT mode
+
+
+@dataclass(frozen=True)
+class InstrumentReset(Event):
+    pass  # Reset selected loop to empty 1-bar default
 
 
 @dataclass(frozen=True)

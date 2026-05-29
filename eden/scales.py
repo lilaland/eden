@@ -77,3 +77,60 @@ def pitch_name(pitch: int) -> str:
 def is_root(root: int, pitch: int) -> bool:
     """True if pitch is any octave of the root note."""
     return (pitch - root) % 12 == 0
+
+
+# ── Piano keyboard layout ─────────────────────────────────────────────────────
+
+# Semitone offsets of the 7 white keys per octave: C D E F G A B
+_WHITE_KEY_SEMITONES: tuple[int, ...] = (0, 2, 4, 5, 7, 9, 11)
+# Semitone offsets of black keys between consecutive white keys (None = no black key)
+_BLACK_KEY_SEMITONES: tuple[int | None, ...] = (1, 3, None, 6, 8, 10, None)
+
+
+def piano_base_note(root: int, offset: int) -> int:
+    """MIDI note of the leftmost white key: C of root's octave + offset semitones."""
+    return root - (root % 12) + offset
+
+
+def piano_white_pitch(base: int, pad_pos: int) -> int:
+    """MIDI pitch for white-key pad 0–15. base = MIDI note of leftmost white key."""
+    octave = pad_pos // 7
+    degree = pad_pos % 7
+    return max(0, min(127, base + octave * 12 + _WHITE_KEY_SEMITONES[degree]))
+
+
+def piano_black_pitch(base: int, pad_pos: int) -> int | None:
+    """MIDI pitch for black-key pad 0–15, or None for the dead E#/B# positions."""
+    octave = pad_pos // 7
+    degree = pad_pos % 7
+    semi = _BLACK_KEY_SEMITONES[degree]
+    if semi is None:
+        return None
+    return max(0, min(127, base + octave * 12 + semi))
+
+
+def note_in_scale(pitch: int, root: int, scale: str) -> bool:
+    """True if pitch belongs to the given scale rooted at root."""
+    intervals = SCALES.get(scale, SCALES["chromatic"])
+    return (pitch - root) % 12 in intervals
+
+
+def white_idx_to_midi(white_idx: int) -> int:
+    """Raw MIDI pitch for white key index (0 = C-1 = MIDI 0, 35 = C4 = MIDI 60).
+
+    May return values outside 0-127 for extreme indices; callers must range-check.
+    One increment = one white key (one column) to the right on a piano.
+    """
+    octave, degree = divmod(white_idx, 7)
+    return octave * 12 + _WHITE_KEY_SEMITONES[degree]
+
+
+def black_key_at(white_idx: int) -> int | None:
+    """Raw MIDI pitch of the black key to the right of white key white_idx, or None.
+
+    None is returned for the E/F and B/C boundaries where no black key exists.
+    May return values outside 0-127; callers must range-check.
+    """
+    octave, degree = divmod(white_idx, 7)
+    semi = _BLACK_KEY_SEMITONES[degree]
+    return None if semi is None else octave * 12 + semi

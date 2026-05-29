@@ -22,3 +22,19 @@ PAD_NEW_SLOT = (0, 100, 0)    # bright green — empty slot selected, ready to a
 # Session view highlights
 PAD_PINK     = (100, 0, 80)   # hot pink — selected instrument or loop
 PAD_ARMED    = (120, 0, 0)    # bright red — armed track
+
+# Chromatic note colors for ROOT indicator (one per semitone 0=C … 11=B)
+NOTE_COLORS: dict[int, tuple[int, int, int]] = {
+    0:  (127, 20,  20),   # C  - red
+    1:  (127, 55,  10),   # C# - orange-red
+    2:  (127, 90,   0),   # D  - orange
+    3:  (110, 110,  0),   # D# - yellow
+    4:  (60,  120,  0),   # E  - yellow-green
+    5:  (0,   110,  0),   # F  - green
+    6:  (0,   100, 50),   # F# - cyan-green
+    7:  (0,    80, 100),  # G  - cyan
+    8:  (0,    40, 127),  # G# - blue
+    9:  (40,    0, 120),  # A  - indigo
+    10: (80,    0, 100),  # A# - purple
+    11: (110,   0,  70),  # B  - red-purple
+}

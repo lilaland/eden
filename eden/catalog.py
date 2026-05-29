@@ -124,7 +124,9 @@ def get_variations(type_idx: int, cat_idx: int) -> tuple[str, ...]:
     """Return variation list for the given type/category indices."""
     if type_idx == 0:  # DRUMS — same variation set for every category
         return DRUM_VARIATIONS
-    return ()  # KEYS has no variations
+    if type_idx == 1:  # KEYS — quantized step editor vs free piano keyboard
+        return ("QUANT", "FREE")
+    return ()
 
 
 def get_track_params(type_idx: int, cat_idx: int, var_idx: int) -> tuple[str, str]:
