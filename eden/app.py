@@ -144,16 +144,14 @@ class EdenApp:
                 event = PadReleased(pad_index=event.pad_index,
                                     hold_seconds=time.time() - down_time)
 
-            # Shift+STOP in INSTRUMENT: undo (tap) or reset (hold ≥ 1s).
+            # Shift+STOP in INSTRUMENT: undo.
             if (isinstance(event, TransportPressed) and event.button == "STOP"
                     and self._state.shift_held
                     and self._state.mode == Mode.INSTRUMENT):
-                if event.pressed:
-                    self._stop_press_time: float = time.time()
-                    continue  # consumed; wait for release
+                if not event.pressed:
+                    event = InstrumentUndo()  # type: ignore[assignment]
                 else:
-                    held = time.time() - getattr(self, "_stop_press_time", time.time())
-                    event = InstrumentReset() if held >= 1.0 else InstrumentUndo()  # type: ignore[assignment]
+                    continue  # consume press, act on release
 
             # A-H slot press: SESSION mode only → immediate display switch.
             if isinstance(event, SongSlotPressed) and event.pressed:
@@ -173,8 +171,9 @@ class EdenApp:
                 if new_state.tempo_bpm != old_bpm:
                     self._clock.set_bpm(new_state.tempo_bpm)
 
-            # REC press → save current session to active slot.
-            if isinstance(event, TransportPressed) and event.button == "REC" and event.pressed:
+            # REC press → save current session to active slot (SESSION mode only).
+            if (isinstance(event, TransportPressed) and event.button == "REC" and event.pressed
+                    and self._state.mode == Mode.SESSION):
                 self._save_session(self._state.active_session_slot)
 
             # Schedule audio AFTER state swap so scheduler sees updated playhead.

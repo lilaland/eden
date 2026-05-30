@@ -15,7 +15,8 @@ from eden.state import (
     default_state, default_loop, default_track_loops,
 )
 from eden.events import (
-    EncoderTurned, PadPressed, SoftkeyPressed, ModeButtonPressed,
+    ClockTicked, EncoderTurned, PadPressed, PadReleased, SoftkeyPressed,
+    ModeButtonPressed, TransportPressed,
 )
 from eden.reduce import reduce
 import eden.catalog as catalog
@@ -423,8 +424,8 @@ def test_oled_synth_cutoff_active_lights_bar():
 def _free_synth_state():
     """Armed SynthTrack in INSTRUMENT mode with quantized=False (FREE piano).
 
-    pitch_window_offset=35 puts C4 (MIDI 60) as the leftmost white key (white_idx 35),
-    matching the old semitone-offset=0 behavior for root_note=60.
+    pitch_window_offset=28 puts C4 (MIDI 60) at pad 7 (white_idx 35).
+    free_recording=True so pad presses write notes (active recording session).
     """
     s = default_state()
     tracks = list(s.tracks)
@@ -433,7 +434,8 @@ def _free_synth_state():
     s = dataclasses.replace(s, tracks=tuple(tracks),
                             armed_tracks=(0,), mode=Mode.INSTRUMENT,
                             instrument_submode=InstrumentSubmode.STEPS,
-                            pitch_window_offset=28)
+                            pitch_window_offset=28,
+                            free_recording=True)
     return s
 
 
@@ -539,25 +541,32 @@ def test_oled_synth_free_shows_scale_and_octave():
     assert out[OLED_BTN5_TITLE][0] == "OCTAVE"
 
 
-def test_oled_synth_free_line2_shows_step_progress():
+def test_oled_synth_free_line2_recording_shows_rec():
     from controller_map import OLED_MAIN_LINE2
-    s = _free_synth_state()
-    # Record two notes to extend loop to 2 steps, cursor at step 2
-    s = reduce(s, PadPressed(pad_index=0, velocity=100))  # step 0 → cursor at 1
-    s = reduce(s, PadPressed(pad_index=2, velocity=100))  # step 1 → cursor at 2 (or wrap)
+    s = _free_synth_state()  # free_recording=True
     out = render_oled(s)
     line2 = out[OLED_MAIN_LINE2][0]
-    # Should contain step counter (N/M) and loop slot (Lx)
-    assert "/" in line2
-    assert "L" in line2
+    assert "REC" in line2
+    assert "L1" in line2
 
 
-def test_oled_synth_free_line2_initial_shows_s1():
+def test_oled_synth_free_line2_free_play_shows_free_play():
     from controller_map import OLED_MAIN_LINE2
-    s = _free_synth_state()
+    s = dataclasses.replace(_free_synth_state(), free_recording=False)
     out = render_oled(s)
     line2 = out[OLED_MAIN_LINE2][0]
-    assert line2.startswith("1/")
+    assert "FREE PLAY" in line2
+    assert "L1" in line2
+
+
+def test_oled_synth_free_line2_pending_shows_arm():
+    from controller_map import OLED_MAIN_LINE2
+    s = dataclasses.replace(_free_synth_state(), free_recording=False,
+                             free_record_pending=True, playhead=16)
+    out = render_oled(s)
+    line2 = out[OLED_MAIN_LINE2][0]
+    assert "ARM" in line2
+    assert "L1" in line2
 
 
 def test_synth_sk3_bars_encoder_extends_loop():
@@ -838,3 +847,106 @@ def test_instrument_reset_removes_from_playing():
     s2 = reduce(s, InstrumentReset())
     assert loop_key not in s2.playing_loops
     assert loop_key not in s2.active_loops
+
+
+# ── FREE recording state machine ──────────────────────────────────────────────
+
+
+def _free_play_state():
+    """FREE piano state in free-play mode (not recording)."""
+    return dataclasses.replace(_free_synth_state(), free_recording=False)
+
+
+def test_free_play_pad_does_not_write():
+    """Pad press in free-play mode (not recording) writes no steps."""
+    s = _free_play_state()
+    s2 = reduce(s, PadPressed(pad_index=7, velocity=100))
+    assert not any(step.on for step in s2.tracks[0].loops[0].steps)
+
+
+def test_free_rec_arm_sets_pending():
+    """REC press in free-play mode arms recording (pending)."""
+    s = _free_play_state()
+    s2 = reduce(s, TransportPressed(button="REC", pressed=True))
+    assert s2.free_record_pending is True
+    assert s2.free_recording is False
+
+
+def test_free_rec_cancel_clears_pending():
+    """Second REC press while pending cancels the arm."""
+    s = dataclasses.replace(_free_play_state(), free_record_pending=True)
+    s2 = reduce(s, TransportPressed(button="REC", pressed=True))
+    assert s2.free_record_pending is False
+    assert s2.free_recording is False
+
+
+def test_free_clock_wrap_starts_recording():
+    """ClockTicked wrapping to playhead=0 transitions pending → recording."""
+    s = dataclasses.replace(_free_play_state(), playhead=31, free_record_pending=True)
+    s2 = reduce(s, ClockTicked())
+    assert s2.playhead == 0
+    assert s2.free_recording is True
+    assert s2.free_record_pending is False
+
+
+def test_free_clock_wrap_clears_loop():
+    """Recording start clears the selected loop."""
+    s = _free_synth_state()  # already has free_recording=True via _instrument_reset path
+    # Put a note in manually
+    from eden.state import StepNote
+    loop = s.tracks[0].loops[0]
+    note_step = StepNote(on=True, pitch=60)
+    new_steps = (note_step,) + loop.steps[1:]
+    new_loop = dataclasses.replace(loop, steps=new_steps)
+    new_loops = s.tracks[0].loops[:0] + (new_loop,) + s.tracks[0].loops[1:]
+    new_track = dataclasses.replace(s.tracks[0], loops=new_loops)
+    new_tracks = s.tracks[:0] + (new_track,) + s.tracks[1:]
+    s_with_note = dataclasses.replace(s, tracks=new_tracks,
+                                      free_recording=False, free_record_pending=True,
+                                      playhead=31)
+    s2 = reduce(s_with_note, ClockTicked())
+    assert s2.free_recording is True
+    assert not any(step.on for step in s2.tracks[0].loops[0].steps)
+
+
+def test_free_stop_recording_finalizes_length():
+    """REC press while recording stops and rounds up to nearest bar."""
+    s = dataclasses.replace(_free_synth_state(), step_cursor=5)
+    # step_cursor=5 with steps_per_bar=16 → 1 bar = 16 steps
+    s2 = reduce(s, TransportPressed(button="REC", pressed=True))
+    assert s2.free_recording is False
+    assert s2.tracks[0].loops[0].step_count == 16
+
+
+def test_free_stop_recording_rounds_up_multi_bar():
+    """When cursor is past one bar, length rounds up to 2 bars."""
+    s = dataclasses.replace(_free_synth_state(), step_cursor=17)
+    # Need some notes in the loop so it's not empty
+    from eden.state import StepNote
+    loop = s.tracks[0].loops[0]
+    new_steps = list(loop.steps)
+    new_steps[0] = StepNote(on=True, pitch=60)
+    new_loop = dataclasses.replace(loop, steps=tuple(new_steps))
+    new_loops = s.tracks[0].loops[:0] + (new_loop,) + s.tracks[0].loops[1:]
+    new_track = dataclasses.replace(s.tracks[0], loops=new_loops)
+    s = dataclasses.replace(s, tracks=s.tracks[:0] + (new_track,) + s.tracks[1:])
+    s2 = reduce(s, TransportPressed(button="REC", pressed=True))
+    assert s2.free_recording is False
+    assert s2.tracks[0].loops[0].step_count == 32  # 2 bars × 16 steps
+
+
+def test_free_shift_rec_resets_pattern():
+    """Shift+REC in FREE mode resets the pattern."""
+    s = dataclasses.replace(_free_synth_state(), shift_held=True)
+    s2 = reduce(s, TransportPressed(button="REC", pressed=True))
+    assert s2.free_recording is False
+    assert s2.free_record_pending is False
+    assert not any(step.on for step in s2.tracks[0].loops[0].steps)
+
+
+def test_free_stop_clears_recording_state():
+    """STOP in INSTRUMENT mode clears free_recording and free_record_pending."""
+    s = dataclasses.replace(_free_synth_state(), free_record_pending=True)
+    s2 = reduce(s, TransportPressed(button="STOP", pressed=True))
+    assert s2.free_recording is False
+    assert s2.free_record_pending is False

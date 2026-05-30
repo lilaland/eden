@@ -82,6 +82,13 @@ class SynthTrack:
     root_note: int = 60            # MIDI root pitch (default C4)
     scale: str = "chromatic"       # key in scales.SCALES
     quantized: bool = True         # True = scale-degree step editor; False = piano keyboard
+    aftertouch: bool = True        # channel pressure enabled
+    arp_on: bool = False
+    arp_mode: str = "up"           # up / down / down_up / chord / random / input
+    arp_rate: int = 16             # note value denominator (4/8/16/32)
+    arp_octaves: int = 1           # 1–4
+    chord_on: bool = False
+    chord_type: str = "major"
 
 
 @dataclass(frozen=True)
@@ -149,6 +156,11 @@ class AppState:
     finishing_tracks: tuple = ()            # tuple[Optional[Track], ...] snapshot of prev session
     finishing_plays_remaining: tuple[tuple[tuple[int, int], int], ...] = ()
     finishing_loop_measure_offsets: tuple[tuple[tuple[int, int], int], ...] = ()
+    # OLED page for Instrument view (SynthTrack: 0=params, 1=arp, 2=chord)
+    instrument_oled_page: int = 0
+    # FREE recording state
+    free_recording: bool = False
+    free_record_pending: bool = False
 
 
 # ── Factory functions ─────────────────────────────────────────────────────────

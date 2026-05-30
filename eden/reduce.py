@@ -86,6 +86,8 @@ def _on_clock_ticked(state: AppState) -> AppState:
     state = dataclasses.replace(state, playhead=new_playhead)
     if new_playhead == 0:
         state = _handle_loop_wrap(state)
+        if state.free_record_pending:
+            state = _start_free_recording(state)
     return state
 
 
@@ -601,6 +603,41 @@ def _new_slot_encoder(state: AppState, event: EncoderTurned) -> AppState:
 # ── Instrument mode ───────────────────────────────────────────────────────────
 
 
+def _start_free_recording(state: AppState) -> AppState:
+    """Clear selected loop and begin FREE recording from step 0."""
+    state = _instrument_reset(state)
+    return dataclasses.replace(state, free_recording=True, free_record_pending=False)
+
+
+def _stop_free_recording(state: AppState) -> AppState:
+    """Finalize FREE recording: round loop length up to nearest bar, then auto-start."""
+    if not state.armed_tracks:
+        return dataclasses.replace(state, free_recording=False)
+    track_idx = state.armed_tracks[0]
+    track = state.tracks[track_idx]
+    if not isinstance(track, SynthTrack):
+        return dataclasses.replace(state, free_recording=False)
+    loop_idx = state.selected_loop
+    loop = track.loops[loop_idx]
+    spb = loop.steps_per_bar
+    cursor = state.step_cursor
+    if cursor == 0 or loop.is_empty:
+        return dataclasses.replace(state, free_recording=False, step_cursor=0)
+    bars = max(1, (cursor + spb - 1) // spb)
+    new_count = bars * spb
+    steps = loop.steps
+    if len(steps) < new_count:
+        steps = steps + tuple(StepNote.off() for _ in range(new_count - len(steps)))
+    else:
+        steps = steps[:new_count]
+    new_loop = dataclasses.replace(loop, steps=steps, bars=bars)
+    new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+    new_track = dataclasses.replace(track, loops=new_loops)
+    new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+    state = dataclasses.replace(state, tracks=new_tracks, free_recording=False, step_cursor=0)
+    return _auto_start_and_gc(state, track_idx, loop_idx)
+
+
 def _instrument_undo(state: AppState) -> AppState:
     """Restore tracks+cursor from the last recording snapshot."""
     if state.undo_snapshot is None:
@@ -666,6 +703,8 @@ def _reduce_instrument(state: AppState, event: Event) -> AppState:
         return _instrument_arrow(state, event)
     if isinstance(event, PlusMinusPressed) and event.pressed:
         return _shift_pitch_window(state, event.button)
+    if isinstance(event, ModeButtonPressed) and event.pressed:
+        return _instrument_mode_button(state, event)
     return state
 
 
@@ -1016,6 +1055,8 @@ def _piano_pad_pressed(
     Row 1 (pad 16-31): black keys — C# D# (dead) F# G# A# (dead) repeating
     Dead positions (E#/B#) produce no note.
     """
+    if not state.free_recording:
+        return state  # free-play mode: audio preview only, no step writing
     state = _save_undo(state)
     loop_idx = state.selected_loop
     track = state.tracks[track_idx]
@@ -1047,6 +1088,8 @@ def _piano_pad_released(
     """
     Commit note duration on pad release: update gate from hold time, advance cursor.
     """
+    if not state.free_recording:
+        return state  # nothing was written on press, nothing to finalize
     loop_idx = state.selected_loop
     track = state.tracks[track_idx]
     if track is None:
@@ -1104,9 +1147,25 @@ def _instrument_transport(state: AppState, event: TransportPressed) -> AppState:
     if event.button == "PLAY":
         return dataclasses.replace(state, is_playing=True)
     if event.button == "STOP":
-        return dataclasses.replace(state, is_playing=False, playhead=0, loop_measure_offsets=())
-    if event.button == "REC" and state.shift_held:
-        return dataclasses.replace(state, active_loops=state.playing_loops)
+        return dataclasses.replace(state,
+                                   is_playing=False, playhead=0, loop_measure_offsets=(),
+                                   free_recording=False, free_record_pending=False)
+    if event.button == "REC":
+        first_track = state.tracks[state.armed_tracks[0]] if state.armed_tracks else None
+        if isinstance(first_track, SynthTrack) and not first_track.quantized:
+            if state.shift_held:
+                # Shift+REC = reset pattern
+                return dataclasses.replace(_instrument_reset(state),
+                                           free_recording=False, free_record_pending=False)
+            if state.free_recording:
+                return _stop_free_recording(state)
+            elif state.free_record_pending:
+                return dataclasses.replace(state, free_record_pending=False)
+            else:
+                return dataclasses.replace(state, free_record_pending=True)
+        # Non-FREE: Shift+REC saves active loops
+        if state.shift_held:
+            return dataclasses.replace(state, active_loops=state.playing_loops)
     return state
 
 
@@ -1117,33 +1176,92 @@ def _is_synth_armed(state: AppState) -> bool:
     return isinstance(state.tracks[state.armed_tracks[0]], SynthTrack)
 
 
+_ARP_MODES = ("up", "down", "down_up", "chord", "random", "input")
+_ARP_RATES = (4, 8, 16, 32)
+_CHORD_TYPES = ("major", "minor", "dom7", "maj7", "min7", "sus2", "sus4", "aug", "dim")
+
+
+def _instrument_mode_button(state: AppState, event: ModeButtonPressed) -> AppState:
+    """Jogwheel arrows navigate OLED pages in INSTRUMENT view for SynthTracks."""
+    first_track = state.tracks[state.armed_tracks[0]] if state.armed_tracks else None
+    if not isinstance(first_track, SynthTrack):
+        return state
+    if event.button == "FORWARD":
+        new_page = min(2, state.instrument_oled_page + 1)
+    else:  # BACK
+        new_page = max(0, state.instrument_oled_page - 1)
+    return dataclasses.replace(state, instrument_oled_page=new_page,
+                               instrument_active_ctrl="")
+
+
 def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
     first_track = state.tracks[state.armed_tracks[0]] if state.armed_tracks else None
     synth = isinstance(first_track, SynthTrack)
-    if event.key == 3:  # SK4: BACK — universal
-        state = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
-        armed = state.saved_armed_tracks if state.saved_armed_tracks is not None else state.armed_tracks
-        return dataclasses.replace(state, mode=Mode.SESSION, instrument_active_ctrl="",
-                                   armed_tracks=armed, saved_armed_tracks=None)
     if synth:
-        if event.key == 0:  # SK1: SCALE (normal) | OSC (shift)
-            ctrl = "OSC" if state.shift_held else "SCALE"
-            new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
-            return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-        if event.key == 1:  # SK2: ROOT (normal) | CUTOFF (shift)
-            ctrl = "CUTOFF" if state.shift_held else "ROOT"
-            new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
-            return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-        if event.key == 2:  # SK3: RANGE (normal) | LEN/BARS (shift)
-            ctrl = "BARS" if state.shift_held else "RANGE"
-            new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
-            return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-        if event.key == 4:  # SK5: OCTAVE (normal) | vel_sensitive toggle (shift)
-            if state.shift_held:
-                return dataclasses.replace(state, vel_sensitive=not state.vel_sensitive)
-            new_ctrl = "" if state.instrument_active_ctrl == "OCTAVE" else "OCTAVE"
-            return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+        page = state.instrument_oled_page
+        if page == 0:
+            # Page 0: SCALE/ROOT/RANGE/AFTRCH/OCTAVE (normal) | OSC/CUTOFF/LEN/RESO/VEL (shift)
+            if event.key == 0:
+                ctrl = "OSC" if state.shift_held else "SCALE"
+                new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+            if event.key == 1:
+                ctrl = "CUTOFF" if state.shift_held else "ROOT"
+                new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+            if event.key == 2:
+                ctrl = "BARS" if state.shift_held else "RANGE"
+                new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+            if event.key == 3:
+                if state.shift_held:
+                    # SK4 shift = RESO toggle
+                    new_ctrl = "" if state.instrument_active_ctrl == "RESO" else "RESO"
+                    return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+                else:
+                    # SK4 normal = aftertouch toggle
+                    return _adjust_synth_param(
+                        state, lambda t: dataclasses.replace(t, aftertouch=not t.aftertouch)
+                    )
+            if event.key == 4:
+                if state.shift_held:
+                    return dataclasses.replace(state, vel_sensitive=not state.vel_sensitive)
+                new_ctrl = "" if state.instrument_active_ctrl == "OCTAVE" else "OCTAVE"
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+        elif page == 1:
+            # Page 1 (arp): ARP_ON / ARP_MODE / ARP_CLEAR / ARP_RATE / ARP_OCTAVES
+            if event.key == 0:
+                return _adjust_synth_param(
+                    state, lambda t: dataclasses.replace(t, arp_on=not t.arp_on)
+                )
+            if event.key == 1:
+                new_ctrl = "" if state.instrument_active_ctrl == "ARP_MODE" else "ARP_MODE"
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+            if event.key == 2:
+                # CLEAR arp sequence — resets to empty; for now just a placeholder
+                return state
+            if event.key == 3:
+                new_ctrl = "" if state.instrument_active_ctrl == "ARP_RATE" else "ARP_RATE"
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+            if event.key == 4:
+                new_ctrl = "" if state.instrument_active_ctrl == "ARP_OCT" else "ARP_OCT"
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+        elif page == 2:
+            # Page 2 (chord): CHORD_ON / CHORD_TYPE / — / — / —
+            if event.key == 0:
+                return _adjust_synth_param(
+                    state, lambda t: dataclasses.replace(t, chord_on=not t.chord_on)
+                )
+            if event.key == 1:
+                new_ctrl = "" if state.instrument_active_ctrl == "CHORD_TYPE" else "CHORD_TYPE"
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
     else:
+        # Drum track: SK4 is BACK
+        if event.key == 3:
+            state = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
+            armed = state.saved_armed_tracks if state.saved_armed_tracks is not None else state.armed_tracks
+            return dataclasses.replace(state, mode=Mode.SESSION, instrument_active_ctrl="",
+                                       armed_tracks=armed, saved_armed_tracks=None)
         if event.key == 0:
             new_ctrl = "" if state.instrument_active_ctrl == "BARS" else "BARS"
             return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
@@ -1153,7 +1271,7 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
         if event.key == 2:
             new_ctrl = "" if state.instrument_active_ctrl == "SIZE" else "SIZE"
             return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-        if event.key == 4:  # SK5: MONO/VEL toggle (normal) | CLEAR (shift)
+        if event.key == 4:
             if state.shift_held:
                 return _clear_armed_loops(state)
             return dataclasses.replace(state, vel_sensitive=not state.vel_sensitive)
@@ -1296,6 +1414,32 @@ def _instrument_encoder(state: AppState, event: EncoderTurned) -> AppState:
         return _adjust_synth_scale(state, event.delta)
     if ctrl == "ROOT":
         return _adjust_synth_root(state, event.delta)
+    if ctrl == "ARP_MODE":
+        d = 1 if event.delta > 0 else -1
+        def cycle_arp_mode(track: SynthTrack) -> SynthTrack:
+            idx = _ARP_MODES.index(track.arp_mode) if track.arp_mode in _ARP_MODES else 0
+            new_idx = (idx + d) % len(_ARP_MODES)
+            return dataclasses.replace(track, arp_mode=_ARP_MODES[new_idx])
+        return _adjust_synth_param(state, cycle_arp_mode)
+    if ctrl == "ARP_RATE":
+        d = 1 if event.delta > 0 else -1
+        def cycle_arp_rate(track: SynthTrack) -> SynthTrack:
+            idx = _ARP_RATES.index(track.arp_rate) if track.arp_rate in _ARP_RATES else 2
+            new_idx = max(0, min(len(_ARP_RATES) - 1, idx + d))
+            return dataclasses.replace(track, arp_rate=_ARP_RATES[new_idx])
+        return _adjust_synth_param(state, cycle_arp_rate)
+    if ctrl == "ARP_OCT":
+        d = 1 if event.delta > 0 else -1
+        def adjust_arp_oct(track: SynthTrack) -> SynthTrack:
+            return dataclasses.replace(track, arp_octaves=max(1, min(4, track.arp_octaves + d)))
+        return _adjust_synth_param(state, adjust_arp_oct)
+    if ctrl == "CHORD_TYPE":
+        d = 1 if event.delta > 0 else -1
+        def cycle_chord_type(track: SynthTrack) -> SynthTrack:
+            idx = _CHORD_TYPES.index(track.chord_type) if track.chord_type in _CHORD_TYPES else 0
+            new_idx = (idx + d) % len(_CHORD_TYPES)
+            return dataclasses.replace(track, chord_type=_CHORD_TYPES[new_idx])
+        return _adjust_synth_param(state, cycle_chord_type)
     return state
 
 

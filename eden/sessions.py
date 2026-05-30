@@ -123,6 +123,13 @@ def _track_to_dict(track) -> Optional[dict]:
             "root_note": track.root_note,
             "scale": track.scale,
             "quantized": track.quantized,
+            "aftertouch": track.aftertouch,
+            "arp_on": track.arp_on,
+            "arp_mode": track.arp_mode,
+            "arp_rate": track.arp_rate,
+            "arp_octaves": track.arp_octaves,
+            "chord_on": track.chord_on,
+            "chord_type": track.chord_type,
             "loops": [_loop_to_dict(lp) for lp in track.loops],
         }
     return None
@@ -159,6 +166,13 @@ def _dict_to_track(d: Optional[dict]):
             root_note=d.get("root_note", 60),
             scale=d.get("scale", "chromatic"),
             quantized=d.get("quantized", True),
+            aftertouch=d.get("aftertouch", True),
+            arp_on=d.get("arp_on", False),
+            arp_mode=d.get("arp_mode", "up"),
+            arp_rate=d.get("arp_rate", 16),
+            arp_octaves=d.get("arp_octaves", 1),
+            chord_on=d.get("chord_on", False),
+            chord_type=d.get("chord_type", "major"),
         )
     return None
 

@@ -473,7 +473,11 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
             t = state.tracks[armed[0]]
             if isinstance(t, SynthTrack):
                 scale_short = SCALE_SHORT.get(t.scale, t.scale[:5].upper())
-                main_line1 = f"{t.name} {scale_short}/{pitch_name(t.root_note)}"
+                page = state.instrument_oled_page
+                dots = ["○", "○", "○"]
+                dots[page] = "●"
+                page_ind = "".join(dots)
+                main_line1 = f"{t.name} {scale_short}/{pitch_name(t.root_note)} {page_ind}"
             else:
                 main_line1 = t.name if t is not None else "EMPTY"
         else:
@@ -512,16 +516,20 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
         first_spb = first_numer * (first_size // 4)
         page_label = "P" if (is_interleaved and first_spb > 32) else ("B" if is_interleaved else "P")
 
-        # OLED line2: FREE synth → write-head fraction; QUANT synth/drum → page progress
+        # OLED line2: FREE synth → recording status; QUANT synth/drum → page progress
         first_track_for_line2 = state.tracks[armed[0]] if armed else None
         if (isinstance(first_track_for_line2, SynthTrack)
                 and not is_interleaved
                 and not first_track_for_line2.quantized):
-            # FREE piano mode: show write-head position "N/total Lx"
-            loop_for_line2 = first_track_for_line2.loops[state.selected_loop]
-            step_count = loop_for_line2.step_count
-            cursor = state.step_cursor % step_count if step_count > 0 else 0
-            main_line2 = f"{cursor + 1}/{step_count} L{state.selected_loop + 1}"
+            loop_num = state.selected_loop + 1
+            if state.free_recording:
+                cursor = state.step_cursor
+                main_line2 = f"● REC {cursor}  L{loop_num}"
+            elif state.free_record_pending:
+                countdown = 32 - state.playhead
+                main_line2 = f"ARM {countdown}st  L{loop_num}"
+            else:
+                main_line2 = f"FREE PLAY  L{loop_num}"
         else:
             # QUANT step mode and drums: show which page/measure you're on
             main_line2 = f"{page_label}{view_m + 1}/{max_pages} L{state.selected_loop + 1}"
@@ -536,38 +544,68 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
             shift = state.shift_held
             scale_short = SCALE_SHORT.get(first_track.scale, first_track.scale[:5].upper())
             root_color_val = NOTE_COLORS.get(first_track.root_note % 12, _OLED_DIM)
-            if shift:
-                # Shift page: OSC / CUTOFF / RESO / (BACK) / VEL
-                osc_color    = _OLED_ACTIVE if ctrl == "OSC"    else _OLED_DIM
-                cutoff_color = _OLED_ACTIVE if ctrl == "CUTOFF" else _OLED_DIM
-                reso_color   = _OLED_ACTIVE if ctrl == "RESO"   else _OLED_DIM
-                cutoff_hz = first_track.filter_cutoff
-                cutoff_str = f"{int(cutoff_hz)}Hz" if cutoff_hz < 1000 else f"{cutoff_hz/1000:.1f}k"
-                _set(OLED_BTN1_TITLE, "OSC", osc_color)
-                _set(OLED_BTN1_VALUE, first_track.osc_type.upper()[:4])
-                _set(OLED_BTN2_TITLE, "CUTOFF", cutoff_color)
-                _set(OLED_BTN2_VALUE, cutoff_str)
-                _set(OLED_BTN3_TITLE, "LEN", _OLED_ACTIVE if ctrl == "BARS" else _OLED_DIM)
-                _set(OLED_BTN3_VALUE, f"{first_bars}bar" + ("s" if first_bars != 1 else ""))
-                vel_color = _OLED_ACTIVE if state.vel_sensitive else _OLED_DIM
-                _set(OLED_BTN5_TITLE, "VEL" if state.vel_sensitive else "MONO", vel_color)
-            else:
-                # Normal page: SCALE / ROOT / RANGE / (BACK) / OCTAVE
-                scale_color  = _OLED_ACTIVE if ctrl == "SCALE"  else _OLED_DIM
-                root_color   = _OLED_ACTIVE if ctrl == "ROOT"   else root_color_val
-                range_color  = _OLED_ACTIVE if ctrl == "RANGE"  else _OLED_DIM
-                octave_color = _OLED_ACTIVE if ctrl == "OCTAVE" else _OLED_DIM
-                _set(OLED_BTN1_TITLE, "SCALE", scale_color)
-                _set(OLED_BTN1_VALUE, scale_short)
-                _set(OLED_BTN2_TITLE, "ROOT", root_color)
-                _set(OLED_BTN2_VALUE, pitch_name(first_track.root_note))
-                _set(OLED_BTN3_TITLE, "RANGE", range_color)
-                rng = state.pitch_window_offset
-                _set(OLED_BTN3_VALUE, f"+{rng}" if rng >= 0 else str(rng))
-                oct_val = state.octave_offset
-                oct_str = f"+{oct_val}" if oct_val >= 0 else str(oct_val)
-                _set(OLED_BTN5_TITLE, "OCTAVE", octave_color)
-                _set(OLED_BTN5_VALUE, oct_str)
+            page = state.instrument_oled_page
+            if page == 0:
+                if shift:
+                    # Page 0 shift: OSC / CUTOFF / LEN / RESO / VEL
+                    osc_color    = _OLED_ACTIVE if ctrl == "OSC"    else _OLED_DIM
+                    cutoff_color = _OLED_ACTIVE if ctrl == "CUTOFF" else _OLED_DIM
+                    reso_color   = _OLED_ACTIVE if ctrl == "RESO"   else _OLED_DIM
+                    cutoff_hz = first_track.filter_cutoff
+                    cutoff_str = f"{int(cutoff_hz)}Hz" if cutoff_hz < 1000 else f"{cutoff_hz/1000:.1f}k"
+                    _set(OLED_BTN1_TITLE, "OSC", osc_color)
+                    _set(OLED_BTN1_VALUE, first_track.osc_type.upper()[:4])
+                    _set(OLED_BTN2_TITLE, "CUTOFF", cutoff_color)
+                    _set(OLED_BTN2_VALUE, cutoff_str)
+                    _set(OLED_BTN3_TITLE, "LEN", _OLED_ACTIVE if ctrl == "BARS" else _OLED_DIM)
+                    _set(OLED_BTN3_VALUE, f"{first_bars}bar" + ("s" if first_bars != 1 else ""))
+                    _set(OLED_BTN4_TITLE, "RESO", reso_color)
+                    _set(OLED_BTN4_VALUE, f"{first_track.filter_res:.2f}")
+                    vel_color = _OLED_ACTIVE if state.vel_sensitive else _OLED_DIM
+                    _set(OLED_BTN5_TITLE, "VEL" if state.vel_sensitive else "MONO", vel_color)
+                else:
+                    # Page 0 normal: SCALE / ROOT / RANGE / AFTRCH / OCTAVE
+                    scale_color  = _OLED_ACTIVE if ctrl == "SCALE"  else _OLED_DIM
+                    root_color   = _OLED_ACTIVE if ctrl == "ROOT"   else root_color_val
+                    range_color  = _OLED_ACTIVE if ctrl == "RANGE"  else _OLED_DIM
+                    aftrch_color = _OLED_ACTIVE if first_track.aftertouch else _OLED_DIM
+                    octave_color = _OLED_ACTIVE if ctrl == "OCTAVE" else _OLED_DIM
+                    _set(OLED_BTN1_TITLE, "SCALE", scale_color)
+                    _set(OLED_BTN1_VALUE, scale_short)
+                    _set(OLED_BTN2_TITLE, "ROOT", root_color)
+                    _set(OLED_BTN2_VALUE, pitch_name(first_track.root_note))
+                    _set(OLED_BTN3_TITLE, "RANGE", range_color)
+                    rng = state.pitch_window_offset
+                    _set(OLED_BTN3_VALUE, f"+{rng}" if rng >= 0 else str(rng))
+                    _set(OLED_BTN4_TITLE, "AFTRCH", aftrch_color)
+                    _set(OLED_BTN4_VALUE, "ON" if first_track.aftertouch else "OFF")
+                    oct_val = state.octave_offset
+                    oct_str = f"+{oct_val}" if oct_val >= 0 else str(oct_val)
+                    _set(OLED_BTN5_TITLE, "OCTAVE", octave_color)
+                    _set(OLED_BTN5_VALUE, oct_str)
+            elif page == 1:
+                # Page 1: ARP
+                arp_on_color   = _OLED_ACTIVE if first_track.arp_on   else _OLED_DIM
+                mode_color     = _OLED_ACTIVE if ctrl == "ARP_MODE"   else _OLED_DIM
+                rate_color     = _OLED_ACTIVE if ctrl == "ARP_RATE"   else _OLED_DIM
+                oct_color      = _OLED_ACTIVE if ctrl == "ARP_OCT"    else _OLED_DIM
+                _set(OLED_BTN1_TITLE, "ARP", arp_on_color)
+                _set(OLED_BTN1_VALUE, "ON" if first_track.arp_on else "OFF")
+                _set(OLED_BTN2_TITLE, "MODE", mode_color)
+                _set(OLED_BTN2_VALUE, first_track.arp_mode.upper()[:5])
+                _set(OLED_BTN3_TITLE, "CLEAR", _OLED_DIM)
+                _set(OLED_BTN4_TITLE, "RATE", rate_color)
+                _set(OLED_BTN4_VALUE, f"1/{first_track.arp_rate}")
+                _set(OLED_BTN5_TITLE, "OCTAVES", oct_color)
+                _set(OLED_BTN5_VALUE, str(first_track.arp_octaves))
+            elif page == 2:
+                # Page 2: CHORD
+                chord_on_color   = _OLED_ACTIVE if first_track.chord_on   else _OLED_DIM
+                ctype_color      = _OLED_ACTIVE if ctrl == "CHORD_TYPE"   else _OLED_DIM
+                _set(OLED_BTN1_TITLE, "CHORD", chord_on_color)
+                _set(OLED_BTN1_VALUE, "ON" if first_track.chord_on else "OFF")
+                _set(OLED_BTN2_TITLE, "TYPE", ctype_color)
+                _set(OLED_BTN2_VALUE, first_track.chord_type.upper()[:5])
         else:
             bars_color  = _OLED_ACTIVE if ctrl == "BARS"  else _OLED_DIM
             numer_color = _OLED_ACTIVE if ctrl == "NUMER" else _OLED_DIM
@@ -585,9 +623,6 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
             else:
                 vel_color = _OLED_ACTIVE if state.vel_sensitive else _OLED_DIM
                 _set(OLED_BTN5_TITLE, "VEL" if state.vel_sensitive else "MONO", vel_color)
-
-        if isinstance(first_track, SynthTrack):
-            _set(OLED_BTN4_TITLE, "< BACK", _OLED_DIM)
 
     return out
 
