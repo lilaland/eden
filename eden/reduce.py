@@ -449,11 +449,13 @@ def _new_slot_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
 
 
 def _free_piano_init_offset(tracks: tuple) -> int:
-    """Return the pitch_window_offset that puts the root's octave-C as leftmost key
-    for the first FREE SynthTrack found, or 0 if none."""
+    """Return pitch_window_offset that centres root's octave-C at column 7 of 16.
+
+    Column 7 puts middle C roughly in the middle of the visible keyboard.
+    """
     for track in tracks:
         if isinstance(track, SynthTrack) and not track.quantized:
-            return (track.root_note // 12) * 7
+            return max(0, (track.root_note // 12) * 7 - 7)
     return 0
 
 

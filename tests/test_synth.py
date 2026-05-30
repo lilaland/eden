@@ -433,7 +433,7 @@ def _free_synth_state():
     s = dataclasses.replace(s, tracks=tuple(tracks),
                             armed_tracks=(0,), mode=Mode.INSTRUMENT,
                             instrument_submode=InstrumentSubmode.STEPS,
-                            pitch_window_offset=35)
+                            pitch_window_offset=28)
     return s
 
 
@@ -469,8 +469,8 @@ def test_synth_free_sk5_opens_octave():
 
 def test_synth_free_pad_white_key_records_pitch():
     s = _free_synth_state()
-    # Pad 0 = first white key = C of root's octave (root=60=C4, base=60)
-    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    # offset=28: pad 7 = white_idx 35 = C4=60
+    s2 = reduce(s, PadPressed(pad_index=7, velocity=100))
     loop = s2.tracks[0].loops[0]
     assert loop.steps[0].on
     assert loop.steps[0].pitch == 60  # C4
@@ -478,8 +478,8 @@ def test_synth_free_pad_white_key_records_pitch():
 
 def test_synth_free_pad_black_key_records_pitch():
     s = _free_synth_state()
-    # Pad 16 = first black key = C# (semitone 1 above base C4=60)
-    s2 = reduce(s, PadPressed(pad_index=16, velocity=100))
+    # offset=28: top-row pad 23 (16+7) = black_key_at(35) = C#4=61
+    s2 = reduce(s, PadPressed(pad_index=23, velocity=100))
     loop = s2.tracks[0].loops[0]
     assert loop.steps[0].on
     assert loop.steps[0].pitch == 61  # C#4
@@ -487,17 +487,18 @@ def test_synth_free_pad_black_key_records_pitch():
 
 def test_synth_free_dead_key_no_note():
     s = _free_synth_state()
-    # Pad 18 (16 + 2) = E# dead position — no step written
-    s2 = reduce(s, PadPressed(pad_index=18, velocity=100))
+    # offset=28: top-row pad 23+2=25 would be E# dead; pad 16+9=25 → black_key_at(37)=None
+    s2 = reduce(s, PadPressed(pad_index=25, velocity=100))
     loop = s2.tracks[0].loops[0]
     assert not loop.steps[0].on  # dead key, unchanged
 
 
 def test_synth_free_octave_offset_shifts_pitch():
+    # offset=28: pad 7 = white_idx 35 = C4; octave_offset=1 → C5=72
     s = dataclasses.replace(_free_synth_state(), octave_offset=1)
-    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    s2 = reduce(s, PadPressed(pad_index=7, velocity=100))
     loop = s2.tracks[0].loops[0]
-    assert loop.steps[0].pitch == 72  # C5 (one octave up)
+    assert loop.steps[0].pitch == 72  # C5 (one octave up from C4)
 
 
 def test_synth_quantized_field_persisted():
