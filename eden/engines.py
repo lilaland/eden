@@ -149,6 +149,7 @@ class SynthVoice:
         "_env_level", "_env_stage", "_env_release_from",
         "_attack_inc", "_decay_inc", "_sustain_level", "_release_samples",
         "_osc_type", "_volume",
+        "_vel_floor", "_aftertouch",  # _vel_floor = initial amplitude; _aftertouch = smoothed gain
         "_filt_a1", "_filt_a2", "_filt_a3",
         "_filt_ic1eq", "_filt_ic2eq",
     )
@@ -182,9 +183,11 @@ class SynthVoice:
         self._sustain_level    = sustain
         self._release_samples  = max(1, int(release * sr))
 
-        self._osc_type = getattr(track_state, "osc_type", "saw")
-        volume         = getattr(track_state, "volume",   0.8)
-        self._volume   = volume * float(np.clip(velocity, 0.0, 1.0))
+        self._osc_type  = getattr(track_state, "osc_type", "saw")
+        vel_gain        = float(np.clip(velocity, 0.0, 1.0))
+        self._volume    = getattr(track_state, "volume", 0.8)
+        self._vel_floor = vel_gain   # D0 can only raise amplitude above this
+        self._aftertouch = vel_gain  # current smoothed amplitude (starts at vel)
 
         # SVF LP filter coefficients (Simper TPT)
         cutoff = getattr(track_state, "filter_cutoff", 8000.0)
@@ -233,6 +236,7 @@ class SynthVoice:
         sustain    = self._sustain_level
         rel_samp   = self._release_samples
         volume     = self._volume
+        at_gain    = self._aftertouch  # snapshot for this block; engine updates between blocks
 
         for i in range(n_frames):
             # Gate countdown → trigger release
@@ -269,7 +273,7 @@ class SynthVoice:
                     env_stage = _ENV_DONE
             # _ENV_SUSTAIN: held, no change
 
-            s = x * env * volume
+            s = x * env * volume * at_gain
             buf[i, 0] += s
             buf[i, 1] += s
 
@@ -286,6 +290,11 @@ class SynthVoice:
 
 _MAX_SYNTH_VOICES = 8
 
+# Aftertouch slew rates (per audio block ≈ 256/44100 s ≈ 5.8 ms)
+# Attack ~40 ms (follow pressure rises quickly), release ~250 ms (prevent sudden drops)
+_AT_ATTACK  = 0.15
+_AT_RELEASE = 0.025
+
 
 class SynthEngine(TrackEngine):
     """
@@ -300,10 +309,19 @@ class SynthEngine(TrackEngine):
         self._trigger_queue: collections.deque = collections.deque(
             maxlen=_MAX_SYNTH_VOICES * 4
         )
+        self._aftertouch_target: float = 0.0  # 0.0 = no pressure yet (inactive)
 
     def note_on(self, pitch: int, velocity: float, gate_samples: int, track_state) -> None:
         max_v = getattr(track_state, "max_voices", _MAX_SYNTH_VOICES)
         self._trigger_queue.append((pitch, velocity, gate_samples, track_state, max_v))
+
+    def note_off(self, pitch: int) -> None:
+        """Trigger release for all voices at the given pitch."""
+        self._trigger_queue.append(("off", pitch))
+
+    def set_aftertouch(self, value: float) -> None:
+        """Update channel pressure gain (0.0-1.0) for all active voices."""
+        self._trigger_queue.append(("at", value))
 
     def fill_block(self, buf: np.ndarray, n_frames: int) -> None:
         # Drain trigger queue
@@ -314,6 +332,15 @@ class SynthEngine(TrackEngine):
                 break
             if item is None:
                 self._voices.clear()
+                continue
+            if isinstance(item, tuple) and len(item) == 2:
+                kind, payload = item
+                if kind == "off":
+                    for v in self._voices:
+                        if v._freq == midi_to_hz(payload) and v._gate_remaining > 1:
+                            v._gate_remaining = 1
+                elif kind == "at":
+                    self._aftertouch_target = float(payload)
                 continue
             pitch, velocity, gate_samples, track_state, max_v = item
             # Steal if at cap: prefer releasing voices, then oldest
@@ -329,6 +356,14 @@ class SynthEngine(TrackEngine):
             self._voices.append(
                 SynthVoice(pitch, velocity, gate_samples, track_state, self._sr)
             )
+
+        # Smooth aftertouch toward target per-voice (each voice has its own vel_floor)
+        at_target = self._aftertouch_target
+        for v in self._voices:
+            effective = max(v._vel_floor, at_target)  # never drops below initial velocity
+            curr = v._aftertouch
+            coeff = _AT_ATTACK if effective > curr else _AT_RELEASE
+            v._aftertouch = curr + coeff * (effective - curr)
 
         # Mix active voices
         alive: list[SynthVoice] = []

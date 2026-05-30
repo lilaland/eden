@@ -54,6 +54,7 @@ from controller_map import (
     TOUCHBAR_PITCHWHEEL_CHANNEL,
 )
 from eden.events import (
+    AftertouchChanged,
     PadPressed,
     PadReleased,
     EncoderTurned,
@@ -325,6 +326,12 @@ class AtomSQ:
             position = (msg.pitch + 8192) / 16383.0
             if self._event_queue:
                 self._event_queue.put(TouchbarMoved(position=position))
+            return
+
+        # Channel pressure (D0): aftertouch from pads
+        if msg.type == "aftertouch" and msg.channel == 0:
+            if self._event_queue:
+                self._event_queue.put(AftertouchChanged(value=msg.value))
             return
 
         if _DEBUG_MIDI and msg.type == "control_change":

@@ -108,3 +108,8 @@ class TapTempoPressed(Event):
 class PlusMinusPressed(Event):
     button: str   # "+" | "-"
     pressed: bool
+
+
+@dataclass(frozen=True)
+class AftertouchChanged(Event):
+    value: int  # 0-127 channel pressure from hardware

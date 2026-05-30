@@ -41,7 +41,7 @@ def test_synth_track_default_filter():
 def test_synth_track_default_envelope():
     t = SynthTrack(name="SAW", loops=default_track_loops())
     assert t.amp_attack == pytest.approx(0.005)
-    assert t.amp_sustain == pytest.approx(0.7)
+    assert t.amp_sustain == pytest.approx(0.85)
 
 
 def test_synth_track_default_volume():
@@ -132,6 +132,33 @@ def test_create_synth_track_has_16_loops():
     assert len(s2.tracks[2].loops) == 16
 
 
+def test_new_synth_track_inherits_last_scale_and_root():
+    """New SynthTrack picks up last_synth_scale / last_synth_root instead of chromatic/C."""
+    from eden.events import EncoderTurned
+    s = _state_with_empty_slot_and_keys()
+    # Create a first track and arm it so we can change its scale/root
+    s2 = reduce(s, SoftkeyPressed(key=4))
+    # Switch to INSTRUMENT mode on the newly created track and change scale + root
+    s2 = dataclasses.replace(s2, mode=Mode.INSTRUMENT, armed_tracks=(2,),
+                              instrument_active_ctrl="SCALE")
+    s2 = reduce(s2, EncoderTurned(encoder=9, delta=1))   # advance scale
+    s2 = dataclasses.replace(s2, instrument_active_ctrl="ROOT")
+    s2 = reduce(s2, EncoderTurned(encoder=9, delta=2))   # advance root by 2
+    saved_scale = s2.tracks[2].scale
+    saved_root  = s2.tracks[2].root_note
+    assert s2.last_synth_scale == saved_scale
+    assert s2.last_synth_root  == saved_root
+    # Now create a second synth track at slot 3 — should inherit saved values
+    s3 = dataclasses.replace(s2, mode=Mode.SESSION, selected_track=3,
+                              tracks=s2.tracks[:3] + (None,) + s2.tracks[4:],
+                              new_slot_type_idx=1)
+    s3 = reduce(s3, SoftkeyPressed(key=4))
+    new_track = s3.tracks[3]
+    assert isinstance(new_track, SynthTrack)
+    assert new_track.scale    == saved_scale
+    assert new_track.root_note == saved_root
+
+
 # ── Step editing on SynthTrack ────────────────────────────────────────────────
 
 
@@ -165,17 +192,13 @@ def test_synth_step_toggle_off():
 
 
 def test_synth_bottom_row_sets_pitch():
-    # Bottom row (pad 0-15) sets pitch on cursor step (default cursor=0)
+    # Bottom row (pad 0-15) sets pitch on cursor step when step is OFF
     s = _armed_synth_state()
-    # First turn step 0 on via top row so we can check its pitch
-    s2 = reduce(s, PadPressed(pad_index=16, velocity=100))
-    # Now press bottom row pad 0: should set pitch for step_cursor (0)
-    s3 = reduce(s2, PadPressed(pad_index=0, velocity=100))
-    assert s3.tracks[0].loops[0].steps[0].on is True
-    # Pitch should be degree_to_pitch(60, "chromatic", 0) = 60
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    assert s2.tracks[0].loops[0].steps[0].on is True
     from eden.scales import degree_to_pitch
     expected = degree_to_pitch(60, "chromatic", 0)
-    assert s3.tracks[0].loops[0].steps[0].pitches == (expected,)
+    assert s2.tracks[0].loops[0].steps[0].pitches == (expected,)
 
 
 def test_synth_bottom_row_advances_cursor():
@@ -183,6 +206,49 @@ def test_synth_bottom_row_advances_cursor():
     assert s.step_cursor == 0
     s2 = reduce(s, PadPressed(pad_index=5, velocity=100))  # bottom row
     assert s2.step_cursor == 1  # cursor advanced
+
+
+def test_synth_bottom_row_adds_chord_tone():
+    """Pressing a second different pitch on an already-ON step merges chord, cursor stays."""
+    s = _armed_synth_state()
+    # Press pad 0: step 0 OFF → ON with pitch A, cursor advances to 1
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    assert s2.step_cursor == 1
+    # Move cursor back to step 0
+    s2 = dataclasses.replace(s2, step_cursor=0)
+    # Press pad 2 (different pitch): step 0 is ON → add chord tone, cursor stays at 0
+    s3 = reduce(s2, PadPressed(pad_index=2, velocity=100))
+    from eden.scales import degree_to_pitch
+    p0 = degree_to_pitch(60, "chromatic", 0)
+    p2 = degree_to_pitch(60, "chromatic", 2)
+    assert s3.tracks[0].loops[0].steps[0].pitches == (p0, p2)
+    assert s3.step_cursor == 0  # cursor did NOT advance
+
+
+def test_synth_bottom_row_removes_chord_tone():
+    """Pressing an already-present pitch removes it from the chord."""
+    s = _armed_synth_state()
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    s2 = dataclasses.replace(s2, step_cursor=0)
+    s3 = reduce(s2, PadPressed(pad_index=2, velocity=100))  # add 2nd pitch
+    from eden.scales import degree_to_pitch
+    p0 = degree_to_pitch(60, "chromatic", 0)
+    p2 = degree_to_pitch(60, "chromatic", 2)
+    assert s3.tracks[0].loops[0].steps[0].pitches == (p0, p2)
+    # Press pad 0 again: remove p0, only p2 remains
+    s4 = reduce(s3, PadPressed(pad_index=0, velocity=100))
+    assert s4.tracks[0].loops[0].steps[0].pitches == (p2,)
+    assert s4.step_cursor == 0  # still didn't advance
+
+
+def test_synth_bottom_row_remove_last_pitch_turns_step_off():
+    """Removing the last pitch from a chord turns the step off."""
+    s = _armed_synth_state()
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    assert s2.tracks[0].loops[0].steps[0].on
+    s2 = dataclasses.replace(s2, step_cursor=0)
+    s3 = reduce(s2, PadPressed(pad_index=0, velocity=100))  # remove the only pitch
+    assert not s3.tracks[0].loops[0].steps[0].on
 
 
 # ── Synth encoder controls in INSTRUMENT mode ─────────────────────────────────
@@ -550,13 +616,14 @@ def test_oled_synth_free_line2_recording_shows_rec():
     assert "L1" in line2
 
 
-def test_oled_synth_free_line2_free_play_shows_free_play():
+def test_oled_synth_free_line2_free_play_shows_beat_counter():
     from controller_map import OLED_MAIN_LINE2
     s = dataclasses.replace(_free_synth_state(), free_recording=False)
     out = render_oled(s)
     line2 = out[OLED_MAIN_LINE2][0]
-    assert "FREE PLAY" in line2
+    assert "/" in line2   # beat/numer format
     assert "L1" in line2
+    assert "FREE PLAY" not in line2
 
 
 def test_oled_synth_free_line2_pending_shows_arm():
@@ -594,6 +661,28 @@ def test_free_pad_press_writes_note_no_cursor_advance():
     s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
     assert s2.tracks[0].loops[0].steps[0].on
     assert s2.step_cursor == 0  # cursor stays until release
+
+
+def test_free_initial_recording_does_not_auto_start_loop():
+    """During the initial recording pass (no existing loop), loop should NOT enter
+    playing_loops on pad press — playback deferred until recording is finalized."""
+    # Use track slot 2 (no pre-existing playing loop) for a clean test
+    s = default_state()
+    synth = SynthTrack(name="SAW", loops=default_track_loops(), quantized=False)
+    tracks = s.tracks[:2] + (synth,) + s.tracks[3:]
+    s = dataclasses.replace(
+        s,
+        tracks=tracks,
+        armed_tracks=(2,),
+        mode=Mode.INSTRUMENT,
+        instrument_submode=InstrumentSubmode.STEPS,
+        pitch_window_offset=28,
+        free_recording=True,
+    )
+    assert s.free_loop_length == 0
+    assert (2, 0) not in s.playing_loops
+    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
+    assert (2, 0) not in s2.playing_loops
 
 
 def test_free_pad_press_placeholder_gate():
@@ -733,49 +822,46 @@ def test_piano_layout_slides_correctly():
 
 
 def test_piano_offset_clamps_at_zero():
-    """- button at offset=0 stays at 0 (can't scroll into negative/invalid range)."""
+    """+ button at offset=0 stays at 0 (+ decreases offset, floor is 0)."""
     from eden.events import PlusMinusPressed
     s = dataclasses.replace(_free_synth_state(), pitch_window_offset=0)
-    s2 = reduce(s, PlusMinusPressed(button="-", pressed=True))
+    s2 = reduce(s, PlusMinusPressed(button="+", pressed=True))
     assert s2.pitch_window_offset == 0
 
 
 def test_piano_offset_clamps_at_max():
-    """+ button at max offset stays at 59 (col 15 would be G9 = MIDI 127)."""
+    """- button at max offset stays at 59 (- increases offset, ceiling is 59)."""
     from eden.events import PlusMinusPressed
     s = dataclasses.replace(_free_synth_state(), pitch_window_offset=59)
-    s2 = reduce(s, PlusMinusPressed(button="+", pressed=True))
+    s2 = reduce(s, PlusMinusPressed(button="-", pressed=True))
     assert s2.pitch_window_offset == 59
 
 
-# ── RANGE +/- buttons (granular in FREE mode) ─────────────────────────────────
+# ── RANGE +/- buttons (granular in FREE mode, flipped: + lowers, - raises) ───
 
 
-def test_range_plus_free_slides_keyboard_left():
-    """+ in FREE mode increments white key index by 1 (keyboard slides left)."""
+def test_range_plus_free_decrements_offset():
+    """+ in FREE mode decrements white key index by 1 (shows lower notes)."""
     from eden.events import PlusMinusPressed
     s = dataclasses.replace(_free_synth_state(), pitch_window_offset=35)
     s2 = reduce(s, PlusMinusPressed(button="+", pressed=True))
-    assert s2.pitch_window_offset == 36  # C4 as leftmost → D4 as leftmost
+    assert s2.pitch_window_offset == 34
 
 
-def test_range_minus_free_slides_keyboard_right():
-    """- in FREE mode decrements white key index by 1 (keyboard slides right)."""
+def test_range_minus_free_increments_offset():
+    """- in FREE mode increments white key index by 1 (shows higher notes)."""
     from eden.events import PlusMinusPressed
-    s = dataclasses.replace(_free_synth_state(), pitch_window_offset=36)
+    s = dataclasses.replace(_free_synth_state(), pitch_window_offset=35)
     s2 = reduce(s, PlusMinusPressed(button="-", pressed=True))
-    assert s2.pitch_window_offset == 35  # D4 as leftmost → C4 as leftmost
+    assert s2.pitch_window_offset == 36
 
 
-def test_range_plus_quant_still_shifts_scale_octave():
-    """+ button in QUANT mode still jumps a full scale octave (unchanged)."""
+def test_range_plus_quant_shifts_one_degree():
+    """+ button in QUANT mode shifts one degree (not a full scale octave)."""
     from eden.events import PlusMinusPressed
-    from eden.scales import SCALES
-    s = dataclasses.replace(_armed_synth_state(), pitch_window_offset=0)
-    track = s.tracks[s.selected_track]
-    scale_len = len(SCALES.get(track.scale, SCALES["chromatic"]))
+    s = dataclasses.replace(_armed_synth_state(), pitch_window_offset=10)
     s2 = reduce(s, PlusMinusPressed(button="+", pressed=True))
-    assert s2.pitch_window_offset == scale_len
+    assert s2.pitch_window_offset == 9  # decremented by 1
 
 
 # ── InstrumentUndo ────────────────────────────────────────────────────────────
@@ -889,10 +975,9 @@ def test_free_clock_wrap_starts_recording():
     assert s2.free_record_pending is False
 
 
-def test_free_clock_wrap_clears_loop():
-    """Recording start clears the selected loop."""
-    s = _free_synth_state()  # already has free_recording=True via _instrument_reset path
-    # Put a note in manually
+def test_free_clock_wrap_starts_overdub_on_existing_loop():
+    """Recording start on a non-empty loop enters overdub (preserves existing notes)."""
+    s = _free_synth_state()
     from eden.state import StepNote
     loop = s.tracks[0].loops[0]
     note_step = StepNote(on=True, pitches=(60,))
@@ -906,7 +991,11 @@ def test_free_clock_wrap_clears_loop():
                                       playhead=31)
     s2 = reduce(s_with_note, ClockTicked())
     assert s2.free_recording is True
-    assert not any(step.on for step in s2.tracks[0].loops[0].steps)
+    # Existing note is preserved — this is overdub, not a fresh clear
+    assert s2.tracks[0].loops[0].steps[0].on is True
+    assert s2.tracks[0].loops[0].steps[0].pitches == (60,)
+    # free_loop_length set to loop's existing step count
+    assert s2.free_loop_length == loop.step_count
 
 
 def test_free_stop_recording_finalizes_length():
@@ -919,20 +1008,37 @@ def test_free_stop_recording_finalizes_length():
 
 
 def test_free_stop_recording_rounds_up_multi_bar():
-    """When cursor is past one bar, length rounds up to 2 bars."""
+    """When cursor is past one bar AND bar 2 has notes, loop stays at 2 bars."""
     s = dataclasses.replace(_free_synth_state(), step_cursor=17)
-    # Need some notes in the loop so it's not empty
     from eden.state import StepNote
     loop = s.tracks[0].loops[0]
-    new_steps = list(loop.steps)
+    # Extend to 32 steps and place notes in both bars
+    new_steps = list(loop.steps) + [StepNote.off()] * 16  # grow to 32
     new_steps[0] = StepNote(on=True, pitches=(60,))
-    new_loop = dataclasses.replace(loop, steps=tuple(new_steps))
+    new_steps[16] = StepNote(on=True, pitches=(62,))  # note in bar 2
+    new_loop = dataclasses.replace(loop, steps=tuple(new_steps), bars=2)
     new_loops = s.tracks[0].loops[:0] + (new_loop,) + s.tracks[0].loops[1:]
     new_track = dataclasses.replace(s.tracks[0], loops=new_loops)
     s = dataclasses.replace(s, tracks=s.tracks[:0] + (new_track,) + s.tracks[1:])
     s2 = reduce(s, TransportPressed(button="REC", pressed=True))
     assert s2.free_recording is False
     assert s2.tracks[0].loops[0].step_count == 32  # 2 bars × 16 steps
+
+
+def test_free_stop_recording_trims_blank_trailing_bar():
+    """Blank trailing bars are trimmed: cursor in bar 2 but no notes there → 1 bar."""
+    s = dataclasses.replace(_free_synth_state(), step_cursor=17)
+    from eden.state import StepNote
+    loop = s.tracks[0].loops[0]
+    new_steps = list(loop.steps)
+    new_steps[0] = StepNote(on=True, pitches=(60,))   # note only in bar 1
+    new_loop = dataclasses.replace(loop, steps=tuple(new_steps))
+    new_loops = s.tracks[0].loops[:0] + (new_loop,) + s.tracks[0].loops[1:]
+    new_track = dataclasses.replace(s.tracks[0], loops=new_loops)
+    s = dataclasses.replace(s, tracks=s.tracks[:0] + (new_track,) + s.tracks[1:])
+    s2 = reduce(s, TransportPressed(button="REC", pressed=True))
+    assert s2.free_recording is False
+    assert s2.tracks[0].loops[0].step_count == 16  # trimmed to 1 bar
 
 
 def test_free_shift_rec_resets_pattern():

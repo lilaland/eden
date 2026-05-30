@@ -641,3 +641,79 @@ def test_render_button_leds_song_on_when_session_mode():
     s = default_state()  # default mode is SESSION
     leds = render_button_leds(s)
     assert leds[NATIVE_LED_SONG] is True
+
+
+# ── SynthTrack OLED page indicator ───────────────────────────────────────────
+
+
+def _synth_armed_state(page: int = 0, quantized: bool = True) -> AppState:
+    """INSTRUMENT mode with a SynthTrack armed on track 2."""
+    s = default_state()
+    synth = SynthTrack(name="LEAD", loops=default_track_loops(), quantized=quantized)
+    tracks = s.tracks[:2] + (synth,) + s.tracks[3:]
+    return dataclasses.replace(
+        s,
+        mode=Mode.INSTRUMENT,
+        instrument_submode=InstrumentSubmode.STEPS,
+        armed_tracks=(2,),
+        tracks=tracks,
+        instrument_oled_page=page,
+    )
+
+
+def test_synth_oled_page0_indicator():
+    """Page 0 → first dot filled: '●○○' in main_line1."""
+    oled = render_oled(_synth_armed_state(page=0))
+    line1 = _t(oled, OLED_MAIN_LINE1)
+    assert "●○○" in line1
+
+
+def test_synth_oled_page1_indicator():
+    """Page 1 → middle dot filled: '○●○' in main_line1."""
+    oled = render_oled(_synth_armed_state(page=1))
+    line1 = _t(oled, OLED_MAIN_LINE1)
+    assert "○●○" in line1
+
+
+def test_synth_oled_page2_indicator():
+    """Page 2 → last dot filled: '○○●' in main_line1."""
+    oled = render_oled(_synth_armed_state(page=2))
+    line1 = _t(oled, OLED_MAIN_LINE1)
+    assert "○○●" in line1
+
+
+def test_synth_oled_page1_arp_controls():
+    """Page 1 shows ARP toggle on SK1 and RATE on SK4."""
+    oled = render_oled(_synth_armed_state(page=1))
+    assert _t(oled, OLED_BTN1_TITLE) == "ARP"
+    assert _t(oled, OLED_BTN4_TITLE) == "RATE"
+
+
+def test_synth_oled_page2_chord_controls():
+    """Page 2 shows CHORD toggle on SK1, TYPE on SK2, VOICES on SK3."""
+    oled = render_oled(_synth_armed_state(page=2))
+    assert _t(oled, OLED_BTN1_TITLE) == "CHORD"
+    assert _t(oled, OLED_BTN2_TITLE) == "TYPE"
+    assert _t(oled, OLED_BTN3_TITLE) == "VOICES"
+
+
+def test_synth_oled_page2_no_sk4_sk5():
+    """Page 2 does not set SK4/SK5 — delta renderer will clear them."""
+    oled = render_oled(_synth_armed_state(page=2))
+    assert OLED_BTN4_TITLE not in oled
+    assert OLED_BTN5_TITLE not in oled
+
+
+def test_synth_free_mode_line2_shows_beat_counter():
+    """FREE (non-quantized) synth in INSTRUMENT mode shows beat/measure progress."""
+    oled = render_oled(_synth_armed_state(page=0, quantized=False))
+    line2 = _t(oled, OLED_MAIN_LINE2)
+    assert "/" in line2  # beat/numer format
+    assert "L1" in line2
+
+
+def test_synth_free_recording_prefix():
+    """While free_recording, main_line1 starts with '● '."""
+    s = dataclasses.replace(_synth_armed_state(page=0, quantized=False), free_recording=True)
+    oled = render_oled(s)
+    assert _t(oled, OLED_MAIN_LINE1).startswith("● ")

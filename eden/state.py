@@ -73,8 +73,8 @@ class SynthTrack:
     osc_type: str = "saw"          # saw / square / sine / triangle
     amp_attack: float = 0.005
     amp_decay: float = 0.1
-    amp_sustain: float = 0.7
-    amp_release: float = 0.2
+    amp_sustain: float = 0.85
+    amp_release: float = 0.4
     filter_cutoff: float = 8000.0  # Hz
     filter_res: float = 0.2        # 0.0–0.99
     volume: float = 0.8
@@ -137,7 +137,7 @@ class AppState:
     metronome_held: bool = False
     tap_times: tuple[float, ...] = ()  # recent Shift+Metronome tap timestamps
     # Velocity mode: False = mono (always 100), True = use actual pad velocity
-    vel_sensitive: bool = False
+    vel_sensitive: bool = True
     # SESSION volume control
     session_active_ctrl: str = ""    # "" | "VOL"
     session_selected_row: int = 0    # 0 = track row (pads 0-15), 1 = loop row (pads 16-31)
@@ -161,6 +161,10 @@ class AppState:
     # FREE recording state
     free_recording: bool = False
     free_record_pending: bool = False
+    free_loop_length: int = 0  # 0 = first pass (growing); >0 = overdub (fixed wrap length)
+    # Last-used scale/root — shared by FREE and QUANT; applied to newly created SynthTracks
+    last_synth_scale: str = "chromatic"
+    last_synth_root: int = 60
 
 
 # ── Factory functions ─────────────────────────────────────────────────────────

@@ -40,9 +40,9 @@ from eden.clock import SequencerClock
 from eden.reduce import reduce
 from eden.render import render_pads, render_oled, render_button_leds
 from eden.scales import degree_to_pitch, white_idx_to_midi, black_key_at
-from eden.arp import expand_chord, compute_arp_sequence
+from eden.arp import expand_chord, compute_arp_sequence, arp_ticks_per_note
 from eden.state import default_state, AppState, DrumTrack, SynthTrack, InstrumentSubmode, Mode
-from eden.events import ClockTicked, InstrumentReset, InstrumentUndo, PadPressed, PadReleased, PlusMinusPressed, SessionLoaded, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
+from eden.events import AftertouchChanged, ClockTicked, InstrumentReset, InstrumentUndo, PadPressed, PadReleased, PlusMinusPressed, SessionLoaded, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
 from eden.state import Mode
 import eden.sessions as sessions
 
@@ -90,6 +90,8 @@ class EdenApp:
 
         # FREE piano mode: track pad-down timestamps for hold-duration recording
         self._free_pad_down_times: dict[int, float] = {}
+        # FREE arp mode: held pads per track so multi-pad arps cycle all pitches
+        self._held_arp_pitches: dict[int, dict[int, int]] = {}  # track_idx → {pad_idx → pitch}
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -185,6 +187,14 @@ class EdenApp:
             if isinstance(event, PadPressed) and self._state.mode == Mode.INSTRUMENT:
                 self._maybe_trigger_synth_preview(event)
 
+            # Aftertouch note-off: release held preview note when pad is lifted.
+            if isinstance(event, PadReleased) and self._state.mode == Mode.INSTRUMENT:
+                self._maybe_release_synth_preview(event)
+
+            # Channel pressure → update gain on active synth voices.
+            if isinstance(event, AftertouchChanged):
+                self._apply_aftertouch(event.value)
+
     def _is_free_piano_mode(self) -> bool:
         """True when INSTRUMENT mode is active with an unquantized SynthTrack armed."""
         if self._state.mode != Mode.INSTRUMENT or not self._state.armed_tracks:
@@ -225,19 +235,119 @@ class EdenApp:
         engine = self._mixer.get_engine(track_idx)
         if engine is None:
             return
-        gate = max(1, int(0.25 * self._mixer._sr))
-        amplitude = event.velocity / 127.0
+        # FREE mode: gate is effectively ∞ — pad release triggers note_off regardless of aftertouch
+        # STEPS/PADS mode: short preview so the note doesn't linger
+        if not track.quantized:
+            gate = max(1, int(30.0 * self._mixer._sr))
+            amplitude = event.velocity / 127.0 if self._state.vel_sensitive else 1.0
+        else:
+            gate = max(1, int(0.25 * self._mixer._sr))
+            amplitude = event.velocity / 127.0
 
-        # Apply chord / arp transformations for live audio feedback
+        # Chord expansion (applies in both FREE and STEPS/PADS modes)
         pitches: tuple[int, ...] = (pitch,)
         if track.chord_on:
             pitches = expand_chord(pitches, track.chord_type)
-        if track.arp_on:
-            pitches = compute_arp_sequence(pitches, track.arp_mode, track.arp_octaves)
-            # Fire all arp notes simultaneously as preview (no time-stagger in live mode)
+
+        # In FREE mode with arp on: drive the arp via the clock tick scheduler.
+        # Accumulate all held pads so holding multiple keys arpeggios through all of them.
+        if track.arp_on and not track.quantized:
+            held = self._held_arp_pitches.setdefault(track_idx, {})
+            held[pad] = pitch
+            all_pitches: tuple[int, ...] = tuple(sorted(set(held.values())))
+            if track.chord_on:
+                all_pitches = expand_chord(all_pitches, track.chord_type)
+            seq = compute_arp_sequence(all_pitches, track.arp_mode, track.arp_octaves)
+            if seq:
+                tpn = arp_ticks_per_note(track.arp_rate)
+                bpm = self._state.tempo_bpm
+                arp_gate = max(1, int(0.8 * tpn * 60.0 / bpm / 8.0 * self._mixer._sr))
+                self._scheduler.merge_live_arp(
+                    track_idx, seq, engine, amplitude, tpn, arp_gate, track
+                )
+            return
 
         for p in pitches:
             engine.note_on(p, amplitude, gate, track)
+
+    def _apply_aftertouch(self, value: int) -> None:
+        """Forward channel pressure to all armed synth engines that have aftertouch enabled."""
+        if not self._state.armed_tracks:
+            return
+        from eden.engines import SynthEngine
+        gain = value / 127.0
+        for track_idx in self._state.armed_tracks:
+            track = self._state.tracks[track_idx]
+            if not isinstance(track, SynthTrack) or not track.aftertouch:
+                continue
+            engine = self._mixer.get_engine(track_idx)
+            if isinstance(engine, SynthEngine):
+                engine.set_aftertouch(gain)
+
+    def _maybe_release_synth_preview(self, event: PadReleased) -> None:
+        """Release a held aftertouch preview note on pad up."""
+        if not self._state.armed_tracks:
+            return
+        track_idx = self._state.armed_tracks[0]
+        track = self._state.tracks[track_idx]
+        if not isinstance(track, SynthTrack) or track.quantized:
+            return  # quantized modes use short gate, no note_off needed
+        from eden.engines import SynthEngine
+        engine = self._mixer.get_engine(track_idx)
+        if not isinstance(engine, SynthEngine):
+            return
+        pad = event.pad_index
+        if not track.quantized:
+            offset = self._state.pitch_window_offset
+            if pad < 16:
+                pitch = white_idx_to_midi(offset + pad)
+                if pitch < 0 or pitch > 127:
+                    return
+            else:
+                pitch = black_key_at(offset + (pad - 16))
+                if pitch is None:
+                    return
+        else:
+            submode = self._state.instrument_submode
+            if submode == InstrumentSubmode.PADS:
+                degree = self._state.pitch_window_offset + pad
+            elif submode == InstrumentSubmode.STEPS and pad < 16:
+                degree = self._state.pitch_window_offset + pad
+            else:
+                return
+            pitch = degree_to_pitch(track.root_note, track.scale, degree)
+        pitch = max(0, min(127, pitch + self._state.octave_offset * 12))
+
+        # Live arp: remove this pad from held set; if others still down, update
+        # sequence; if none remain, stop the arp entirely.
+        if track.arp_on:
+            held = self._held_arp_pitches.get(track_idx, {})
+            held.pop(pad, None)
+            if held:
+                all_pitches: tuple[int, ...] = tuple(sorted(set(held.values())))
+                if track.chord_on:
+                    all_pitches = expand_chord(all_pitches, track.chord_type)
+                seq = compute_arp_sequence(all_pitches, track.arp_mode, track.arp_octaves)
+                tpn = arp_ticks_per_note(track.arp_rate)
+                bpm = self._state.tempo_bpm
+                arp_gate = max(1, int(0.8 * tpn * 60.0 / bpm / 8.0 * self._mixer._sr))
+                # Keep existing amplitude from running context; it was set on press
+                existing = self._scheduler._live_arp_tracks.get(track_idx)
+                cur_amplitude = existing["amplitude"] if existing else 1.0
+                if seq:
+                    self._scheduler.merge_live_arp(
+                        track_idx, seq, engine, cur_amplitude, tpn, arp_gate, track
+                    )
+            else:
+                self._held_arp_pitches.pop(track_idx, None)
+                self._scheduler.stop_live_arp(track_idx)
+            return
+
+        pitches: tuple[int, ...] = (pitch,)
+        if track.chord_on:
+            pitches = expand_chord(pitches, track.chord_type)
+        for p in pitches:
+            engine.note_off(p)
 
     # ─── Engine lifecycle ─────────────────────────────────────────────────────
 
@@ -262,6 +372,19 @@ class EdenApp:
         for i, (old_t, new_t) in enumerate(zip(old_tracks, new_tracks)):
             if old_t is new_t:
                 continue
+
+            # Reuse the existing engine when the track type hasn't changed and
+            # no audio-critical parameters changed.  SynthEngine has no init
+            # deps on track data at all; DrumEngine only needs replacement when
+            # the sample name changes.  Replacing engines during FREE recording
+            # (which creates a new track object on every pad press) would kill
+            # active voices and break live arp sequences.
+            if (old_t is not None and new_t is not None
+                    and type(old_t) is type(new_t)):
+                if isinstance(new_t, SynthTrack):
+                    continue  # SynthEngine is stateless w.r.t. track data
+                if isinstance(new_t, DrumTrack) and old_t.sample_name == new_t.sample_name:
+                    continue  # DrumEngine only depends on sample_name
 
             # Preserve old engine if this track has finishing loops
             if new_state.finishing_loops and old_t is not None:

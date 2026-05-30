@@ -1158,16 +1158,16 @@ def test_reduce_does_not_mutate_input_state():
 def test_sk5_instrument_toggles_vel_sensitive():
     """SK5 in INSTRUMENT mode toggles vel_sensitive."""
     s = _armed_instrument(armed=(0,))
-    assert s.vel_sensitive is False
+    assert s.vel_sensitive is True  # default is now VEL
     s2 = reduce(s, SoftkeyPressed(key=4))
-    assert s2.vel_sensitive is True
+    assert s2.vel_sensitive is False
     s3 = reduce(s2, SoftkeyPressed(key=4))
-    assert s3.vel_sensitive is False
+    assert s3.vel_sensitive is True
 
 
 def test_mono_step_uses_velocity_100():
-    """In MONO mode (default), step velocity is always 100."""
-    s = _armed_instrument(armed=(0,))
+    """In MONO mode, step velocity is always 100."""
+    s = dataclasses.replace(_armed_instrument(armed=(0,)), vel_sensitive=False)
     assert s.vel_sensitive is False
     s2 = reduce(s, PadPressed(pad_index=0, velocity=42))
     assert s2.tracks[0].loops[1].steps[0].velocity == 100

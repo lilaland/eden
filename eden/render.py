@@ -479,7 +479,8 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
                 dots = ["○", "○", "○"]
                 dots[page] = "●"
                 page_ind = "".join(dots)
-                main_line1 = f"{t.name} {scale_short}/{pitch_name(t.root_note)} {page_ind}"
+                rec_prefix = "● " if state.free_recording else ""
+                main_line1 = f"{rec_prefix}{t.name} {scale_short}/{pitch_name(t.root_note)} {page_ind}"
             else:
                 main_line1 = t.name if t is not None else "EMPTY"
         else:
@@ -524,14 +525,13 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
                 and not is_interleaved
                 and not first_track_for_line2.quantized):
             loop_num = state.selected_loop + 1
+            beat = state.playhead // max(1, 32 // first_numer) + 1
             if state.free_recording:
-                cursor = state.step_cursor
-                main_line2 = f"● REC {cursor}  L{loop_num}"
+                main_line2 = f"● REC {beat}/{first_numer}  L{loop_num}"
             elif state.free_record_pending:
-                countdown = 32 - state.playhead
-                main_line2 = f"ARM {countdown}st  L{loop_num}"
+                main_line2 = f"ARM  {beat}/{first_numer}  L{loop_num}"
             else:
-                main_line2 = f"FREE PLAY  L{loop_num}"
+                main_line2 = f"{beat}/{first_numer}  L{loop_num}"
         else:
             # QUANT step mode and drums: show which page/measure you're on
             main_line2 = f"{page_label}{view_m + 1}/{max_pages} L{state.selected_loop + 1}"
@@ -602,12 +602,15 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
                 _set(OLED_BTN5_VALUE, str(first_track.arp_octaves))
             elif page == 2:
                 # Page 2: CHORD
-                chord_on_color   = _OLED_ACTIVE if first_track.chord_on   else _OLED_DIM
-                ctype_color      = _OLED_ACTIVE if ctrl == "CHORD_TYPE"   else _OLED_DIM
+                chord_on_color = _OLED_ACTIVE if first_track.chord_on else _OLED_DIM
+                ctype_color    = _OLED_ACTIVE if ctrl == "CHORD_TYPE"  else _OLED_DIM
+                voices_color   = _OLED_ACTIVE if ctrl == "VOICES"      else _OLED_DIM
                 _set(OLED_BTN1_TITLE, "CHORD", chord_on_color)
                 _set(OLED_BTN1_VALUE, "ON" if first_track.chord_on else "OFF")
                 _set(OLED_BTN2_TITLE, "TYPE", ctype_color)
                 _set(OLED_BTN2_VALUE, first_track.chord_type.upper()[:5])
+                _set(OLED_BTN3_TITLE, "VOICES", voices_color)
+                _set(OLED_BTN3_VALUE, str(first_track.max_voices))
         else:
             bars_color  = _OLED_ACTIVE if ctrl == "BARS"  else _OLED_DIM
             numer_color = _OLED_ACTIVE if ctrl == "NUMER" else _OLED_DIM

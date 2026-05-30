@@ -288,7 +288,9 @@ def _on_mode_button(state: AppState, event: ModeButtonPressed) -> AppState:
         state = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
         armed = state.saved_armed_tracks if state.saved_armed_tracks is not None else state.armed_tracks
         return dataclasses.replace(state, mode=Mode.SESSION, armed_tracks=armed, saved_armed_tracks=None)
-    # EDIT, USER, BACK, FORWARD — no-op for M1/M2
+    # BACK/FORWARD navigate OLED pages in INSTRUMENT mode
+    if event.button in ("BACK", "FORWARD") and state.mode == Mode.INSTRUMENT:
+        return _instrument_mode_button(state, event)
     return state
 
 
@@ -469,7 +471,9 @@ def _create_new_slot_track(state: AppState) -> AppState:
     if type_idx == 1:  # KEYS → SynthTrack
         quantized = (state.new_slot_var_idx == 0)  # 0=QUANT, 1=FREE
         new_track = SynthTrack(name=name, loops=default_track_loops(), osc_type=param,
-                               quantized=quantized)
+                               quantized=quantized,
+                               scale=state.last_synth_scale,
+                               root_note=state.last_synth_root)
         init_offset = _free_piano_init_offset((new_track,))
     else:  # DRUMS → DrumTrack
         new_track = DrumTrack(name=name, sample_name=param, loops=default_track_loops())
@@ -604,9 +608,25 @@ def _new_slot_encoder(state: AppState, event: EncoderTurned) -> AppState:
 
 
 def _start_free_recording(state: AppState) -> AppState:
-    """Clear selected loop and begin FREE recording from step 0."""
-    state = _instrument_reset(state)
-    return dataclasses.replace(state, free_recording=True, free_record_pending=False)
+    """Begin FREE recording. On first pass, loop grows freely.
+    On subsequent passes (overdub), pitches merge into the existing fixed-length loop."""
+    if not state.armed_tracks:
+        return dataclasses.replace(state, free_recording=True, free_record_pending=False)
+    track_idx = state.armed_tracks[0]
+    track = state.tracks[track_idx]
+    loop_idx = state.selected_loop
+    if isinstance(track, SynthTrack):
+        loop = track.loops[loop_idx]
+        existing_len = loop.step_count if not loop.is_empty else 0
+    else:
+        existing_len = 0
+    return dataclasses.replace(
+        state,
+        free_recording=True,
+        free_record_pending=False,
+        free_loop_length=existing_len,
+        step_cursor=0,
+    )
 
 
 def _stop_free_recording(state: AppState) -> AppState:
@@ -621,20 +641,33 @@ def _stop_free_recording(state: AppState) -> AppState:
     loop = track.loops[loop_idx]
     spb = loop.steps_per_bar
     cursor = state.step_cursor
-    if cursor == 0 or loop.is_empty:
+    if loop.is_empty:
         return dataclasses.replace(state, free_recording=False, step_cursor=0)
-    bars = max(1, (cursor + spb - 1) // spb)
+    # Round up to the nearest whole bar (minimum 1 bar)
+    bars = max(1, (max(cursor, 1) + spb - 1) // spb)
     new_count = bars * spb
     steps = loop.steps
     if len(steps) < new_count:
         steps = steps + tuple(StepNote.off() for _ in range(new_count - len(steps)))
     else:
         steps = steps[:new_count]
+    # Trim blank trailing bars — keep at least 1 bar
+    while bars > 1:
+        bar_start = (bars - 1) * spb
+        if not any(steps[bar_start + i].on for i in range(spb)):
+            bars -= 1
+            steps = steps[:bar_start]
+        else:
+            break
+    new_count = bars * spb
     new_loop = dataclasses.replace(loop, steps=steps, bars=bars)
     new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
     new_track = dataclasses.replace(track, loops=new_loops)
     new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
-    state = dataclasses.replace(state, tracks=new_tracks, free_recording=False, step_cursor=0)
+    state = dataclasses.replace(
+        state, tracks=new_tracks, free_recording=False, step_cursor=0,
+        free_loop_length=new_count,
+    )
     return _auto_start_and_gc(state, track_idx, loop_idx)
 
 
@@ -674,7 +707,8 @@ def _instrument_reset(state: AppState) -> AppState:
     return dataclasses.replace(new_state, step_cursor=0,
                                playing_loops=new_playing,
                                active_loops=new_active,
-                               undo_snapshot=None)
+                               undo_snapshot=None,
+                               free_loop_length=0)
 
 
 def _reduce_instrument(state: AppState, event: Event) -> AppState:
@@ -970,6 +1004,52 @@ def _set_step_pitch(
     return dataclasses.replace(state, tracks=new_tracks)
 
 
+def _edit_step_chord(
+    state: AppState, track_idx: int, loop_idx: int, step_idx: int,
+    pitch: int, velocity: int,
+) -> tuple[AppState, bool]:
+    """Add/remove pitch from a step's chord without changing the cursor.
+
+    Returns (new_state, advanced) where advanced=True means the step was fresh
+    (OFF → ON) and the caller should advance the cursor.
+
+    Behaviour:
+      - Step OFF → turn ON with this pitch; caller should advance cursor.
+      - Step ON, pitch not present → add pitch to chord; cursor stays.
+      - Step ON, pitch already present → remove it; if no pitches remain, turn step OFF.
+    """
+    track = state.tracks[track_idx]
+    if track is None:
+        return state, False
+    loop = track.loops[loop_idx]
+    if step_idx >= loop.step_count:
+        return state, False
+    old = loop.steps[step_idx]
+    eff_vel = max(1, min(127, velocity if state.vel_sensitive else 100))
+
+    if not old.on:
+        new_step = dataclasses.replace(old, on=True, pitches=(pitch,), velocity=eff_vel)
+        advance = True
+    elif pitch not in old.pitches:
+        new_step = dataclasses.replace(old, pitches=old.pitches + (pitch,))
+        advance = False
+    else:
+        # Remove this pitch from the chord
+        remaining = tuple(p for p in old.pitches if p != pitch)
+        if remaining:
+            new_step = dataclasses.replace(old, pitches=remaining)
+        else:
+            new_step = StepNote.off()
+        advance = False
+
+    new_steps = loop.steps[:step_idx] + (new_step,) + loop.steps[step_idx + 1:]
+    new_loop = dataclasses.replace(loop, steps=new_steps)
+    new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+    new_track = dataclasses.replace(track, loops=new_loops)
+    new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+    return dataclasses.replace(state, tracks=new_tracks), advance
+
+
 def _advance_step_cursor(state: AppState, track_idx: int, loop_idx: int) -> AppState:
     """Advance step_cursor to the next step, wrapping within the loop."""
     track = state.tracks[track_idx]
@@ -1004,15 +1084,16 @@ def _synth_steps_pad_pressed(
         state = _ensure_loop_length(state, track_idx, loop_idx, step_idx + 1)
         new_state = _toggle_step(state, track_idx, loop_idx, step_idx, event.velocity)
     else:
-        # Bottom row: pitch entry for current cursor step
+        # Bottom row: pitch entry for current cursor step (supports chords)
         degree = state.pitch_window_offset + pad
         pitch = degree_to_pitch(track.root_note, track.scale, degree)
         pitch = max(0, min(127, pitch + state.octave_offset * 12))
         step_idx = state.step_cursor
         state = _ensure_loop_length(state, track_idx, loop_idx, step_idx + 1)
-        new_state = _set_step_pitch(state, track_idx, loop_idx, step_idx,
-                                    pitch, event.velocity)
-        new_state = _advance_step_cursor(new_state, track_idx, loop_idx)
+        new_state, advance = _edit_step_chord(state, track_idx, loop_idx, step_idx,
+                                              pitch, event.velocity)
+        if advance:
+            new_state = _advance_step_cursor(new_state, track_idx, loop_idx)
 
     return _auto_start_and_gc(new_state, track_idx, loop_idx)
 
@@ -1039,9 +1120,10 @@ def _synth_pads_pad_pressed(
     pitch = max(0, min(127, pitch + state.octave_offset * 12))
     step_idx = state.step_cursor
     state = _ensure_loop_length(state, track_idx, loop_idx, step_idx + 1)
-    new_state = _set_step_pitch(state, track_idx, loop_idx, step_idx,
-                                pitch, event.velocity)
-    new_state = _advance_step_cursor(new_state, track_idx, loop_idx)
+    new_state, advance = _edit_step_chord(state, track_idx, loop_idx, step_idx,
+                                          pitch, event.velocity)
+    if advance:
+        new_state = _advance_step_cursor(new_state, track_idx, loop_idx)
     return _auto_start_and_gc(new_state, track_idx, loop_idx)
 
 
@@ -1073,13 +1155,41 @@ def _piano_pad_pressed(
             return state  # dead key (E# / B# position)
 
     pitch = max(0, min(127, pitch + state.octave_offset * 12))
+    loop_len = state.free_loop_length
     step_idx = state.step_cursor
-    state = _ensure_loop_length(state, track_idx, loop_idx, step_idx + 1)
-    # Write note with placeholder gate=1.0; duration is committed on pad release
-    new_state = _set_step_pitch(state, track_idx, loop_idx, step_idx,
+    if loop_len > 0:
+        # Overdub: cursor wraps at fixed loop length, no growing
+        step_idx = step_idx % loop_len
+        state = dataclasses.replace(state, step_cursor=step_idx)
+        # Merge pitch into existing step (additive overdub)
+        cur_loop = state.tracks[track_idx].loops[loop_idx]
+        if step_idx < cur_loop.step_count:
+            old_step = cur_loop.steps[step_idx]
+            if old_step.on and pitch not in old_step.pitches:
+                merged = old_step.pitches + (pitch,)
+                new_step = dataclasses.replace(old_step, pitches=merged)
+            elif not old_step.on:
+                new_step = StepNote(on=True, pitches=(pitch,),
+                                    velocity=event.velocity, gate=1.0)
+            else:
+                new_step = old_step  # pitch already present, skip duplicate
+            new_steps = cur_loop.steps[:step_idx] + (new_step,) + cur_loop.steps[step_idx + 1:]
+            new_loop = dataclasses.replace(cur_loop, steps=new_steps)
+            new_loops = state.tracks[track_idx].loops[:loop_idx] + (new_loop,) + state.tracks[track_idx].loops[loop_idx + 1:]
+            new_track = dataclasses.replace(state.tracks[track_idx], loops=new_loops)
+            new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+            state = dataclasses.replace(state, tracks=new_tracks)
+    else:
+        # First pass: loop grows freely
+        state = _ensure_loop_length(state, track_idx, loop_idx, step_idx + 1)
+        state = _set_step_pitch(state, track_idx, loop_idx, step_idx,
                                 pitch, event.velocity, gate=1.0)
-    # Cursor does NOT advance here — it advances when the pad is released
-    return _auto_start_and_gc(new_state, track_idx, loop_idx)
+    # Cursor does NOT advance here — it advances when the pad is released.
+    # During the initial recording pass (loop_len==0) we withhold auto-start so
+    # playback doesn't begin on a partial, growing loop — wait for _stop_free_recording.
+    if state.free_loop_length == 0:
+        return _drop_fully_empty_tracks(state, (track_idx,))
+    return _auto_start_and_gc(state, track_idx, loop_idx)
 
 
 def _piano_pad_released(
@@ -1113,9 +1223,15 @@ def _piano_pad_released(
 
     advance = max(1, round(gate))
     next_cursor = step_idx + advance
-    state = _ensure_loop_length(state, track_idx, loop_idx, next_cursor + 1)
-    step_count = state.tracks[track_idx].loops[loop_idx].step_count
-    next_cursor = next_cursor % max(1, step_count)
+    loop_len = state.free_loop_length
+    if loop_len > 0:
+        # Overdub: wrap at fixed loop length
+        next_cursor = next_cursor % loop_len
+    else:
+        # First pass: loop grows
+        state = _ensure_loop_length(state, track_idx, loop_idx, next_cursor + 1)
+        step_count = state.tracks[track_idx].loops[loop_idx].step_count
+        next_cursor = next_cursor % max(1, step_count)
     return dataclasses.replace(state, step_cursor=next_cursor)
 
 
@@ -1247,13 +1363,16 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
                 new_ctrl = "" if state.instrument_active_ctrl == "ARP_OCT" else "ARP_OCT"
                 return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
         elif page == 2:
-            # Page 2 (chord): CHORD_ON / CHORD_TYPE / — / — / —
+            # Page 2 (chord): CHORD_ON / CHORD_TYPE / VOICES / — / —
             if event.key == 0:
                 return _adjust_synth_param(
                     state, lambda t: dataclasses.replace(t, chord_on=not t.chord_on)
                 )
             if event.key == 1:
                 new_ctrl = "" if state.instrument_active_ctrl == "CHORD_TYPE" else "CHORD_TYPE"
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+            if event.key == 2:
+                new_ctrl = "" if state.instrument_active_ctrl == "VOICES" else "VOICES"
                 return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
     else:
         # Drum track: SK4 is BACK
@@ -1349,34 +1468,39 @@ def _adjust_synth_scale(state: AppState, delta: int) -> AppState:
         idx = list(SCALE_NAMES).index(track.scale) if track.scale in SCALE_NAMES else 0
         new_idx = (idx + (1 if delta > 0 else -1)) % len(SCALE_NAMES)
         return dataclasses.replace(track, scale=SCALE_NAMES[new_idx])
-    return _adjust_synth_param(state, cycle)
+    new_state = _adjust_synth_param(state, cycle)
+    for idx in new_state.armed_tracks:
+        track = new_state.tracks[idx]
+        if isinstance(track, SynthTrack):
+            return dataclasses.replace(new_state, last_synth_scale=track.scale)
+    return new_state
 
 
 def _adjust_synth_root(state: AppState, delta: int) -> AppState:
     step = 1 if delta > 0 else -1
     def adjust(track: SynthTrack) -> SynthTrack:
         return dataclasses.replace(track, root_note=max(0, min(127, track.root_note + step)))
-    return _adjust_synth_param(state, adjust)
+    new_state = _adjust_synth_param(state, adjust)
+    for idx in new_state.armed_tracks:
+        track = new_state.tracks[idx]
+        if isinstance(track, SynthTrack):
+            return dataclasses.replace(new_state, last_synth_root=track.root_note)
+    return new_state
 
 
 def _shift_pitch_window(state: AppState, button: str) -> AppState:
-    """Shift the pitch window.
+    """Shift the pitch window one step in the intuitive direction.
 
-    FREE piano: +/- slides the 16-column window one white key at a time.
-    + slides right (lower index), - slides left (higher index).
-    QUANT: jumps one scale-octave. Drums: 8 degrees.
+    "+" shows higher notes (shifts window up); "-" shows lower notes.
+    FREE piano: moves one white key at a time.
+    QUANT / Drums: moves one scale degree at a time.
     """
     track = state.tracks[state.armed_tracks[0]] if state.armed_tracks else None
+    d = -1 if button == "+" else 1
     if isinstance(track, SynthTrack) and not track.quantized:
-        d = 1 if button == "+" else -1
         new_offset = max(0, min(59, state.pitch_window_offset + d))
-        return dataclasses.replace(state, pitch_window_offset=new_offset)
-    if isinstance(track, SynthTrack):
-        scale_len = len(SCALES.get(track.scale, SCALES["chromatic"]))
     else:
-        scale_len = 8
-    delta = scale_len if button == "+" else -scale_len
-    new_offset = max(-48, min(108, state.pitch_window_offset + delta))
+        new_offset = max(-48, min(108, state.pitch_window_offset + d))
     return dataclasses.replace(state, pitch_window_offset=new_offset)
 
 
@@ -1440,6 +1564,11 @@ def _instrument_encoder(state: AppState, event: EncoderTurned) -> AppState:
             new_idx = (idx + d) % len(_CHORD_TYPES)
             return dataclasses.replace(track, chord_type=_CHORD_TYPES[new_idx])
         return _adjust_synth_param(state, cycle_chord_type)
+    if ctrl == "VOICES":
+        d = 1 if event.delta > 0 else -1
+        def adjust_voices(track: SynthTrack) -> SynthTrack:
+            return dataclasses.replace(track, max_voices=max(1, min(16, track.max_voices + d)))
+        return _adjust_synth_param(state, adjust_voices)
     return state
 
 

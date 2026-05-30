@@ -213,12 +213,16 @@ class StepScheduler:
     def __init__(self, mixer: AudioMixer, state_ref: StateRef) -> None:
         self._mixer = mixer
         self._state_ref = state_ref
-        self._arp_tracks: dict[int, dict] = {}  # track_idx → arp context
+        self._arp_tracks: dict[int, dict] = {}       # step-sequencer arp contexts
+        self._live_arp_tracks: dict[int, dict] = {}  # live pad-held arp contexts
 
     def on_tick(self) -> None:
         state = self._state_ref.get()
         if not state.is_playing:
             self._arp_tracks.clear()
+            # Live arps keep running even without transport
+            if self._live_arp_tracks:
+                self._advance_arp()
             return
 
         playhead = state.playhead
@@ -231,6 +235,9 @@ class StepScheduler:
             effective_muted = frozenset(
                 i for i in range(len(state.tracks)) if i not in soloed
             )
+
+        # Advance ongoing arp sequences first so each interval is uniform
+        self._advance_arp()
 
         self._trigger_loops(
             state.playing_loops, state.tracks, offsets, playhead,
@@ -245,9 +252,6 @@ class StepScheduler:
                 effective_muted, state.tempo_bpm, self._mixer.get_finishing_engine,
                 apply_effects=False,
             )
-
-        # Advance ongoing arp sequences
-        self._advance_arp()
 
     def _trigger_loops(
         self,
@@ -334,23 +338,80 @@ class StepScheduler:
                     engine.note_on(p, amplitude, gate_samples, track)
                 break
 
+    def start_live_arp(
+        self,
+        track_idx: int,
+        seq: tuple,
+        engine,
+        amplitude: float,
+        tpn: int,
+        gate_samples: int,
+        track,
+    ) -> None:
+        """Start a live (pad-held) arp sequence, firing the first note immediately."""
+        if not seq:
+            return
+        engine.note_on(seq[0], amplitude, gate_samples, track)
+        if len(seq) > 1:
+            self._live_arp_tracks[track_idx] = {
+                "sequence": seq,
+                "idx": 1,
+                "ticks_until_next": tpn,
+                "ticks_per_note": tpn,
+                "amplitude": amplitude,
+                "gate_samples": gate_samples,
+                "engine": engine,
+                "track": track,
+            }
+
+    def merge_live_arp(
+        self,
+        track_idx: int,
+        seq: tuple,
+        engine,
+        amplitude: float,
+        tpn: int,
+        gate_samples: int,
+        track,
+    ) -> None:
+        """Update or start a live arp sequence without restarting the phase.
+
+        If an arp is already running for this track, the sequence is swapped
+        in-place and the current index is clamped to the new length so the
+        rhythm continues uninterrupted.  If no arp is running, starts one
+        immediately (same as start_live_arp).
+        """
+        if not seq:
+            return
+        ctx = self._live_arp_tracks.get(track_idx)
+        if ctx is not None:
+            ctx["sequence"] = seq
+            ctx["idx"] = ctx["idx"] % len(seq)
+            ctx["amplitude"] = amplitude
+            ctx["gate_samples"] = gate_samples
+            ctx["engine"] = engine
+            ctx["track"] = track
+        else:
+            self.start_live_arp(track_idx, seq, engine, amplitude, tpn, gate_samples, track)
+
+    def stop_live_arp(self, track_idx: int) -> None:
+        """Stop a live arp; the last-fired note decays naturally."""
+        self._live_arp_tracks.pop(track_idx, None)
+
     def _advance_arp(self) -> None:
-        """Fire the next note for each active arp sequence."""
-        finished: list[int] = []
-        for track_idx, ctx in self._arp_tracks.items():
-            ctx["ticks_until_next"] -= 1
-            if ctx["ticks_until_next"] > 0:
-                continue
-            # Fire next note
-            seq = ctx["sequence"]
-            idx = ctx["idx"]
-            ctx["engine"].note_on(
-                seq[idx], ctx["amplitude"], ctx["gate_samples"], ctx["track"]
-            )
-            idx = (idx + 1) % len(seq)
-            ctx["idx"] = idx
-            ctx["ticks_until_next"] = ctx["ticks_per_note"]
-        # No cleanup needed — arp loops indefinitely until a new step fires
+        """Fire the next note for each active arp sequence (step and live)."""
+        for ctx_dict in (self._arp_tracks, self._live_arp_tracks):
+            for ctx in list(ctx_dict.values()):
+                ctx["ticks_until_next"] -= 1
+                if ctx["ticks_until_next"] > 0:
+                    continue
+                seq = ctx["sequence"]
+                idx = ctx["idx"]
+                ctx["engine"].note_on(
+                    seq[idx], ctx["amplitude"], ctx["gate_samples"], ctx["track"]
+                )
+                ctx["idx"] = (idx + 1) % len(seq)
+                ctx["ticks_until_next"] = ctx["ticks_per_note"]
 
 
 # ---------------------------------------------------------------------------
