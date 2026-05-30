@@ -175,7 +175,7 @@ def test_synth_bottom_row_sets_pitch():
     # Pitch should be degree_to_pitch(60, "chromatic", 0) = 60
     from eden.scales import degree_to_pitch
     expected = degree_to_pitch(60, "chromatic", 0)
-    assert s3.tracks[0].loops[0].steps[0].pitch == expected
+    assert s3.tracks[0].loops[0].steps[0].pitches == (expected,)
 
 
 def test_synth_bottom_row_advances_cursor():
@@ -475,7 +475,7 @@ def test_synth_free_pad_white_key_records_pitch():
     s2 = reduce(s, PadPressed(pad_index=7, velocity=100))
     loop = s2.tracks[0].loops[0]
     assert loop.steps[0].on
-    assert loop.steps[0].pitch == 60  # C4
+    assert loop.steps[0].pitches == (60,)  # C4
 
 
 def test_synth_free_pad_black_key_records_pitch():
@@ -484,7 +484,7 @@ def test_synth_free_pad_black_key_records_pitch():
     s2 = reduce(s, PadPressed(pad_index=23, velocity=100))
     loop = s2.tracks[0].loops[0]
     assert loop.steps[0].on
-    assert loop.steps[0].pitch == 61  # C#4
+    assert loop.steps[0].pitches == (61,)  # C#4
 
 
 def test_synth_free_dead_key_no_note():
@@ -500,7 +500,7 @@ def test_synth_free_octave_offset_shifts_pitch():
     s = dataclasses.replace(_free_synth_state(), octave_offset=1)
     s2 = reduce(s, PadPressed(pad_index=7, velocity=100))
     loop = s2.tracks[0].loops[0]
-    assert loop.steps[0].pitch == 72  # C5 (one octave up from C4)
+    assert loop.steps[0].pitches == (72,)  # C5 (one octave up from C4)
 
 
 def test_synth_quantized_field_persisted():
@@ -895,7 +895,7 @@ def test_free_clock_wrap_clears_loop():
     # Put a note in manually
     from eden.state import StepNote
     loop = s.tracks[0].loops[0]
-    note_step = StepNote(on=True, pitch=60)
+    note_step = StepNote(on=True, pitches=(60,))
     new_steps = (note_step,) + loop.steps[1:]
     new_loop = dataclasses.replace(loop, steps=new_steps)
     new_loops = s.tracks[0].loops[:0] + (new_loop,) + s.tracks[0].loops[1:]
@@ -925,7 +925,7 @@ def test_free_stop_recording_rounds_up_multi_bar():
     from eden.state import StepNote
     loop = s.tracks[0].loops[0]
     new_steps = list(loop.steps)
-    new_steps[0] = StepNote(on=True, pitch=60)
+    new_steps[0] = StepNote(on=True, pitches=(60,))
     new_loop = dataclasses.replace(loop, steps=tuple(new_steps))
     new_loops = s.tracks[0].loops[:0] + (new_loop,) + s.tracks[0].loops[1:]
     new_track = dataclasses.replace(s.tracks[0], loops=new_loops)

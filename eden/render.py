@@ -223,7 +223,9 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
                         # Bottom row (pads 0-15): pitch window
                         # Find which degree matches the cursor step's pitch
                         cursor_step = loop.steps[state.step_cursor] if state.step_cursor < loop.step_count else None
-                        cursor_pitch = cursor_step.pitch if (cursor_step and cursor_step.on) else None
+                        cursor_pitch = (cursor_step.pitches[0]
+                                        if (cursor_step and cursor_step.on and cursor_step.pitches)
+                                        else None)
                         for pad_idx in range(16):
                             degree = state.pitch_window_offset + pad_idx
                             pitch = degree_to_pitch(track.root_note, track.scale, degree)

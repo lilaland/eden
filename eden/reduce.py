@@ -958,7 +958,7 @@ def _set_step_pitch(
         return state
     old = loop.steps[step_idx]
     eff_vel = velocity if state.vel_sensitive else 100
-    kw: dict = {"on": True, "pitch": pitch, "velocity": max(1, min(127, eff_vel))}
+    kw: dict = {"on": True, "pitches": (pitch,), "velocity": max(1, min(127, eff_vel))}
     if gate is not None:
         kw["gate"] = gate
     new_step = dataclasses.replace(old, **kw)

@@ -62,15 +62,34 @@ def test_steps_roundtrip_velocity():
 
 
 def test_steps_roundtrip_pitch_and_gate():
-    steps = (StepNote(on=True, pitch=72, gate=0.25),) + \
+    steps = (StepNote(on=True, pitches=(72,), gate=0.25),) + \
             tuple(StepNote.off() for _ in range(15))
     loop = Loop(steps=steps)
     d = sessions._loop_to_dict(loop)
     assert "pitches" in d
     assert "gates" in d
     back = sessions._dict_to_loop(d)
-    assert back.steps[0].pitch == 72
+    assert back.steps[0].pitches == (72,)
     assert back.steps[0].gate == 0.25
+
+
+def test_steps_roundtrip_multi_pitch_chord():
+    """Multi-pitch (chord) steps serialize and deserialize as list-of-lists."""
+    chord = StepNote(on=True, pitches=(60, 64, 67))  # C major triad
+    steps = (chord,) + tuple(StepNote.off() for _ in range(15))
+    loop = Loop(steps=steps)
+    d = sessions._loop_to_dict(loop)
+    assert d["pitches"][0] == [60, 64, 67]
+    back = sessions._dict_to_loop(d)
+    assert back.steps[0].pitches == (60, 64, 67)
+
+
+def test_steps_roundtrip_old_flat_pitch_format():
+    """Old sessions with flat int list for pitches are loaded as 1-tuples."""
+    from eden.sessions import _str_to_steps
+    steps = _str_to_steps("1000", pitches=[72, 60, 60, 60])
+    assert steps[0].pitches == (72,)
+    assert steps[1].pitches == (60,)
 
 
 def test_steps_drum_no_extra_arrays():

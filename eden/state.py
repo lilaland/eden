@@ -16,9 +16,9 @@ class Mode(Enum):
 class StepNote:
     """A single step in a loop. Drums use on/velocity; synths use all fields."""
     on: bool
-    pitch: int = 60      # MIDI note 0-127; ignored by DrumTrack
-    velocity: int = 100  # 0-127; used by both drums and synths
-    gate: float = 0.5    # fraction of step duration held; ignored by DrumTrack
+    pitches: tuple[int, ...] = (60,)  # MIDI notes 0-127; multi-voice chord; ignored by DrumTrack
+    velocity: int = 100               # 0-127; used by both drums and synths
+    gate: float = 0.5                 # fraction of step duration held; ignored by DrumTrack
 
     @classmethod
     def off(cls) -> "StepNote":

@@ -31,6 +31,13 @@ def _steps_to_str(steps: tuple[StepNote, ...]) -> str:
     return "".join("1" if s.on else "0" for s in steps)
 
 
+def _parse_pitches_entry(entry) -> tuple[int, ...]:
+    """Convert a session pitches entry to a tuple. Handles old int and new list format."""
+    if isinstance(entry, list):
+        return tuple(entry) if entry else (60,)
+    return (int(entry),)  # old format: single int per step
+
+
 def _str_to_steps(
     s: str,
     pitches: list | None = None,
@@ -39,9 +46,13 @@ def _str_to_steps(
 ) -> tuple[StepNote, ...]:
     result = []
     for i, c in enumerate(s):
+        if pitches and i < len(pitches):
+            step_pitches = _parse_pitches_entry(pitches[i])
+        else:
+            step_pitches = (60,)
         result.append(StepNote(
             on=c == "1",
-            pitch=pitches[i] if pitches and i < len(pitches) else 60,
+            pitches=step_pitches,
             velocity=velocities[i] if velocities and i < len(velocities) else 100,
             gate=gates[i] if gates and i < len(gates) else 0.5,
         ))
@@ -63,11 +74,11 @@ def _loop_to_dict(loop: Loop) -> Optional[dict]:
     if loop.volume != 1.0:
         d["volume"] = loop.volume
     # Only emit per-step arrays when non-default (drums never will)
-    pitches = [s.pitch for s in loop.steps]
+    step_pitches = [list(s.pitches) for s in loop.steps]
     velocities = [s.velocity for s in loop.steps]
     gates = [s.gate for s in loop.steps]
-    if any(p != 60 for p in pitches):
-        d["pitches"] = pitches
+    if any(p != [60] for p in step_pitches):
+        d["pitches"] = step_pitches
     if any(v != 100 for v in velocities):
         d["velocities"] = velocities
     if any(g != 0.5 for g in gates):
