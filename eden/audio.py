@@ -19,6 +19,8 @@ import sounddevice as sd
 import soundfile as sf
 
 from eden.engines import DrumEngine, SynthEngine, TrackEngine
+from eden.state import SynthTrack
+from eden.arp import expand_chord, compute_arp_sequence, arp_ticks_per_note
 
 # ---------------------------------------------------------------------------
 # StateRef — atomic state reference
@@ -202,15 +204,21 @@ class StepScheduler:
     """
     On each clock tick, reads AppState and calls engine.note_on() for every
     active step at the current playhead. Runs on the main (event-loop) thread.
+
+    Arp state (_arp_tracks) keeps a per-track context for ongoing arp sequences.
+    Each context is a dict with keys: sequence, idx, ticks_until_next,
+    ticks_per_note, amplitude, gate_samples, engine, track.
     """
 
     def __init__(self, mixer: AudioMixer, state_ref: StateRef) -> None:
         self._mixer = mixer
         self._state_ref = state_ref
+        self._arp_tracks: dict[int, dict] = {}  # track_idx → arp context
 
     def on_tick(self) -> None:
         state = self._state_ref.get()
         if not state.is_playing:
+            self._arp_tracks.clear()
             return
 
         playhead = state.playhead
@@ -227,6 +235,7 @@ class StepScheduler:
         self._trigger_loops(
             state.playing_loops, state.tracks, offsets, playhead,
             effective_muted, state.tempo_bpm, self._mixer.get_engine,
+            apply_effects=True,
         )
 
         if state.finishing_loops and state.finishing_tracks:
@@ -234,7 +243,11 @@ class StepScheduler:
             self._trigger_loops(
                 state.finishing_loops, state.finishing_tracks, fin_offsets, playhead,
                 effective_muted, state.tempo_bpm, self._mixer.get_finishing_engine,
+                apply_effects=False,
             )
+
+        # Advance ongoing arp sequences
+        self._advance_arp()
 
     def _trigger_loops(
         self,
@@ -245,6 +258,8 @@ class StepScheduler:
         muted,
         bpm: float,
         get_engine: Callable[[int], Optional[TrackEngine]],
+        *,
+        apply_effects: bool = False,
     ) -> None:
         sr = self._mixer._sr
         for track_idx, track in enumerate(tracks):
@@ -279,13 +294,63 @@ class StepScheduler:
                 if engine is None:
                     continue
 
-                # gate_samples: step.gate fraction of one step's duration
                 step_secs = (4.0 / loop.step_size) * (60.0 / bpm)
                 gate_samples = max(1, int(step.gate * step_secs * sr))
                 amplitude = (step.velocity / 127.0) * loop.volume
-                for p in step.pitches:
+                pitches = step.pitches
+
+                if apply_effects and isinstance(track, SynthTrack):
+                    # Chord expansion: add chord tones to each pitch
+                    if track.chord_on:
+                        pitches = expand_chord(pitches, track.chord_type)
+
+                    # Arp: sequence pitches over time instead of playing all at once
+                    if track.arp_on and track.arp_mode != "chord":
+                        seq = compute_arp_sequence(pitches, track.arp_mode, track.arp_octaves)
+                        if seq:
+                            tpn = arp_ticks_per_note(track.arp_rate)
+                            arp_gate = max(1, int(0.8 * tpn * 60.0 / bpm / 8.0 * sr))
+                            # Fire first note immediately; register context for subsequent
+                            engine.note_on(seq[0], amplitude, arp_gate, track)
+                            if len(seq) > 1:
+                                self._arp_tracks[track_idx] = {
+                                    "sequence": seq,
+                                    "idx": 1,
+                                    "ticks_until_next": tpn,
+                                    "ticks_per_note": tpn,
+                                    "amplitude": amplitude,
+                                    "gate_samples": arp_gate,
+                                    "engine": engine,
+                                    "track": track,
+                                }
+                            else:
+                                self._arp_tracks.pop(track_idx, None)
+                        break
+                    elif track.arp_on and track.arp_mode == "chord":
+                        # Chord arp mode = all notes at once (same as chord_on)
+                        pitches = compute_arp_sequence(pitches, "chord", track.arp_octaves)
+
+                for p in pitches:
                     engine.note_on(p, amplitude, gate_samples, track)
                 break
+
+    def _advance_arp(self) -> None:
+        """Fire the next note for each active arp sequence."""
+        finished: list[int] = []
+        for track_idx, ctx in self._arp_tracks.items():
+            ctx["ticks_until_next"] -= 1
+            if ctx["ticks_until_next"] > 0:
+                continue
+            # Fire next note
+            seq = ctx["sequence"]
+            idx = ctx["idx"]
+            ctx["engine"].note_on(
+                seq[idx], ctx["amplitude"], ctx["gate_samples"], ctx["track"]
+            )
+            idx = (idx + 1) % len(seq)
+            ctx["idx"] = idx
+            ctx["ticks_until_next"] = ctx["ticks_per_note"]
+        # No cleanup needed — arp loops indefinitely until a new step fires
 
 
 # ---------------------------------------------------------------------------

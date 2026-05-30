@@ -40,6 +40,7 @@ from eden.clock import SequencerClock
 from eden.reduce import reduce
 from eden.render import render_pads, render_oled, render_button_leds
 from eden.scales import degree_to_pitch, white_idx_to_midi, black_key_at
+from eden.arp import expand_chord, compute_arp_sequence
 from eden.state import default_state, AppState, DrumTrack, SynthTrack, InstrumentSubmode, Mode
 from eden.events import ClockTicked, InstrumentReset, InstrumentUndo, PadPressed, PadReleased, PlusMinusPressed, SessionLoaded, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
 from eden.state import Mode
@@ -225,7 +226,18 @@ class EdenApp:
         if engine is None:
             return
         gate = max(1, int(0.25 * self._mixer._sr))
-        engine.note_on(pitch, event.velocity / 127.0, gate, track)
+        amplitude = event.velocity / 127.0
+
+        # Apply chord / arp transformations for live audio feedback
+        pitches: tuple[int, ...] = (pitch,)
+        if track.chord_on:
+            pitches = expand_chord(pitches, track.chord_type)
+        if track.arp_on:
+            pitches = compute_arp_sequence(pitches, track.arp_mode, track.arp_octaves)
+            # Fire all arp notes simultaneously as preview (no time-stagger in live mode)
+
+        for p in pitches:
+            engine.note_on(p, amplitude, gate, track)
 
     # ─── Engine lifecycle ─────────────────────────────────────────────────────
 
