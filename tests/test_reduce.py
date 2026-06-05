@@ -180,12 +180,21 @@ def test_song_button_switches_to_session():
 
 
 def test_back_button_noop():
-    """BACK button (and FORWARD, EDIT, USER) is a no-op in M1/M2."""
+    """BACK and FORWARD are no-ops in SESSION; USER is a no-op everywhere."""
     state = default_state()
-    for btn in ("BACK", "FORWARD", "EDIT", "USER"):
+    for btn in ("BACK", "FORWARD", "USER"):
         result = reduce(state, ModeButtonPressed(button=btn, pressed=True))
         assert result.mode is Mode.SESSION
         assert result is state
+
+
+def test_edit_button_toggles_edit_mode():
+    """EDIT button toggles edit_mode on/off."""
+    state = default_state()
+    on = reduce(state, ModeButtonPressed(button="EDIT", pressed=True))
+    assert on.edit_mode is True
+    off = reduce(on, ModeButtonPressed(button="EDIT", pressed=True))
+    assert off.edit_mode is False
 
 
 def test_mode_button_release_noop():
@@ -239,10 +248,12 @@ def test_session_new_slot_encoder_changes_category():
     from eden.events import SoftkeyPressed, EncoderTurned
     state = default_state()
     state = reduce(state, PadPressed(pad_index=2, velocity=100))
-    state = reduce(state, SoftkeyPressed(key=1))    # activate CAT ctrl
+    # SK2 press now cycles cat by 1 (0→1=Snare) AND activates CAT ctrl
+    state = reduce(state, SoftkeyPressed(key=1))
     assert state.new_slot_active_ctrl == "CAT"
+    assert state.new_slot_cat_idx == 1              # already advanced to Snare by tap
     result = reduce(state, EncoderTurned(encoder=9, delta=1))
-    assert result.new_slot_cat_idx == 1             # moved from Kick to Snare
+    assert result.new_slot_cat_idx == 2             # jog moved to Cl.Hat
 
 
 def test_session_pad_top_row_adds_to_playing():
@@ -1155,10 +1166,19 @@ def test_reduce_does_not_mutate_input_state():
 # ── MONO / VEL sensitivity ────────────────────────────────────────────────────
 
 
-def test_sk5_instrument_toggles_vel_sensitive():
-    """SK5 in INSTRUMENT mode toggles vel_sensitive."""
+def test_sk5_instrument_enters_drum_pads_submode():
+    """SK5 in drum STEPS submode enters PADS free-recording submode."""
     s = _armed_instrument(armed=(0,))
-    assert s.vel_sensitive is True  # default is now VEL
+    assert s.instrument_submode is InstrumentSubmode.STEPS
+    s2 = reduce(s, SoftkeyPressed(key=4))
+    assert s2.instrument_submode is InstrumentSubmode.PADS
+
+
+def test_sk5_drum_pads_toggles_vel_sensitive():
+    """SK5 in drum PADS submode toggles vel_sensitive."""
+    s = dataclasses.replace(_armed_instrument(armed=(0,)),
+                            instrument_submode=InstrumentSubmode.PADS)
+    assert s.vel_sensitive is True
     s2 = reduce(s, SoftkeyPressed(key=4))
     assert s2.vel_sensitive is False
     s3 = reduce(s2, SoftkeyPressed(key=4))

@@ -100,13 +100,40 @@ _VARIATION_KEYS: dict[str, str] = {
 
 # ── Keys (synth) catalog ──────────────────────────────────────────────────────
 
-_KEYS_OSC_NAMES: tuple[str, ...] = ("Saw", "Square", "Sine", "Tri")
-_KEYS_ENGINE_KEY: dict[str, str] = {
-    "Saw": "saw", "Square": "square", "Sine": "sine", "Tri": "triangle",
+# Each preset: (display_name, track_name, osc_type, extra_synth_params)
+_KEYS_PRESETS: dict[str, tuple] = {
+    "Raw": (
+        ("Saw",       "SAW",   "saw",      {}),
+        ("Square",    "SQR",   "square",   {}),
+        ("Sine",      "SINE",  "sine",     {}),
+        ("Tri",       "TRI",   "triangle", {}),
+    ),
+    "Bass": (
+        ("Sub Bass",  "SBASS", "sine",     {"filter_cutoff": 180.0, "amp_attack": 0.01, "amp_release": 0.4}),
+        ("Reese",     "REESE", "saw",      {"filter_cutoff": 400.0, "filter_res": 0.5}),
+        ("FM Bass",   "FMBAS", "sine",     {"filter_cutoff": 600.0, "amp_attack": 0.005, "amp_release": 0.2}),
+        ("Wobble",    "WOBBL", "saw",      {"filter_cutoff": 300.0, "filter_res": 0.6, "amp_attack": 0.01}),
+    ),
+    "Lead": (
+        ("Mono Lead", "LEAD",  "saw",      {"filter_cutoff": 3000.0}),
+        ("Supersaw",  "SSAW",  "saw",      {"filter_cutoff": 5000.0, "amp_attack": 0.05, "max_voices": 4}),
+        ("Screamer",  "SCRM",  "square",   {"filter_cutoff": 2500.0, "filter_res": 0.3}),
+    ),
+    "Pad": (
+        ("Warm Pad",   "WPAD",  "sine",    {"amp_attack": 0.5, "amp_sustain": 0.8, "amp_release": 1.2, "filter_cutoff": 1500.0}),
+        ("Evolv.Pad",  "EPAD",  "triangle",{"amp_attack": 1.0, "amp_sustain": 0.7, "amp_release": 2.0, "filter_cutoff": 2000.0}),
+        ("String Pad", "STRNG", "saw",     {"amp_attack": 0.3, "amp_release": 0.9, "filter_cutoff": 3500.0}),
+    ),
+    "Pluck": (
+        ("Pluck",      "PLUCK", "triangle",{"amp_attack": 0.001, "amp_sustain": 0.0, "amp_release": 0.5, "filter_cutoff": 4000.0}),
+    ),
+    "Keys": (
+        ("Keys",       "KEYS",  "square",  {"amp_attack": 0.01, "amp_sustain": 0.7, "amp_release": 0.3, "filter_cutoff": 6000.0}),
+    ),
 }
-_KEYS_TRACK_NAMES: dict[str, str] = {
-    "Saw": "SAW", "Square": "SQR", "Sine": "SINE", "Tri": "TRI",
-}
+
+KEYS_FOLDERS: tuple[str, ...] = tuple(_KEYS_PRESETS.keys())
+
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
@@ -115,17 +142,18 @@ def get_categories(type_idx: int) -> tuple[str, ...]:
     """Return category list for the given type index."""
     if type_idx == 0:  # DRUMS
         return DRUM_CATEGORIES
-    if type_idx == 1:  # KEYS — osc type is the "category"
-        return _KEYS_OSC_NAMES
+    if type_idx == 1:  # KEYS — folders
+        return KEYS_FOLDERS
     return ()
 
 
 def get_variations(type_idx: int, cat_idx: int) -> tuple[str, ...]:
     """Return variation list for the given type/category indices."""
-    if type_idx == 0:  # DRUMS — same variation set for every category
+    if type_idx == 0:  # DRUMS
         return DRUM_VARIATIONS
-    if type_idx == 1:  # KEYS — quantized step editor vs free piano keyboard
-        return ("QUANT", "FREE")
+    if type_idx == 1:  # KEYS — presets within selected folder
+        folder = KEYS_FOLDERS[cat_idx % len(KEYS_FOLDERS)]
+        return tuple(p[0] for p in _KEYS_PRESETS[folder])
     return ()
 
 
@@ -144,6 +172,16 @@ def get_track_params(type_idx: int, cat_idx: int, var_idx: int) -> tuple[str, st
         var_key = _VARIATION_KEYS[var]
         return _DRUM_TRACK_NAMES[cat], f"{cat_key}_{var_key}"
     if type_idx == 1:  # KEYS
-        osc = _KEYS_OSC_NAMES[cat_idx % len(_KEYS_OSC_NAMES)]
-        return _KEYS_TRACK_NAMES[osc], _KEYS_ENGINE_KEY[osc]
+        folder = KEYS_FOLDERS[cat_idx % len(KEYS_FOLDERS)]
+        presets = _KEYS_PRESETS[folder]
+        _, track_name, osc_type, _ = presets[var_idx % len(presets)]
+        return track_name, osc_type
     return "EMPTY", ""
+
+
+def get_synth_preset_extras(cat_idx: int, var_idx: int) -> dict:
+    """Return extra SynthTrack constructor kwargs for the selected KEYS preset."""
+    folder = KEYS_FOLDERS[cat_idx % len(KEYS_FOLDERS)]
+    presets = _KEYS_PRESETS[folder]
+    _, _, _, extras = presets[var_idx % len(presets)]
+    return dict(extras)

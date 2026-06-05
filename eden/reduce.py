@@ -9,9 +9,11 @@ import eden.catalog as catalog
 from eden.state import (
     AppState,
     DrumTrack,
+    FXChain,
     InstrumentSubmode,
     Loop,
     Mode,
+    NoteEvent,
     SampleTrack,
     StepNote,
     SynthTrack,
@@ -20,6 +22,7 @@ from eden.state import (
     default_track_loops,
 )
 from eden.events import (
+    AftertouchChanged,
     ArrowPressed,
     ClockTicked,
     EncoderTurned,
@@ -44,7 +47,7 @@ from eden.scales import (
     white_idx_to_midi, black_key_at,
 )
 
-
+_REC_HOLD_TICKS = 32  # clock ticks for shift+hold-REC to trigger full clear
 
 
 # ── Top-level dispatch ────────────────────────────────────────────────────────
@@ -53,6 +56,8 @@ from eden.scales import (
 def reduce(state: AppState, event: Event) -> AppState:
     if isinstance(event, ShiftChanged):
         return dataclasses.replace(state, shift_held=event.held)
+    if isinstance(event, AftertouchChanged):
+        return dataclasses.replace(state, current_aftertouch=event.value / 127.0)
     if isinstance(event, ClockTicked):
         return _on_clock_ticked(state)
     if isinstance(event, ModeButtonPressed):
@@ -69,6 +74,14 @@ def reduce(state: AppState, event: Event) -> AppState:
     if isinstance(event, EncoderTurned) and state.metronome_held and event.encoder == 9:
         new_bpm = max(20.0, min(300.0, state.tempo_bpm + event.delta))
         return dataclasses.replace(state, tempo_bpm=float(new_bpm))
+    # EDIT mode: encoders 1-8 control FX params
+    if isinstance(event, EncoderTurned) and state.edit_mode and 1 <= event.encoder <= 8:
+        return _fx_encoder(state, event)
+    # BACK/FORWARD navigate FX pages when edit overlay is open
+    if (isinstance(event, ModeButtonPressed) and event.pressed
+            and event.button in ("BACK", "FORWARD") and state.edit_mode):
+        new_page = (state.fx_edit_page + 1) % 2 if event.button == "FORWARD" else (state.fx_edit_page - 1) % 2
+        return dataclasses.replace(state, fx_edit_page=new_page, fx_active_knob=-1)
     if state.mode == Mode.SESSION:
         return _reduce_session(state, event)
     if state.mode == Mode.INSTRUMENT:
@@ -84,6 +97,8 @@ def _on_clock_ticked(state: AppState) -> AppState:
         return state
     new_playhead = (state.playhead + 1) % 32
     state = dataclasses.replace(state, playhead=new_playhead)
+    if state.rec_held_shift:
+        state = dataclasses.replace(state, rec_held_ticks=state.rec_held_ticks + 1)
     if new_playhead == 0:
         state = _handle_loop_wrap(state)
         if state.free_record_pending:
@@ -262,6 +277,10 @@ def _on_tap_tempo(state: AppState, event: TapTempoPressed) -> AppState:
 def _on_mode_button(state: AppState, event: ModeButtonPressed) -> AppState:
     if not event.pressed:
         return state
+    if event.button == "EDIT":
+        new_edit = not state.edit_mode
+        return dataclasses.replace(state, edit_mode=new_edit,
+                                   fx_active_knob=-1 if not new_edit else state.fx_active_knob)
     if event.button == "INST":
         if state.tracks[state.selected_track] is None:
             # Empty slot — create track from picker and enter INSTRUMENT,
@@ -331,6 +350,7 @@ def _session_pad_pressed(state: AppState, event: PadPressed) -> AppState:
                 new_slot_type_idx=0,
                 new_slot_cat_idx=0,
                 new_slot_var_idx=0,
+                new_slot_mode_idx=0,
                 new_slot_active_ctrl="",
             )
         return dataclasses.replace(
@@ -427,7 +447,9 @@ def _session_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
             return _cycle_loop_count(state)
         new_ctrl = "" if state.session_active_ctrl == "VOL" else "VOL"
         return dataclasses.replace(state, session_active_ctrl=new_ctrl)
-    if event.key == 3:  # SK4: ARM1 — arm selected track as single, enter INSTRUMENT
+    if event.key == 3:  # SK4: ARM1 (normal) | REC ALL (shift)
+        if state.shift_held:
+            return _enter_rec_all(state)
         return _arm_single(state)
     if event.key == 4:  # SK5: ARM2 — add to dual-arm list
         return _arm_dual(state)
@@ -435,19 +457,33 @@ def _session_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
 
 
 def _new_slot_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
-    """Handle softkeys while the new-instrument picker is open."""
-    if event.key == 0:  # SK1: activate/deactivate TYPE ctrl
-        new_ctrl = "" if state.new_slot_active_ctrl == "TYPE" else "TYPE"
-        return dataclasses.replace(state, new_slot_active_ctrl=new_ctrl)
-    if event.key == 1:  # SK2: activate/deactivate CAT ctrl
-        new_ctrl = "" if state.new_slot_active_ctrl == "CAT" else "CAT"
-        return dataclasses.replace(state, new_slot_active_ctrl=new_ctrl)
-    if event.key == 2:  # SK3: activate/deactivate VAR ctrl
-        new_ctrl = "" if state.new_slot_active_ctrl == "VAR" else "VAR"
-        return dataclasses.replace(state, new_slot_active_ctrl=new_ctrl)
-    if event.key == 3:  # SK4: BACK — deactivate any active ctrl
+    """Handle softkeys while the new-instrument picker is open.
+
+    Tapping a control button cycles the value by +1 AND activates the jog mapping.
+    """
+    is_keys = state.new_slot_type_idx == 1
+    if event.key == 0:  # SK1: cycle TYPE + activate
+        types = catalog.INSTRUMENT_TYPES
+        new_idx = (state.new_slot_type_idx + 1) % len(types)
+        return dataclasses.replace(state,
+                                   new_slot_type_idx=new_idx,
+                                   new_slot_cat_idx=0, new_slot_var_idx=0, new_slot_mode_idx=0,
+                                   new_slot_active_ctrl="TYPE")
+    if event.key == 1:  # SK2: cycle CAT + activate
+        cats = catalog.get_categories(state.new_slot_type_idx)
+        if cats:
+            new_idx = (state.new_slot_cat_idx + 1) % len(cats)
+            return dataclasses.replace(state, new_slot_cat_idx=new_idx,
+                                       new_slot_active_ctrl="CAT")
+    if event.key == 2:  # SK3: cycle VAR + activate
+        vars_ = catalog.get_variations(state.new_slot_type_idx, state.new_slot_cat_idx)
+        if vars_:
+            new_idx = (state.new_slot_var_idx + 1) % len(vars_)
+            return dataclasses.replace(state, new_slot_var_idx=new_idx,
+                                       new_slot_active_ctrl="VAR")
+    if event.key == 3:  # SK4: BACK
         return dataclasses.replace(state, new_slot_active_ctrl="")
-    if event.key == 4:  # SK5: CREATE — instantiate the track
+    if event.key == 4:  # SK5: CREATE
         return _create_new_slot_track(state)
     return state
 
@@ -469,15 +505,16 @@ def _create_new_slot_track(state: AppState) -> AppState:
     type_idx = state.new_slot_type_idx
     name, param = catalog.get_track_params(type_idx, state.new_slot_cat_idx, state.new_slot_var_idx)
     if type_idx == 1:  # KEYS → SynthTrack
-        quantized = (state.new_slot_var_idx == 0)  # 0=QUANT, 1=FREE
+        extras = catalog.get_synth_preset_extras(state.new_slot_cat_idx, state.new_slot_var_idx)
         new_track = SynthTrack(name=name, loops=default_track_loops(), osc_type=param,
-                               quantized=quantized,
+                               quantized=True,
                                scale=state.last_synth_scale,
-                               root_note=state.last_synth_root)
+                               root_note=state.last_synth_root,
+                               **extras)
         init_offset = _free_piano_init_offset((new_track,))
     else:  # DRUMS → DrumTrack
         new_track = DrumTrack(name=name, sample_name=param, loops=default_track_loops())
-        init_offset = state.pitch_window_offset  # drums don't use pitch_window_offset
+        init_offset = state.pitch_window_offset
     new_tracks = state.tracks[:pad] + (new_track,) + state.tracks[pad + 1:]
     return dataclasses.replace(
         state,
@@ -505,6 +542,23 @@ def _cycle_loop_count(state: AppState) -> AppState:
     new_track = dataclasses.replace(track, loops=new_loops)
     new_tracks = state.tracks[:state.selected_track] + (new_track,) + state.tracks[state.selected_track + 1:]
     return dataclasses.replace(state, tracks=new_tracks)
+
+
+def _enter_rec_all(state: AppState) -> AppState:
+    """Arms all DrumTrack and SampleTrack indices, enters INSTRUMENT/DRUM_FREE."""
+    drum_idxs = tuple(
+        i for i, t in enumerate(state.tracks)
+        if isinstance(t, (DrumTrack, SampleTrack))
+    )
+    if not drum_idxs:
+        return state
+    return dataclasses.replace(state,
+        armed_tracks=drum_idxs,
+        mode=Mode.INSTRUMENT,
+        instrument_submode=InstrumentSubmode.DRUM_FREE,
+        instrument_oled_page=0,
+        instrument_active_ctrl="",
+    )
 
 
 def _arm_single(state: AppState) -> AppState:
@@ -580,27 +634,21 @@ def _new_slot_encoder(state: AppState, event: EncoderTurned) -> AppState:
     if ctrl == "TYPE":
         types = catalog.INSTRUMENT_TYPES
         new_idx = (state.new_slot_type_idx + delta) % len(types)
-        # Reset downstream indices when type changes.
-        return dataclasses.replace(
-            state,
-            new_slot_type_idx=new_idx,
-            new_slot_cat_idx=0,
-            new_slot_var_idx=0,
-        )
+        return dataclasses.replace(state,
+                                   new_slot_type_idx=new_idx,
+                                   new_slot_cat_idx=0, new_slot_var_idx=0, new_slot_mode_idx=0)
     if ctrl == "CAT":
         cats = catalog.get_categories(state.new_slot_type_idx)
         if cats:
             new_idx = (state.new_slot_cat_idx + delta) % len(cats)
-            return dataclasses.replace(
-                state,
-                new_slot_cat_idx=new_idx,
-                new_slot_var_idx=0,
-            )
+            return dataclasses.replace(state, new_slot_cat_idx=new_idx)
     if ctrl == "VAR":
         vars_ = catalog.get_variations(state.new_slot_type_idx, state.new_slot_cat_idx)
         if vars_:
             new_idx = (state.new_slot_var_idx + delta) % len(vars_)
             return dataclasses.replace(state, new_slot_var_idx=new_idx)
+    if ctrl == "MODE":
+        return dataclasses.replace(state, new_slot_mode_idx=(state.new_slot_mode_idx + delta) % 2)
     return state
 
 
@@ -608,67 +656,286 @@ def _new_slot_encoder(state: AppState, event: EncoderTurned) -> AppState:
 
 
 def _start_free_recording(state: AppState) -> AppState:
-    """Begin FREE recording. On first pass, loop grows freely.
-    On subsequent passes (overdub), pitches merge into the existing fixed-length loop."""
+    """Begin FREE recording. Pre-allocate loop and start playback."""
     if not state.armed_tracks:
         return dataclasses.replace(state, free_recording=True, free_record_pending=False)
-    track_idx = state.armed_tracks[0]
-    track = state.tracks[track_idx]
     loop_idx = state.selected_loop
-    if isinstance(track, SynthTrack):
+    new_state = state
+    for track_idx in state.armed_tracks:
+        track = new_state.tracks[track_idx]
+        if track is None:
+            continue
         loop = track.loops[loop_idx]
-        existing_len = loop.step_count if not loop.is_empty else 0
-    else:
-        existing_len = 0
-    return dataclasses.replace(
-        state,
-        free_recording=True,
-        free_record_pending=False,
-        free_loop_length=existing_len,
-        step_cursor=0,
-    )
+        if loop.is_empty:
+            spb = loop.steps_per_bar
+            new_steps = tuple(StepNote.off() for _ in range(loop.bars * spb))
+            new_loop = dataclasses.replace(loop, steps=new_steps)
+            new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+            new_track = dataclasses.replace(track, loops=new_loops)
+            new_tracks = new_state.tracks[:track_idx] + (new_track,) + new_state.tracks[track_idx + 1:]
+            new_state = dataclasses.replace(new_state, tracks=new_tracks)
+    new_playing = set(new_state.playing_loops)
+    new_active = set(new_state.active_loops)
+    for track_idx in new_state.armed_tracks:
+        new_playing.add((track_idx, loop_idx))
+        new_active.add((track_idx, loop_idx))
+    final_track = new_state.tracks[new_state.armed_tracks[0]]
+    existing_len = final_track.loops[loop_idx].step_count if final_track is not None else 0
+    return dataclasses.replace(new_state,
+                               free_recording=True,
+                               free_record_pending=False,
+                               free_pending_ticks=(),
+                               free_loop_length=existing_len,
+                               playing_loops=frozenset(new_playing),
+                               active_loops=frozenset(new_active))
 
 
 def _stop_free_recording(state: AppState) -> AppState:
-    """Finalize FREE recording: round loop length up to nearest bar, then auto-start."""
-    if not state.armed_tracks:
-        return dataclasses.replace(state, free_recording=False)
-    track_idx = state.armed_tracks[0]
+    """Stop writing notes. Loop keeps playing."""
+    return dataclasses.replace(state, free_recording=False, free_pending_ticks=())
+
+
+def _undo_free_session(state: AppState) -> AppState:
+    """Restore armed loops to snapshot taken at last REC press."""
+    new_state = dataclasses.replace(state, rec_held_shift=False, rec_held_ticks=0,
+                                    free_recording=False, free_pending_ticks=())
+    new_playing = set(new_state.playing_loops)
+    new_active = set(new_state.active_loops)
+    for track_idx, loop_idx, loop_snap in state.free_undo_loops:
+        track = new_state.tracks[track_idx]
+        if track is None:
+            continue
+        new_loops = track.loops[:loop_idx] + (loop_snap,) + track.loops[loop_idx + 1:]
+        new_track = dataclasses.replace(track, loops=new_loops)
+        new_tracks = new_state.tracks[:track_idx] + (new_track,) + new_state.tracks[track_idx + 1:]
+        new_state = dataclasses.replace(new_state, tracks=new_tracks)
+        if loop_snap.is_empty:
+            new_playing.discard((track_idx, loop_idx))
+            new_active.discard((track_idx, loop_idx))
+    return dataclasses.replace(new_state,
+                               playing_loops=frozenset(new_playing),
+                               active_loops=frozenset(new_active))
+
+
+def _clear_free_loop(state: AppState) -> AppState:
+    """Clear all notes from armed loops and stop playback."""
+    loop_idx = state.selected_loop
+    new_state = dataclasses.replace(state, rec_held_shift=False, rec_held_ticks=0,
+                                    free_recording=False, free_pending_ticks=(),
+                                    free_undo_loops=())
+    new_playing = set(new_state.playing_loops)
+    new_active = set(new_state.active_loops)
+    for track_idx in state.armed_tracks:
+        track = new_state.tracks[track_idx]
+        if track is None:
+            continue
+        loop = track.loops[loop_idx]
+        empty_loop = dataclasses.replace(loop, steps=(), free_events=())
+        new_loops = track.loops[:loop_idx] + (empty_loop,) + track.loops[loop_idx + 1:]
+        new_track = dataclasses.replace(track, loops=new_loops)
+        new_tracks = new_state.tracks[:track_idx] + (new_track,) + new_state.tracks[track_idx + 1:]
+        new_state = dataclasses.replace(new_state, tracks=new_tracks)
+        new_playing.discard((track_idx, loop_idx))
+        new_active.discard((track_idx, loop_idx))
+    return dataclasses.replace(new_state,
+                               playing_loops=frozenset(new_playing),
+                               active_loops=frozenset(new_active))
+
+
+def _drum_free_pad_pressed(state: AppState, event: PadPressed) -> AppState:
+    """DRUM_FREE: pad 0-15 maps to track 0-15. Records NoteEvent to that track's loop."""
+    pad = event.pad_index
+    if pad >= 16:
+        return state
+    track_idx = pad
     track = state.tracks[track_idx]
-    if not isinstance(track, SynthTrack):
-        return dataclasses.replace(state, free_recording=False)
+    if track is None:
+        return state
+    if not state.free_recording:
+        return state
     loop_idx = state.selected_loop
     loop = track.loops[loop_idx]
-    spb = loop.steps_per_bar
-    cursor = state.step_cursor
     if loop.is_empty:
-        return dataclasses.replace(state, free_recording=False, step_cursor=0)
-    # Round up to the nearest whole bar (minimum 1 bar)
-    bars = max(1, (max(cursor, 1) + spb - 1) // spb)
-    new_count = bars * spb
-    steps = loop.steps
-    if len(steps) < new_count:
-        steps = steps + tuple(StepNote.off() for _ in range(new_count - len(steps)))
-    else:
-        steps = steps[:new_count]
-    # Trim blank trailing bars — keep at least 1 bar
-    while bars > 1:
-        bar_start = (bars - 1) * spb
-        if not any(steps[bar_start + i].on for i in range(spb)):
-            bars -= 1
-            steps = steps[:bar_start]
-        else:
-            break
-    new_count = bars * spb
-    new_loop = dataclasses.replace(loop, steps=steps, bars=bars)
+        spb = loop.steps_per_bar
+        new_steps = tuple(StepNote.off() for _ in range(loop.bars * spb))
+        new_loop = dataclasses.replace(loop, steps=new_steps)
+        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+        new_track = dataclasses.replace(track, loops=new_loops)
+        new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+        state = dataclasses.replace(state, tracks=new_tracks)
+        track = state.tracks[track_idx]
+        loop = track.loops[loop_idx]
+    loop_offsets = dict(state.loop_measure_offsets)
+    bar_offset = loop_offsets.get((track_idx, loop_idx), 0)
+    spb = loop.steps_per_bar
+    step_in_bar = state.playhead * spb // 32
+    step_idx = (bar_offset * spb + step_in_bar) % max(1, loop.step_count)
+    pitch = 60
+    if step_idx < loop.step_count:
+        old_step = loop.steps[step_idx]
+        new_step = (StepNote(on=True, pitches=(pitch,), velocity=event.velocity, gate=1.0)
+                    if not old_step.on else dataclasses.replace(old_step, velocity=event.velocity))
+        new_steps = loop.steps[:step_idx] + (new_step,) + loop.steps[step_idx + 1:]
+        new_loop = dataclasses.replace(loop, steps=new_steps)
+        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+        new_track = dataclasses.replace(track, loops=new_loops)
+        new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+        state = dataclasses.replace(state, tracks=new_tracks)
+    pending = state.free_pending_ticks + ((pad, step_idx, pitch, event.velocity),)
+    return dataclasses.replace(state, free_pending_ticks=pending)
+
+
+def _drum_free_pad_released(state: AppState, event: PadReleased) -> AppState:
+    """DRUM_FREE: update gate on the step + commit NoteEvent (no cursor advancement)."""
+    pad = event.pad_index
+    if pad >= 16:
+        return state
+    track_idx = pad
+    pending = state.free_pending_ticks
+    match_idx = next((i for i, p in enumerate(pending) if p[0] == pad), None)
+    if match_idx is None:
+        return state
+    _, tick, pitch, velocity = pending[match_idx]
+    remaining = pending[:match_idx] + pending[match_idx + 1:]
+    loop_idx = state.selected_loop
+    track = state.tracks[track_idx]
+    if track is None:
+        return dataclasses.replace(state, free_pending_ticks=remaining)
+    loop = track.loops[loop_idx]
+    step_dur_secs = 60.0 / max(1.0, state.tempo_bpm) / (loop.step_size / 4.0)
+    gate = max(0.1, event.hold_seconds / step_dur_secs)
+    if tick < loop.step_count:
+        old_step = loop.steps[tick]
+        if old_step.on:
+            new_step = dataclasses.replace(old_step, gate=gate)
+            new_steps = loop.steps[:tick] + (new_step,) + loop.steps[tick + 1:]
+            new_loop = dataclasses.replace(loop, steps=new_steps)
+            new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+            new_track = dataclasses.replace(track, loops=new_loops)
+            new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+            state = dataclasses.replace(state, tracks=new_tracks)
+    loop = state.tracks[track_idx].loops[loop_idx]
+    note_event = NoteEvent(tick=tick, pitch=pitch, velocity=velocity, gate=gate, aftertouch=0.0)
+    new_loop = dataclasses.replace(loop, free_events=loop.free_events + (note_event,))
     new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
-    new_track = dataclasses.replace(track, loops=new_loops)
+    new_track = dataclasses.replace(state.tracks[track_idx], loops=new_loops)
     new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
-    state = dataclasses.replace(
-        state, tracks=new_tracks, free_recording=False, step_cursor=0,
-        free_loop_length=new_count,
-    )
-    return _auto_start_and_gc(state, track_idx, loop_idx)
+    return dataclasses.replace(state, tracks=new_tracks, free_pending_ticks=remaining)
+
+
+def _drum_pads_pad_pressed(state: AppState, event: PadPressed, track_idx: int) -> AppState:
+    """DrumTrack PADS submode: any pad is a drum hit. Clock-driven placement."""
+    if not state.free_recording:
+        return state
+    loop_idx = state.selected_loop
+    track = state.tracks[track_idx]
+    if track is None:
+        return state
+
+    # Lazily pre-allocate loop if still empty
+    loop = track.loops[loop_idx]
+    if loop.is_empty:
+        spb = loop.steps_per_bar
+        new_steps = tuple(StepNote.off() for _ in range(loop.bars * spb))
+        new_loop = dataclasses.replace(loop, steps=new_steps)
+        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+        new_track = dataclasses.replace(track, loops=new_loops)
+        new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+        state = dataclasses.replace(state, tracks=new_tracks)
+        track = state.tracks[track_idx]
+        loop = track.loops[loop_idx]
+
+    # Clock-driven position
+    loop_offsets = dict(state.loop_measure_offsets)
+    bar_offset = loop_offsets.get((track_idx, loop_idx), 0)
+    spb = loop.steps_per_bar
+    step_in_bar = state.playhead * spb // 32
+    step_idx = (bar_offset * spb + step_in_bar) % max(1, loop.step_count)
+    pitch = 60
+
+    if step_idx < loop.step_count:
+        old_step = loop.steps[step_idx]
+        if not old_step.on:
+            new_step = StepNote(on=True, pitches=(pitch,), velocity=event.velocity, gate=1.0)
+        else:
+            new_step = dataclasses.replace(old_step, velocity=event.velocity)
+        new_steps = loop.steps[:step_idx] + (new_step,) + loop.steps[step_idx + 1:]
+        new_loop = dataclasses.replace(loop, steps=new_steps)
+        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+        new_track = dataclasses.replace(track, loops=new_loops)
+        new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+        state = dataclasses.replace(state, tracks=new_tracks)
+
+    loop = state.tracks[track_idx].loops[loop_idx]
+    note_event = NoteEvent(tick=step_idx, pitch=pitch, velocity=event.velocity, gate=1.0)
+    new_free = loop.free_events + (note_event,)
+    new_loop = dataclasses.replace(loop, free_events=new_free)
+    new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+    new_track = dataclasses.replace(state.tracks[track_idx], loops=new_loops)
+    new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+    return dataclasses.replace(state, tracks=new_tracks)
+
+
+def _run_quantize(state: AppState) -> AppState:
+    """Convert loop.free_events to steps using pull-toward-grid quantization."""
+    if not state.armed_tracks:
+        return state
+    loop_idx = state.selected_loop
+    new_state = state
+    grid = state.quantize_grid
+    strength = state.quantize_strength
+
+    for track_idx in state.armed_tracks:
+        track = new_state.tracks[track_idx]
+        if track is None:
+            continue
+        loop = track.loops[loop_idx]
+        if not loop.free_events:
+            continue
+        spb = loop.steps_per_bar
+        from collections import defaultdict as _dd
+        tick_map = _dd(list)
+        for evt in loop.free_events:
+            # Pull toward nearest grid point
+            steps_per_grid = max(1, loop.step_size // grid)
+            grid_pos = round(evt.tick / steps_per_grid) * steps_per_grid
+            new_tick = round(evt.tick + strength * (grid_pos - evt.tick))
+            new_tick = max(0, new_tick)
+            tick_map[new_tick].append(evt)
+        max_tick = max(tick_map.keys()) if tick_map else 0
+        bars = max(1, (max_tick + spb) // spb)
+        new_count = bars * spb
+        new_steps_list = [StepNote.off()] * new_count
+        for tick, evts in tick_map.items():
+            if tick < new_count:
+                pitches = tuple(sorted({ev.pitch for ev in evts}))
+                max_vel = max(ev.velocity for ev in evts)
+                avg_gate = sum(ev.gate for ev in evts) / len(evts)
+                at = max(ev.aftertouch for ev in evts)
+                new_steps_list[tick] = StepNote(
+                    on=True, pitches=pitches,
+                    velocity=max_vel, gate=max(0.1, avg_gate), aftertouch=at,
+                )
+        # Trim blank trailing bars
+        while bars > 1:
+            bar_start = (bars - 1) * spb
+            if not any(new_steps_list[bar_start + i].on for i in range(spb)):
+                bars -= 1
+                new_steps_list = new_steps_list[:bars * spb]
+            else:
+                break
+        new_count = bars * spb
+        new_loop = dataclasses.replace(loop, steps=tuple(new_steps_list[:new_count]), bars=bars,
+                                       free_events=())
+        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+        if isinstance(track, SynthTrack):
+            new_track = dataclasses.replace(track, loops=new_loops, quantized=True)
+        else:
+            new_track = dataclasses.replace(track, loops=new_loops)
+        new_tracks = new_state.tracks[:track_idx] + (new_track,) + new_state.tracks[track_idx + 1:]
+        new_state = dataclasses.replace(new_state, tracks=new_tracks)
+        new_state = _auto_start_and_gc(new_state, track_idx, loop_idx)
+    return new_state
 
 
 def _instrument_undo(state: AppState) -> AppState:
@@ -719,6 +986,8 @@ def _reduce_instrument(state: AppState, event: Event) -> AppState:
     if isinstance(event, PadPressed):
         return _instrument_pad_pressed(state, event)
     if isinstance(event, PadReleased):
+        if state.instrument_submode == InstrumentSubmode.DRUM_FREE and state.free_recording:
+            return _drum_free_pad_released(state, event)
         # Only FREE piano mode cares about pad release (hold-based duration)
         if state.armed_tracks:
             track = state.tracks[state.armed_tracks[0]]
@@ -917,9 +1186,16 @@ def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
     loop_idx = state.selected_loop
     view_m = state.instrument_view_measure
 
+    if state.instrument_submode == InstrumentSubmode.DRUM_FREE:
+        return _drum_free_pad_pressed(state, event)
+
     if len(state.armed_tracks) == 1:
         affected_track = state.armed_tracks[0]
         track = state.tracks[affected_track]
+
+        if (isinstance(track, DrumTrack)
+                and state.instrument_submode == InstrumentSubmode.PADS):
+            return _drum_pads_pad_pressed(state, event, affected_track)
 
         # SynthTrack gets its own dual-row pad logic in both submodes.
         if isinstance(track, SynthTrack):
@@ -1132,13 +1408,10 @@ def _piano_pad_pressed(
 ) -> AppState:
     """
     SynthTrack FREE (piano keyboard) mode handler.
-
-    Row 0 (pad 0-15): white keys — C D E F G A B repeating
-    Row 1 (pad 16-31): black keys — C# D# (dead) F# G# A# (dead) repeating
-    Dead positions (E#/B#) produce no note.
+    Notes are placed at the current clock position (bar_offset * spb + playhead * spb // 32).
     """
     if not state.free_recording:
-        return state  # free-play mode: audio preview only, no step writing
+        return state
     state = _save_undo(state)
     loop_idx = state.selected_loop
     track = state.tracks[track_idx]
@@ -1152,87 +1425,104 @@ def _piano_pad_pressed(
     else:
         pitch = black_key_at(offset + (pad - 16))
         if pitch is None:
-            return state  # dead key (E# / B# position)
+            return state
 
     pitch = max(0, min(127, pitch + state.octave_offset * 12))
-    loop_len = state.free_loop_length
-    step_idx = state.step_cursor
-    if loop_len > 0:
-        # Overdub: cursor wraps at fixed loop length, no growing
-        step_idx = step_idx % loop_len
-        state = dataclasses.replace(state, step_cursor=step_idx)
-        # Merge pitch into existing step (additive overdub)
-        cur_loop = state.tracks[track_idx].loops[loop_idx]
-        if step_idx < cur_loop.step_count:
-            old_step = cur_loop.steps[step_idx]
-            if old_step.on and pitch not in old_step.pitches:
-                merged = old_step.pitches + (pitch,)
-                new_step = dataclasses.replace(old_step, pitches=merged)
-            elif not old_step.on:
-                new_step = StepNote(on=True, pitches=(pitch,),
-                                    velocity=event.velocity, gate=1.0)
-            else:
-                new_step = old_step  # pitch already present, skip duplicate
-            new_steps = cur_loop.steps[:step_idx] + (new_step,) + cur_loop.steps[step_idx + 1:]
-            new_loop = dataclasses.replace(cur_loop, steps=new_steps)
-            new_loops = state.tracks[track_idx].loops[:loop_idx] + (new_loop,) + state.tracks[track_idx].loops[loop_idx + 1:]
-            new_track = dataclasses.replace(state.tracks[track_idx], loops=new_loops)
-            new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
-            state = dataclasses.replace(state, tracks=new_tracks)
-    else:
-        # First pass: loop grows freely
-        state = _ensure_loop_length(state, track_idx, loop_idx, step_idx + 1)
-        state = _set_step_pitch(state, track_idx, loop_idx, step_idx,
-                                pitch, event.velocity, gate=1.0)
-    # Cursor does NOT advance here — it advances when the pad is released.
-    # During the initial recording pass (loop_len==0) we withhold auto-start so
-    # playback doesn't begin on a partial, growing loop — wait for _stop_free_recording.
-    if state.free_loop_length == 0:
-        return _drop_fully_empty_tracks(state, (track_idx,))
-    return _auto_start_and_gc(state, track_idx, loop_idx)
+
+    # Lazily pre-allocate loop if still empty
+    loop = track.loops[loop_idx]
+    if loop.is_empty:
+        spb = loop.steps_per_bar
+        new_steps = tuple(StepNote.off() for _ in range(loop.bars * spb))
+        new_loop = dataclasses.replace(loop, steps=new_steps)
+        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+        new_track = dataclasses.replace(track, loops=new_loops)
+        new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+        state = dataclasses.replace(state, tracks=new_tracks)
+        track = state.tracks[track_idx]
+        loop = track.loops[loop_idx]
+
+    # Clock-driven position
+    loop_offsets = dict(state.loop_measure_offsets)
+    bar_offset = loop_offsets.get((track_idx, loop_idx), 0)
+    spb = loop.steps_per_bar
+    step_in_bar = state.playhead * spb // 32
+    step_idx = (bar_offset * spb + step_in_bar) % max(1, loop.step_count)
+
+    # Write to step (additive — handles simultaneous multi-pad polyphony)
+    if step_idx < loop.step_count:
+        old_step = loop.steps[step_idx]
+        if not old_step.on:
+            new_step = StepNote(on=True, pitches=(pitch,), velocity=event.velocity, gate=1.0)
+        elif pitch not in old_step.pitches:
+            new_step = dataclasses.replace(old_step, pitches=old_step.pitches + (pitch,))
+        else:
+            new_step = old_step
+        new_steps = loop.steps[:step_idx] + (new_step,) + loop.steps[step_idx + 1:]
+        new_loop = dataclasses.replace(loop, steps=new_steps)
+        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+        new_track = dataclasses.replace(track, loops=new_loops)
+        new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+        state = dataclasses.replace(state, tracks=new_tracks)
+
+    # Register pending tick so release can finalize gate + commit NoteEvent
+    pending = state.free_pending_ticks + ((pad, step_idx, pitch, event.velocity),)
+    return dataclasses.replace(state, free_pending_ticks=pending)
 
 
 def _piano_pad_released(
     state: AppState, event: PadReleased, track_idx: int,
 ) -> AppState:
     """
-    Commit note duration on pad release: update gate from hold time, advance cursor.
+    Commit note on pad release: create NoteEvent with real gate, advance cursor.
     """
     if not state.free_recording:
-        return state  # nothing was written on press, nothing to finalize
+        return state
+    pad = event.pad_index
+    # Find matching pending entry for this pad
+    pending = state.free_pending_ticks
+    match_idx = next((i for i, p in enumerate(pending) if p[0] == pad), None)
+    if match_idx is None:
+        return state
+
+    entry = pending[match_idx]
+    _, tick, pitch, velocity = entry
+    remaining = pending[:match_idx] + pending[match_idx + 1:]
+
     loop_idx = state.selected_loop
     track = state.tracks[track_idx]
     if track is None:
-        return state
+        return dataclasses.replace(state, free_pending_ticks=remaining)
     loop = track.loops[loop_idx]
     step_size = loop.step_size
     step_dur_secs = 60.0 / max(1.0, state.tempo_bpm) / (step_size / 4.0)
     gate = max(0.1, event.hold_seconds / step_dur_secs)
+    aftertouch = state.current_aftertouch
 
-    step_idx = state.step_cursor
-    if step_idx < loop.step_count:
-        old_step = loop.steps[step_idx]
+    # Update gate on the step that was written during press
+    if tick < loop.step_count:
+        old_step = loop.steps[tick]
         if old_step.on:
             new_step = dataclasses.replace(old_step, gate=gate)
-            new_steps = loop.steps[:step_idx] + (new_step,) + loop.steps[step_idx + 1:]
+            new_steps = loop.steps[:tick] + (new_step,) + loop.steps[tick + 1:]
             new_loop = dataclasses.replace(loop, steps=new_steps)
             new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
             new_track = dataclasses.replace(track, loops=new_loops)
             new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
             state = dataclasses.replace(state, tracks=new_tracks)
 
-    advance = max(1, round(gate))
-    next_cursor = step_idx + advance
-    loop_len = state.free_loop_length
-    if loop_len > 0:
-        # Overdub: wrap at fixed loop length
-        next_cursor = next_cursor % loop_len
-    else:
-        # First pass: loop grows
-        state = _ensure_loop_length(state, track_idx, loop_idx, next_cursor + 1)
-        step_count = state.tracks[track_idx].loops[loop_idx].step_count
-        next_cursor = next_cursor % max(1, step_count)
-    return dataclasses.replace(state, step_cursor=next_cursor)
+    # Commit NoteEvent (for quantize and aftertouch storage)
+    loop = state.tracks[track_idx].loops[loop_idx]  # re-read after step update
+    note_event = NoteEvent(tick=tick, pitch=pitch, velocity=velocity,
+                           gate=gate, aftertouch=aftertouch)
+    new_free = loop.free_events + (note_event,)
+    new_loop = dataclasses.replace(loop, free_events=new_free)
+    new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+    new_track = dataclasses.replace(state.tracks[track_idx], loops=new_loops)
+    new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+    state = dataclasses.replace(state, tracks=new_tracks)
+
+    return dataclasses.replace(state, free_pending_ticks=remaining)
 
 
 def _toggle_step(
@@ -1258,29 +1548,55 @@ def _toggle_step(
 
 
 def _instrument_transport(state: AppState, event: TransportPressed) -> AppState:
-    if not event.pressed:
-        return state
     if event.button == "PLAY":
+        if not event.pressed:
+            return state
         return dataclasses.replace(state, is_playing=True)
     if event.button == "STOP":
+        if not event.pressed:
+            return state
         return dataclasses.replace(state,
                                    is_playing=False, playhead=0, loop_measure_offsets=(),
                                    free_recording=False, free_record_pending=False)
     if event.button == "REC":
         first_track = state.tracks[state.armed_tracks[0]] if state.armed_tracks else None
-        if isinstance(first_track, SynthTrack) and not first_track.quantized:
+        is_free = (isinstance(first_track, SynthTrack) and not first_track.quantized) or \
+                  state.instrument_submode == InstrumentSubmode.DRUM_FREE or \
+                  (isinstance(first_track, DrumTrack) and state.instrument_submode == InstrumentSubmode.PADS)
+        if is_free:
             if state.shift_held:
-                # Shift+REC = reset pattern
-                return dataclasses.replace(_instrument_reset(state),
-                                           free_recording=False, free_record_pending=False)
-            if state.free_recording:
-                return _stop_free_recording(state)
-            elif state.free_record_pending:
-                return dataclasses.replace(state, free_record_pending=False)
+                if event.pressed:
+                    return dataclasses.replace(state, rec_held_shift=True, rec_held_ticks=0,
+                                               free_recording=False)
+                else:  # released
+                    if state.rec_held_shift:
+                        if state.rec_held_ticks < _REC_HOLD_TICKS:
+                            return _undo_free_session(state)
+                        else:
+                            return _clear_free_loop(state)
+                    return dataclasses.replace(state, rec_held_shift=False)
             else:
-                return dataclasses.replace(state, free_record_pending=True)
+                state = dataclasses.replace(state, rec_held_shift=False)
+                if event.pressed:
+                    snap = tuple(
+                        (ti, state.selected_loop, state.tracks[ti].loops[state.selected_loop])
+                        for ti in state.armed_tracks
+                        if state.tracks[ti] is not None
+                    )
+                    if not state.free_record_pending and not state.free_recording:
+                        # Not yet running: arm for bar-boundary start
+                        return dataclasses.replace(state, free_record_pending=True,
+                                                   free_undo_loops=snap)
+                    else:
+                        # Loop already running: start recording immediately
+                        return dataclasses.replace(state, free_recording=True,
+                                                   free_undo_loops=snap)
+                else:  # released
+                    if state.free_record_pending:
+                        return dataclasses.replace(state, free_record_pending=False)
+                    return _stop_free_recording(state)
         # Non-FREE: Shift+REC saves active loops
-        if state.shift_held:
+        if state.shift_held and event.pressed:
             return dataclasses.replace(state, active_loops=state.playing_loops)
     return state
 
@@ -1298,16 +1614,19 @@ _CHORD_TYPES = ("major", "minor", "dom7", "maj7", "min7", "sus2", "sus4", "aug",
 
 
 def _instrument_mode_button(state: AppState, event: ModeButtonPressed) -> AppState:
-    """Jogwheel arrows navigate OLED pages in INSTRUMENT view for SynthTracks."""
+    """Jogwheel arrows navigate OLED pages in INSTRUMENT view for SynthTracks and DrumTracks."""
     first_track = state.tracks[state.armed_tracks[0]] if state.armed_tracks else None
-    if not isinstance(first_track, SynthTrack):
+    if isinstance(first_track, SynthTrack):
+        max_page = 4
+    elif isinstance(first_track, DrumTrack) and state.instrument_submode == InstrumentSubmode.STEPS:
+        max_page = 1
+    else:
         return state
     if event.button == "FORWARD":
-        new_page = min(2, state.instrument_oled_page + 1)
-    else:  # BACK
+        new_page = min(max_page, state.instrument_oled_page + 1)
+    else:
         new_page = max(0, state.instrument_oled_page - 1)
-    return dataclasses.replace(state, instrument_oled_page=new_page,
-                               instrument_active_ctrl="")
+    return dataclasses.replace(state, instrument_oled_page=new_page, instrument_active_ctrl="")
 
 
 def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
@@ -1326,36 +1645,42 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
                 new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
                 return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
             if event.key == 2:
-                ctrl = "BARS" if state.shift_held else "RANGE"
+                ctrl = "ATTACK" if state.shift_held else "BARS"
                 new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
                 return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
             if event.key == 3:
                 if state.shift_held:
-                    # SK4 shift = RESO toggle
-                    new_ctrl = "" if state.instrument_active_ctrl == "RESO" else "RESO"
-                    return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-                else:
-                    # SK4 normal = aftertouch toggle
                     return _adjust_synth_param(
                         state, lambda t: dataclasses.replace(t, aftertouch=not t.aftertouch)
                     )
+                else:
+                    if first_track and not first_track.quantized:
+                        # FREE → QUANT: quantize recorded notes and switch to step mode
+                        new_state = _run_quantize(state)
+                        return _adjust_synth_param(
+                            new_state, lambda t: dataclasses.replace(t, quantized=True)
+                        )
+                    # STEP → FREE: enter free piano mode
+                    return _adjust_synth_param(
+                        state, lambda t: dataclasses.replace(t, quantized=False)
+                    )
             if event.key == 4:
                 if state.shift_held:
-                    return dataclasses.replace(state, vel_sensitive=not state.vel_sensitive)
+                    new_ctrl = "" if state.instrument_active_ctrl == "RELEASE" else "RELEASE"
+                    return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
                 new_ctrl = "" if state.instrument_active_ctrl == "OCTAVE" else "OCTAVE"
                 return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
         elif page == 1:
             # Page 1 (arp): ARP_ON / ARP_MODE / ARP_CLEAR / ARP_RATE / ARP_OCTAVES
             if event.key == 0:
-                return _adjust_synth_param(
-                    state, lambda t: dataclasses.replace(t, arp_on=not t.arp_on)
+                return _adjust_loop_param(
+                    state, lambda lp: dataclasses.replace(lp, arp_on=not lp.arp_on)
                 )
             if event.key == 1:
                 new_ctrl = "" if state.instrument_active_ctrl == "ARP_MODE" else "ARP_MODE"
                 return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
             if event.key == 2:
-                # CLEAR arp sequence — resets to empty; for now just a placeholder
-                return state
+                return state  # CLEAR placeholder
             if event.key == 3:
                 new_ctrl = "" if state.instrument_active_ctrl == "ARP_RATE" else "ARP_RATE"
                 return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
@@ -1365,8 +1690,8 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
         elif page == 2:
             # Page 2 (chord): CHORD_ON / CHORD_TYPE / VOICES / — / —
             if event.key == 0:
-                return _adjust_synth_param(
-                    state, lambda t: dataclasses.replace(t, chord_on=not t.chord_on)
+                return _adjust_loop_param(
+                    state, lambda lp: dataclasses.replace(lp, chord_on=not lp.chord_on)
                 )
             if event.key == 1:
                 new_ctrl = "" if state.instrument_active_ctrl == "CHORD_TYPE" else "CHORD_TYPE"
@@ -1374,26 +1699,91 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
             if event.key == 2:
                 new_ctrl = "" if state.instrument_active_ctrl == "VOICES" else "VOICES"
                 return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-    else:
-        # Drum track: SK4 is BACK
-        if event.key == 3:
-            state = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
-            armed = state.saved_armed_tracks if state.saved_armed_tracks is not None else state.armed_tracks
-            return dataclasses.replace(state, mode=Mode.SESSION, instrument_active_ctrl="",
-                                       armed_tracks=armed, saved_armed_tracks=None)
-        if event.key == 0:
-            new_ctrl = "" if state.instrument_active_ctrl == "BARS" else "BARS"
-            return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-        if event.key == 1:
-            new_ctrl = "" if state.instrument_active_ctrl == "NUMER" else "NUMER"
-            return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-        if event.key == 2:
-            new_ctrl = "" if state.instrument_active_ctrl == "SIZE" else "SIZE"
-            return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
-        if event.key == 4:
-            if state.shift_held:
-                return _clear_armed_loops(state)
+        elif page == 3:
+            # Page 3 (quantize): GRID / — / STRENGTH / — / QUANTIZE
+            if event.key == 0:
+                new_ctrl = "" if state.instrument_active_ctrl == "Q_GRID" else "Q_GRID"
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+            if event.key == 2:
+                new_ctrl = "" if state.instrument_active_ctrl == "Q_STR" else "Q_STR"
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+            if event.key == 4:
+                return _run_quantize(state)
+        elif page == 4:
+            if event.key == 0:   # SK1: KEEP
+                return _set_keep_empty(state)
+            if event.key == 4:   # SK5: DELETE
+                return _delete_armed_track(state)
+        # VEL/MONO toggle available on any page where SK5 isn't claimed above
+        if event.key == 4 and not state.shift_held:
             return dataclasses.replace(state, vel_sensitive=not state.vel_sensitive)
+    else:
+        # Drum track
+        if state.instrument_submode == InstrumentSubmode.DRUM_FREE:
+            if event.key == 0:
+                new_state = _run_quantize(state)
+                return dataclasses.replace(new_state, instrument_submode=InstrumentSubmode.STEPS,
+                                           instrument_active_ctrl="")
+            if event.key == 1:
+                new_ctrl = "" if state.instrument_active_ctrl == "Q_GRID" else "Q_GRID"
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+            if event.key == 2:
+                new_ctrl = "" if state.instrument_active_ctrl == "Q_STR" else "Q_STR"
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+            if event.key == 3:  # BACK → SESSION
+                state_out = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
+                saved = state_out.saved_armed_tracks if state_out.saved_armed_tracks is not None else ()
+                return dataclasses.replace(state_out, mode=Mode.SESSION, armed_tracks=saved,
+                                           saved_armed_tracks=None, instrument_submode=InstrumentSubmode.STEPS,
+                                           instrument_active_ctrl="", free_recording=False,
+                                           free_record_pending=False)
+            if event.key == 4:
+                return dataclasses.replace(state, vel_sensitive=not state.vel_sensitive)
+        elif state.instrument_submode == InstrumentSubmode.PADS:
+            # Free drum recording submode: QUANT / Q.GRID / Q.AMT / BACK / VEL
+            if event.key == 0:
+                new_state = _run_quantize(state)
+                return dataclasses.replace(new_state, instrument_submode=InstrumentSubmode.STEPS,
+                                           instrument_active_ctrl="")
+            if event.key == 1:
+                new_ctrl = "" if state.instrument_active_ctrl == "Q_GRID" else "Q_GRID"
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+            if event.key == 2:
+                new_ctrl = "" if state.instrument_active_ctrl == "Q_STR" else "Q_STR"
+                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+            if event.key == 3:
+                return dataclasses.replace(state, instrument_submode=InstrumentSubmode.STEPS,
+                                           instrument_active_ctrl="")
+            if event.key == 4:
+                return dataclasses.replace(state, vel_sensitive=not state.vel_sensitive)
+        else:
+            # STEPS submode: page 0 = BARS/NUMER/SIZE/BACK/FREE; page 1 = KEEP/DELETE
+            page = state.instrument_oled_page
+            if page == 0:
+                if event.key == 3:
+                    state = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
+                    armed = state.saved_armed_tracks if state.saved_armed_tracks is not None else state.armed_tracks
+                    return dataclasses.replace(state, mode=Mode.SESSION, instrument_active_ctrl="",
+                                               armed_tracks=armed, saved_armed_tracks=None)
+                if event.key == 0:
+                    new_ctrl = "" if state.instrument_active_ctrl == "BARS" else "BARS"
+                    return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+                if event.key == 1:
+                    new_ctrl = "" if state.instrument_active_ctrl == "NUMER" else "NUMER"
+                    return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+                if event.key == 2:
+                    new_ctrl = "" if state.instrument_active_ctrl == "SIZE" else "SIZE"
+                    return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+                if event.key == 4:
+                    if state.shift_held:
+                        return _clear_armed_loops(state)
+                    return dataclasses.replace(state, instrument_submode=InstrumentSubmode.PADS,
+                                               instrument_active_ctrl="")
+            elif page == 1:
+                if event.key == 0:   # SK1: KEEP
+                    return _set_keep_empty(state)
+                if event.key == 4:   # SK5: DELETE
+                    return _delete_armed_track(state)
     return state
 
 
@@ -1434,6 +1824,25 @@ def _adjust_synth_param(state: AppState, fn) -> AppState:
         new_track = fn(track)
         if new_track is track:
             continue
+        new_tracks = new_state.tracks[:idx] + (new_track,) + new_state.tracks[idx + 1:]
+        new_state = dataclasses.replace(new_state, tracks=new_tracks)
+    return new_state
+
+
+def _adjust_loop_param(state: AppState, fn) -> AppState:
+    """Apply fn(Loop) → Loop to the selected loop of every armed SynthTrack."""
+    new_state = state
+    loop_idx = state.selected_loop
+    for idx in state.armed_tracks:
+        track = new_state.tracks[idx]
+        if not isinstance(track, SynthTrack):
+            continue
+        loop = track.loops[loop_idx]
+        new_loop = fn(loop)
+        if new_loop is loop:
+            continue
+        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+        new_track = dataclasses.replace(track, loops=new_loops)
         new_tracks = new_state.tracks[:idx] + (new_track,) + new_state.tracks[idx + 1:]
         new_state = dataclasses.replace(new_state, tracks=new_tracks)
     return new_state
@@ -1534,41 +1943,65 @@ def _instrument_encoder(state: AppState, event: EncoderTurned) -> AppState:
         return _adjust_synth_cutoff(state, event.delta)
     if ctrl == "RESO":
         return _adjust_synth_reso(state, event.delta)
+    if ctrl == "ATTACK":
+        factor = 1.15 if event.delta > 0 else 1.0 / 1.15
+        def adjust_attack(track: SynthTrack) -> SynthTrack:
+            return dataclasses.replace(track, amp_attack=round(max(0.001, min(10.0, track.amp_attack * factor)), 4))
+        return _adjust_synth_param(state, adjust_attack)
+    if ctrl == "SUSTAIN":
+        step = 0.05 * (1 if event.delta > 0 else -1)
+        def adjust_sustain(track: SynthTrack) -> SynthTrack:
+            return dataclasses.replace(track, amp_sustain=round(max(0.0, min(1.0, track.amp_sustain + step)), 3))
+        return _adjust_synth_param(state, adjust_sustain)
+    if ctrl == "RELEASE":
+        factor = 1.15 if event.delta > 0 else 1.0 / 1.15
+        def adjust_release(track: SynthTrack) -> SynthTrack:
+            return dataclasses.replace(track, amp_release=round(max(0.001, min(10.0, track.amp_release * factor)), 4))
+        return _adjust_synth_param(state, adjust_release)
     if ctrl == "SCALE":
         return _adjust_synth_scale(state, event.delta)
     if ctrl == "ROOT":
         return _adjust_synth_root(state, event.delta)
     if ctrl == "ARP_MODE":
         d = 1 if event.delta > 0 else -1
-        def cycle_arp_mode(track: SynthTrack) -> SynthTrack:
-            idx = _ARP_MODES.index(track.arp_mode) if track.arp_mode in _ARP_MODES else 0
-            new_idx = (idx + d) % len(_ARP_MODES)
-            return dataclasses.replace(track, arp_mode=_ARP_MODES[new_idx])
-        return _adjust_synth_param(state, cycle_arp_mode)
+        def cycle_arp_mode(lp: Loop) -> Loop:
+            idx = _ARP_MODES.index(lp.arp_mode) if lp.arp_mode in _ARP_MODES else 0
+            return dataclasses.replace(lp, arp_mode=_ARP_MODES[(idx + d) % len(_ARP_MODES)])
+        return _adjust_loop_param(state, cycle_arp_mode)
     if ctrl == "ARP_RATE":
         d = 1 if event.delta > 0 else -1
-        def cycle_arp_rate(track: SynthTrack) -> SynthTrack:
-            idx = _ARP_RATES.index(track.arp_rate) if track.arp_rate in _ARP_RATES else 2
-            new_idx = max(0, min(len(_ARP_RATES) - 1, idx + d))
-            return dataclasses.replace(track, arp_rate=_ARP_RATES[new_idx])
-        return _adjust_synth_param(state, cycle_arp_rate)
+        def cycle_arp_rate(lp: Loop) -> Loop:
+            idx = _ARP_RATES.index(lp.arp_rate) if lp.arp_rate in _ARP_RATES else 2
+            return dataclasses.replace(lp, arp_rate=_ARP_RATES[max(0, min(len(_ARP_RATES) - 1, idx + d))])
+        return _adjust_loop_param(state, cycle_arp_rate)
     if ctrl == "ARP_OCT":
         d = 1 if event.delta > 0 else -1
-        def adjust_arp_oct(track: SynthTrack) -> SynthTrack:
-            return dataclasses.replace(track, arp_octaves=max(1, min(4, track.arp_octaves + d)))
-        return _adjust_synth_param(state, adjust_arp_oct)
+        def adjust_arp_oct(lp: Loop) -> Loop:
+            return dataclasses.replace(lp, arp_octaves=max(1, min(4, lp.arp_octaves + d)))
+        return _adjust_loop_param(state, adjust_arp_oct)
     if ctrl == "CHORD_TYPE":
         d = 1 if event.delta > 0 else -1
-        def cycle_chord_type(track: SynthTrack) -> SynthTrack:
-            idx = _CHORD_TYPES.index(track.chord_type) if track.chord_type in _CHORD_TYPES else 0
-            new_idx = (idx + d) % len(_CHORD_TYPES)
-            return dataclasses.replace(track, chord_type=_CHORD_TYPES[new_idx])
-        return _adjust_synth_param(state, cycle_chord_type)
+        def cycle_chord_type(lp: Loop) -> Loop:
+            idx = _CHORD_TYPES.index(lp.chord_type) if lp.chord_type in _CHORD_TYPES else 0
+            return dataclasses.replace(lp, chord_type=_CHORD_TYPES[(idx + d) % len(_CHORD_TYPES)])
+        return _adjust_loop_param(state, cycle_chord_type)
     if ctrl == "VOICES":
         d = 1 if event.delta > 0 else -1
         def adjust_voices(track: SynthTrack) -> SynthTrack:
             return dataclasses.replace(track, max_voices=max(1, min(16, track.max_voices + d)))
         return _adjust_synth_param(state, adjust_voices)
+    if ctrl == "Q_GRID":
+        d = 1 if event.delta > 0 else -1
+        try:
+            idx = _STEP_SIZES.index(state.quantize_grid)
+        except ValueError:
+            idx = 2
+        new_idx = max(0, min(len(_STEP_SIZES) - 1, idx + d))
+        return dataclasses.replace(state, quantize_grid=_STEP_SIZES[new_idx])
+    if ctrl == "Q_STR":
+        step = 0.1 * (1 if event.delta > 0 else -1)
+        new_str = round(max(0.0, min(1.0, state.quantize_strength + step)), 2)
+        return dataclasses.replace(state, quantize_strength=new_str)
     return state
 
 
@@ -1585,6 +2018,44 @@ def _instrument_arrow(state: AppState, event: ArrowPressed) -> AppState:
     delta = 1 if event.direction == "RIGHT" else -1
     view = max(0, min(max_pages - 1, state.instrument_view_measure + delta))
     return dataclasses.replace(state, instrument_view_measure=view)
+
+
+def _get_edit_fx(state: AppState):
+    """Return (chain, track_idx_or_None) for the active FX context."""
+    if state.mode == Mode.INSTRUMENT and state.armed_tracks:
+        track = state.tracks[state.armed_tracks[0]]
+        if track is not None and hasattr(track, "fx"):
+            return track.fx, state.armed_tracks[0]
+    return state.global_fx, None
+
+
+def _set_edit_fx(state: AppState, new_chain, track_idx) -> AppState:
+    """Write an updated FX chain back into state."""
+    if track_idx is not None:
+        track = state.tracks[track_idx]
+        new_track = dataclasses.replace(track, fx=new_chain)
+        new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+        return dataclasses.replace(state, tracks=new_tracks)
+    return dataclasses.replace(state, global_fx=new_chain)
+
+
+def _fx_encoder(state: AppState, event) -> AppState:
+    """Encoder 1-8 adjusts FX param. One revolution (24 detents) = full 0→1 range."""
+    fx_idx = event.encoder - 1
+    step = event.delta / 24
+    chain, track_idx = _get_edit_fx(state)
+
+    if state.fx_edit_page == 0:
+        vals = list(chain.page1)
+        vals[fx_idx] = round(max(0.0, min(1.0, vals[fx_idx] + step)), 3)
+        new_chain = dataclasses.replace(chain, page1=tuple(vals))
+    else:
+        vals = list(chain.page2)
+        vals[fx_idx] = round(max(0.0, min(1.0, vals[fx_idx] + step)), 3)
+        new_chain = dataclasses.replace(chain, page2=tuple(vals))
+
+    state = _set_edit_fx(state, new_chain, track_idx)
+    return dataclasses.replace(state, fx_active_knob=fx_idx)
 
 
 def _drop_fully_empty_tracks(
@@ -1605,7 +2076,7 @@ def _drop_fully_empty_tracks(
         if idx in protected:
             continue
         track = tracks[idx]
-        if track is not None and all(loop.is_empty for loop in track.loops):
+        if track is not None and all(loop.is_empty for loop in track.loops) and not getattr(track, 'keep_empty', False):
             tracks[idx] = None
             if idx in new_armed:
                 new_armed.remove(idx)
@@ -1626,6 +2097,44 @@ def _drop_fully_empty_tracks(
         soloed_tracks=state.soloed_tracks - dropped,
         mode=new_mode,
         loop_measure_offsets=new_offsets,
+    )
+
+
+def _set_keep_empty(state: AppState) -> AppState:
+    """Set keep_empty=True on all armed tracks."""
+    new_state = state
+    for track_idx in state.armed_tracks:
+        track = new_state.tracks[track_idx]
+        if track is None:
+            continue
+        try:
+            new_track = dataclasses.replace(track, keep_empty=True)
+        except TypeError:
+            continue
+        new_tracks = new_state.tracks[:track_idx] + (new_track,) + new_state.tracks[track_idx + 1:]
+        new_state = dataclasses.replace(new_state, tracks=new_tracks)
+    return new_state
+
+
+def _delete_armed_track(state: AppState) -> AppState:
+    """Remove first armed track slot and return to SESSION."""
+    if not state.armed_tracks:
+        return state
+    track_idx = state.armed_tracks[0]
+    new_tracks = state.tracks[:track_idx] + (None,) + state.tracks[track_idx + 1:]
+    new_playing = frozenset(p for p in state.playing_loops if p[0] != track_idx)
+    new_active = frozenset(p for p in state.active_loops if p[0] != track_idx)
+    new_armed = tuple(t for t in state.armed_tracks if t != track_idx)
+    new_offsets = tuple(e for e in state.loop_measure_offsets if e[0][0] != track_idx)
+    return dataclasses.replace(state,
+        tracks=new_tracks,
+        armed_tracks=new_armed,
+        playing_loops=new_playing,
+        active_loops=new_active,
+        muted_tracks=frozenset(state.muted_tracks - {track_idx}),
+        soloed_tracks=frozenset(state.soloed_tracks - {track_idx}),
+        loop_measure_offsets=new_offsets,
+        mode=Mode.SESSION,
     )
 
 

@@ -697,18 +697,20 @@ def test_synth_oled_page2_chord_controls():
     assert _t(oled, OLED_BTN3_TITLE) == "VOICES"
 
 
-def test_synth_oled_page2_no_sk4_sk5():
-    """Page 2 does not set SK4/SK5 — delta renderer will clear them."""
+def test_synth_oled_page2_has_vel_sk5():
+    """Page 2 shows VEL/MONO on SK5; SK4 is left empty."""
     oled = render_oled(_synth_armed_state(page=2))
     assert OLED_BTN4_TITLE not in oled
-    assert OLED_BTN5_TITLE not in oled
+    from controller_map import OLED_BTN5_TITLE as SK5T
+    assert SK5T in oled
+    assert oled[SK5T][0] in ("VEL", "MONO")
 
 
-def test_synth_free_mode_line2_shows_beat_counter():
-    """FREE (non-quantized) synth in INSTRUMENT mode shows beat/measure progress."""
+def test_synth_free_mode_line2_shows_bbt_position():
+    """FREE (non-quantized) synth in INSTRUMENT mode shows BBT position."""
     oled = render_oled(_synth_armed_state(page=0, quantized=False))
     line2 = _t(oled, OLED_MAIN_LINE2)
-    assert "/" in line2  # beat/numer format
+    assert "." in line2  # BBT format (bar.beat.sub)
     assert "L1" in line2
 
 
@@ -717,3 +719,22 @@ def test_synth_free_recording_prefix():
     s = dataclasses.replace(_synth_armed_state(page=0, quantized=False), free_recording=True)
     oled = render_oled(s)
     assert _t(oled, OLED_MAIN_LINE1).startswith("● ")
+
+
+def test_synth_oled_page0_normal_has_len_not_range():
+    """Page 0 normal: SK3 shows LEN (loop bars), not RANGE."""
+    oled = render_oled(_synth_armed_state(page=0))
+    assert _t(oled, OLED_BTN3_TITLE) == "LEN"
+    assert "bar" in _t(oled, OLED_BTN3_VALUE)
+
+
+def test_synth_oled_page0_shift_has_attack_sustain_release():
+    """Page 0 shift: SK3=ATTACK, SK4=SUSTAIN, SK5=RELEASE."""
+    s = dataclasses.replace(_synth_armed_state(page=0), shift_held=True)
+    oled = render_oled(s)
+    assert _t(oled, OLED_BTN3_TITLE) == "ATTACK"
+    assert _t(oled, OLED_BTN4_TITLE) == "SUSTAIN"
+    assert _t(oled, OLED_BTN5_TITLE) == "RELEASE"
+    assert "ms" in _t(oled, OLED_BTN3_VALUE) or "s" in _t(oled, OLED_BTN3_VALUE)
+    assert "%" in _t(oled, OLED_BTN4_VALUE)
+    assert "ms" in _t(oled, OLED_BTN5_VALUE) or "s" in _t(oled, OLED_BTN5_VALUE)

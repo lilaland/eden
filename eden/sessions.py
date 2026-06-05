@@ -7,8 +7,8 @@ import os
 from typing import Optional
 
 from eden.state import (
-    AppState, DrumTrack, SynthTrack, Loop, StepNote, Mode, InstrumentSubmode,
-    default_loop, default_track_loops,
+    AppState, DrumTrack, SynthTrack, Loop, StepNote, NoteEvent, Mode, InstrumentSubmode,
+    FXChain, default_loop, default_track_loops,
 )
 
 SESSION_VERSION = 2
@@ -59,6 +59,19 @@ def _str_to_steps(
     return tuple(result)
 
 
+def _fxchain_to_dict(chain: FXChain) -> dict:
+    return {"page1": list(chain.page1), "page2": list(chain.page2)}
+
+
+def _dict_to_fxchain(d) -> FXChain:
+    if d is None:
+        return FXChain()
+    return FXChain(
+        page1=tuple(float(v) for v in d.get("page1", (0.5, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0))),
+        page2=tuple(float(v) for v in d.get("page2", (0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0))),
+    )
+
+
 # ── Loop ──────────────────────────────────────────────────────────────────────
 
 def _loop_to_dict(loop: Loop) -> Optional[dict]:
@@ -83,10 +96,27 @@ def _loop_to_dict(loop: Loop) -> Optional[dict]:
         d["velocities"] = velocities
     if any(g != 0.5 for g in gates):
         d["gates"] = gates
+    # Arp/chord — only emit when non-default
+    if loop.arp_on:
+        d["arp_on"] = loop.arp_on
+        d["arp_mode"] = loop.arp_mode
+        d["arp_rate"] = loop.arp_rate
+        d["arp_octaves"] = loop.arp_octaves
+    if loop.chord_on:
+        d["chord_on"] = loop.chord_on
+        d["chord_type"] = loop.chord_type
+    # Free events
+    if loop.free_events:
+        d["free_events"] = [
+            {"tick": e.tick, "pitch": e.pitch, "velocity": e.velocity,
+             "gate": e.gate, "aftertouch": e.aftertouch}
+            for e in loop.free_events
+        ]
     return d
 
 
-def _dict_to_loop(d: Optional[dict]) -> Loop:
+def _dict_to_loop(d: Optional[dict], track_arp: Optional[dict] = None) -> Loop:
+    """Deserialize a loop dict. track_arp is a dict with legacy per-track arp/chord fields."""
     if d is None:
         return default_loop()
     steps = _str_to_steps(
@@ -95,6 +125,17 @@ def _dict_to_loop(d: Optional[dict]) -> Loop:
         velocities=d.get("velocities"),
         gates=d.get("gates"),
     )
+    # Migrate legacy track-level arp/chord to loop if this loop has no override
+    arp_src = d if "arp_on" in d else (track_arp or {})
+    chord_src = d if "chord_on" in d else (track_arp or {})
+    raw_events = d.get("free_events", [])
+    free_events = tuple(
+        NoteEvent(
+            tick=e["tick"], pitch=e["pitch"], velocity=e["velocity"],
+            gate=e["gate"], aftertouch=e.get("aftertouch", 0.0),
+        )
+        for e in raw_events
+    )
     return Loop(
         steps=steps,
         bars=d.get("bars", 1),
@@ -102,6 +143,13 @@ def _dict_to_loop(d: Optional[dict]) -> Loop:
         step_size=d.get("step_size", 16),
         loop_count=d.get("loop_count", 0),
         volume=d.get("volume", 1.0),
+        arp_on=bool(arp_src.get("arp_on", False)),
+        arp_mode=str(arp_src.get("arp_mode", "up")),
+        arp_rate=int(arp_src.get("arp_rate", 16)),
+        arp_octaves=int(arp_src.get("arp_octaves", 1)),
+        chord_on=bool(chord_src.get("chord_on", False)),
+        chord_type=str(chord_src.get("chord_type", "major")),
+        free_events=free_events,
     )
 
 
@@ -116,6 +164,7 @@ def _track_to_dict(track) -> Optional[dict]:
             "name": track.name,
             "sample_name": track.sample_name,
             "volume": track.volume,
+            "fx": _fxchain_to_dict(track.fx),
             "loops": [_loop_to_dict(lp) for lp in track.loops],
         }
     if isinstance(track, SynthTrack):
@@ -135,12 +184,7 @@ def _track_to_dict(track) -> Optional[dict]:
             "scale": track.scale,
             "quantized": track.quantized,
             "aftertouch": track.aftertouch,
-            "arp_on": track.arp_on,
-            "arp_mode": track.arp_mode,
-            "arp_rate": track.arp_rate,
-            "arp_octaves": track.arp_octaves,
-            "chord_on": track.chord_on,
-            "chord_type": track.chord_type,
+            "fx": _fxchain_to_dict(track.fx),
             "loops": [_loop_to_dict(lp) for lp in track.loops],
         }
     return None
@@ -156,10 +200,14 @@ def _dict_to_track(d: Optional[dict]):
         while len(loops) < 16:
             loops += (default_loop(),)
         return DrumTrack(name=d["name"], sample_name=d["sample_name"],
-                         volume=d.get("volume", 1.0), loops=loops[:16])
+                         volume=d.get("volume", 1.0), loops=loops[:16],
+                         fx=_dict_to_fxchain(d.get("fx")))
     if t == "synth":
+        # Legacy: arp/chord may have been stored at track level; migrate to loops
+        legacy_arp = {k: d[k] for k in ("arp_on", "arp_mode", "arp_rate", "arp_octaves",
+                                          "chord_on", "chord_type") if k in d}
         raw_loops = d.get("loops", [])
-        loops = tuple(_dict_to_loop(l) for l in raw_loops)
+        loops = tuple(_dict_to_loop(l, track_arp=legacy_arp) for l in raw_loops)
         while len(loops) < 16:
             loops += (default_loop(),)
         return SynthTrack(
@@ -178,12 +226,7 @@ def _dict_to_track(d: Optional[dict]):
             scale=d.get("scale", "chromatic"),
             quantized=d.get("quantized", True),
             aftertouch=d.get("aftertouch", True),
-            arp_on=d.get("arp_on", False),
-            arp_mode=d.get("arp_mode", "up"),
-            arp_rate=d.get("arp_rate", 16),
-            arp_octaves=d.get("arp_octaves", 1),
-            chord_on=d.get("chord_on", False),
-            chord_type=d.get("chord_type", "major"),
+            fx=_dict_to_fxchain(d.get("fx")),
         )
     return None
 
@@ -201,6 +244,7 @@ def state_to_session(state: AppState, name: str) -> dict:
         "active_loops": sorted([list(pair) for pair in state.active_loops]),
         "muted_tracks": sorted(state.muted_tracks),
         "soloed_tracks": sorted(state.soloed_tracks),
+        "global_fx": _fxchain_to_dict(state.global_fx),
     }
 
 
@@ -237,6 +281,7 @@ def session_to_state_patch(data: dict, slot: int) -> dict:
         "new_slot_active_ctrl": "",
         "saved_armed_tracks": None,
         "is_playing": True,
+        "global_fx": _dict_to_fxchain(data.get("global_fx")),
     }
 
 

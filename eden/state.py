@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional, Union
 
@@ -19,15 +19,27 @@ class StepNote:
     pitches: tuple[int, ...] = (60,)  # MIDI notes 0-127; multi-voice chord; ignored by DrumTrack
     velocity: int = 100               # 0-127; used by both drums and synths
     gate: float = 0.5                 # fraction of step duration held; ignored by DrumTrack
+    aftertouch: float = 0.0           # channel pressure at time of recording [0,1]; playback-ignored
 
     @classmethod
     def off(cls) -> "StepNote":
         return cls(on=False)
 
 
+@dataclass(frozen=True)
+class NoteEvent:
+    """A single note event captured during free recording, before quantize."""
+    tick: int           # step-cursor position at press time
+    pitch: int          # MIDI note 0-127
+    velocity: int       # 0-127
+    gate: float         # duration as fraction of one step (same units as StepNote.gate)
+    aftertouch: float = 0.0  # channel pressure at release time [0,1]
+
+
 class InstrumentSubmode(Enum):
-    STEPS = auto()  # default step-grid editing
-    PADS = auto()   # M2: live pad recording into a loop slot
+    STEPS = auto()     # default step-grid editing
+    PADS = auto()      # live pad recording into a loop slot
+    DRUM_FREE = auto() # free multi-track drum recording (pads 0-15 = tracks 0-15)
 
 
 @dataclass(frozen=True)
@@ -40,10 +52,19 @@ class Loop:
     numerator: int = 4
     step_size: int = 16          # note value denominator: 4/8/16/32
     volume: float = 1.0          # per-loop mix volume 0.0–1.0
+    # Chord/arp settings (per-loop; applied during step-sequencer playback)
+    arp_on: bool = False
+    arp_mode: str = "up"         # up / down / down_up / chord / random / input
+    arp_rate: int = 16           # note value denominator (4/8/16/32)
+    arp_octaves: int = 1         # 1–4
+    chord_on: bool = False
+    chord_type: str = "major"
+    # Raw free-recording events; preserved for re-quantize
+    free_events: tuple = ()      # tuple[NoteEvent, ...]
 
     @property
     def is_empty(self) -> bool:
-        return not any(s.on for s in self.steps)
+        return not any(s.on for s in self.steps) and not self.free_events
 
     @property
     def step_count(self) -> int:
@@ -55,6 +76,15 @@ class Loop:
 
 
 @dataclass(frozen=True)
+class FXChain:
+    """8-slot FX values per page, normalized 0.0–1.0."""
+    # Page 1: LOW EQ, MID EQ, HI EQ, DELAY, CHORUS, REVERB, DIST, PHASE
+    page1: tuple[float, ...] = (0.5, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0)
+    # Page 2: HPF, LPF, CRUSH, PITCH, COMP, TAPE, GATE, RSAMP
+    page2: tuple[float, ...] = (0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0)
+
+
+@dataclass(frozen=True)
 class DrumTrack:
     """A drum/sample track backed by a single sample file."""
 
@@ -62,6 +92,8 @@ class DrumTrack:
     sample_name: str
     loops: tuple[Loop, ...]  # always 16 loops
     volume: float = 1.0      # track mix volume 0.0–1.0
+    keep_empty: bool = False
+    fx: FXChain = field(default_factory=FXChain)
 
 
 @dataclass(frozen=True)
@@ -83,12 +115,8 @@ class SynthTrack:
     scale: str = "chromatic"       # key in scales.SCALES
     quantized: bool = True         # True = scale-degree step editor; False = piano keyboard
     aftertouch: bool = True        # channel pressure enabled
-    arp_on: bool = False
-    arp_mode: str = "up"           # up / down / down_up / chord / random / input
-    arp_rate: int = 16             # note value denominator (4/8/16/32)
-    arp_octaves: int = 1           # 1–4
-    chord_on: bool = False
-    chord_type: str = "major"
+    keep_empty: bool = False
+    fx: FXChain = field(default_factory=FXChain)
 
 
 @dataclass(frozen=True)
@@ -132,7 +160,8 @@ class AppState:
     new_slot_type_idx: int = 0         # index into catalog.INSTRUMENT_TYPES
     new_slot_cat_idx: int = 0          # index into categories for current type
     new_slot_var_idx: int = 0          # index into variations for current category
-    new_slot_active_ctrl: str = ""     # "" | "TYPE" | "CAT" | "VAR"
+    new_slot_mode_idx: int = 0         # KEYS only: 0=QUANT, 1=FREE
+    new_slot_active_ctrl: str = ""     # "" | "TYPE" | "CAT" | "VAR" | "MODE"
     saved_armed_tracks: Optional[tuple[int, ...]] = None  # restored on exit from new-slot INSTRUMENT
     metronome_held: bool = False
     tap_times: tuple[float, ...] = ()  # recent Shift+Metronome tap timestamps
@@ -162,9 +191,23 @@ class AppState:
     free_recording: bool = False
     free_record_pending: bool = False
     free_loop_length: int = 0  # 0 = first pass (growing); >0 = overdub (fixed wrap length)
+    rec_held_shift: bool = False          # True while shift+REC is physically held
+    rec_held_ticks: int = 0               # clock ticks since shift+REC was pressed
+    free_undo_loops: tuple = ()           # ((track_idx, loop_idx, Loop), ...) snapshot before last REC
     # Last-used scale/root — shared by FREE and QUANT; applied to newly created SynthTracks
     last_synth_scale: str = "chromatic"
     last_synth_root: int = 60
+    global_fx: FXChain = field(default_factory=FXChain)
+    edit_mode: bool = False
+    fx_edit_page: int = 0
+    fx_active_knob: int = -1
+    # Quantize settings (applied to free_events → steps)
+    quantize_grid: int = 16          # grid resolution (same denominator as step_size)
+    quantize_strength: float = 1.0   # 0.0–1.0; pull-toward-grid fraction
+    # In-flight free-recording presses: (pad, tick, pitch, velocity) tuples
+    free_pending_ticks: tuple = ()
+    # Current channel pressure [0,1]; captured into NoteEvents on release
+    current_aftertouch: float = 0.0
 
 
 # ── Factory functions ─────────────────────────────────────────────────────────

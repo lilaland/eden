@@ -84,6 +84,9 @@ class AudioMixer:
 
         # Pre-allocated mix buffer (float64 for internal precision)
         self._mix_buf = np.zeros((BLOCK_SIZE, 2), dtype=np.float64)
+        self._track_buf = np.zeros((BLOCK_SIZE, 2), dtype=np.float64)
+        self._fx_processors: dict[int, object] = {}
+        self._master_fx = None
 
         if os.path.isdir(sample_dir):
             for fname in os.listdir(sample_dir):
@@ -153,6 +156,15 @@ class AudioMixer:
     def clear_finishing_engines(self) -> None:
         self._finishing_engines.clear()
 
+    def assign_fx_processor(self, track_idx: int, proc) -> None:
+        self._fx_processors[track_idx] = proc
+
+    def remove_fx_processor(self, track_idx: int) -> None:
+        self._fx_processors.pop(track_idx, None)
+
+    def set_master_fx(self, proc) -> None:
+        self._master_fx = proc
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -184,15 +196,29 @@ class AudioMixer:
 
         mix = self._mix_buf
         mix[:frames] = 0.0
+        track_buf = self._track_buf
 
-        for engine in list(self._engines.values()):
-            engine.fill_block(mix[:frames], frames)
+        for track_idx, engine in list(self._engines.items()):
+            track_buf[:frames] = 0.0
+            engine.fill_block(track_buf[:frames], frames)
+            fx = self._fx_processors.get(track_idx)
+            if fx is not None:
+                processed = fx.process(track_buf[:frames].astype(np.float32))
+                mix[:frames] += processed.astype(np.float64)
+            else:
+                mix[:frames] += track_buf[:frames]
 
         for engine in list(self._finishing_engines.values()):
             engine.fill_block(mix[:frames], frames)
 
         np.clip(mix[:frames], -1.0, 1.0, out=mix[:frames])
-        outdata[:] = mix[:frames].astype(np.float32)
+
+        if self._master_fx is not None:
+            out_f32 = mix[:frames].astype(np.float32)
+            processed = self._master_fx.process(out_f32)
+            outdata[:] = np.clip(processed if processed.shape[0] == frames else out_f32, -1.0, 1.0)
+        else:
+            outdata[:] = mix[:frames].astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -305,14 +331,14 @@ class StepScheduler:
 
                 if apply_effects and isinstance(track, SynthTrack):
                     # Chord expansion: add chord tones to each pitch
-                    if track.chord_on:
-                        pitches = expand_chord(pitches, track.chord_type)
+                    if loop.chord_on:
+                        pitches = expand_chord(pitches, loop.chord_type)
 
                     # Arp: sequence pitches over time instead of playing all at once
-                    if track.arp_on and track.arp_mode != "chord":
-                        seq = compute_arp_sequence(pitches, track.arp_mode, track.arp_octaves)
+                    if loop.arp_on and loop.arp_mode != "chord":
+                        seq = compute_arp_sequence(pitches, loop.arp_mode, loop.arp_octaves)
                         if seq:
-                            tpn = arp_ticks_per_note(track.arp_rate)
+                            tpn = arp_ticks_per_note(loop.arp_rate)
                             arp_gate = max(1, int(0.8 * tpn * 60.0 / bpm / 8.0 * sr))
                             # Fire first note immediately; register context for subsequent
                             engine.note_on(seq[0], amplitude, arp_gate, track)
@@ -330,9 +356,9 @@ class StepScheduler:
                             else:
                                 self._arp_tracks.pop(track_idx, None)
                         break
-                    elif track.arp_on and track.arp_mode == "chord":
+                    elif loop.arp_on and loop.arp_mode == "chord":
                         # Chord arp mode = all notes at once (same as chord_on)
-                        pitches = compute_arp_sequence(pitches, "chord", track.arp_octaves)
+                        pitches = compute_arp_sequence(pitches, "chord", loop.arp_octaves)
 
                 for p in pitches:
                     engine.note_on(p, amplitude, gate_samples, track)

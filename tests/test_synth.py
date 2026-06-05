@@ -60,36 +60,58 @@ def test_catalog_instrument_types_has_keys():
 def test_catalog_keys_categories():
     cats = catalog.get_categories(1)
     assert len(cats) >= 4
-    assert "Saw" in cats
+    assert "Raw" in cats
+    assert "Bass" in cats
+    assert "Lead" in cats
+    assert "Pad" in cats
 
 
-def test_catalog_keys_variations():
-    vars_ = catalog.get_variations(1, 0)
-    assert vars_ == ("QUANT", "FREE")
+def test_catalog_keys_variations_raw():
+    vars_ = catalog.get_variations(1, 0)  # cat_idx=0 = Raw folder
+    assert "Saw" in vars_
+    assert "Square" in vars_
+    assert "Sine" in vars_
+    assert "Tri" in vars_
+
+
+def test_catalog_keys_variations_bass():
+    vars_ = catalog.get_variations(1, 1)  # cat_idx=1 = Bass folder
+    assert "Sub Bass" in vars_
+    assert "Reese" in vars_
 
 
 def test_catalog_keys_track_params_saw():
-    name, param = catalog.get_track_params(1, 0, 0)
+    name, param = catalog.get_track_params(1, 0, 0)  # Raw/Saw
     assert name == "SAW"
     assert param == "saw"
 
 
 def test_catalog_keys_track_params_square():
-    name, param = catalog.get_track_params(1, 1, 0)
+    name, param = catalog.get_track_params(1, 0, 1)  # Raw/Square
     assert name == "SQR"
     assert param == "square"
 
 
 def test_catalog_keys_track_params_sine():
-    name, param = catalog.get_track_params(1, 2, 0)
+    name, param = catalog.get_track_params(1, 0, 2)  # Raw/Sine
     assert name == "SINE"
     assert param == "sine"
 
 
 def test_catalog_keys_track_params_tri():
-    name, param = catalog.get_track_params(1, 3, 0)
+    name, param = catalog.get_track_params(1, 0, 3)  # Raw/Tri
     assert name == "TRI"
     assert param == "triangle"
+
+
+def test_catalog_keys_preset_extras_raw_has_no_extras():
+    extras = catalog.get_synth_preset_extras(0, 0)  # Raw/Saw
+    assert extras == {}
+
+
+def test_catalog_keys_preset_extras_bass_has_filter():
+    extras = catalog.get_synth_preset_extras(1, 0)  # Bass/Sub Bass
+    assert "filter_cutoff" in extras
 
 
 # ── Creating a SynthTrack via the new-slot picker ─────────────────────────────
@@ -121,7 +143,7 @@ def test_create_synth_track_osc_type():
 
 
 def test_create_synth_track_square():
-    s = dataclasses.replace(_state_with_empty_slot_and_keys(), new_slot_cat_idx=1)
+    s = dataclasses.replace(_state_with_empty_slot_and_keys(), new_slot_cat_idx=0, new_slot_var_idx=1)
     s2 = reduce(s, SoftkeyPressed(key=4))
     assert s2.tracks[2].osc_type == "square"
 
@@ -276,11 +298,91 @@ def test_synth_cutoff_ctrl():
     assert s2.instrument_active_ctrl == "CUTOFF"
 
 
-def test_synth_sk3_shift_opens_bars():
-    # Shift+SK3 = LEN/BARS (replaces RESO)
+def test_synth_sk3_shift_opens_attack():
+    # Shift+SK3 = ATTACK
     s = dataclasses.replace(_armed_synth_state(), shift_held=True)
     s2 = reduce(s, SoftkeyPressed(key=2))
+    assert s2.instrument_active_ctrl == "ATTACK"
+
+
+def test_synth_sk3_normal_opens_bars():
+    # Normal SK3 = LEN (loop bars)
+    s = _armed_synth_state()
+    s2 = reduce(s, SoftkeyPressed(key=2))
     assert s2.instrument_active_ctrl == "BARS"
+
+
+def test_synth_sk4_toggles_free_mode():
+    # SK4: STEP → FREE enters free mode
+    s = _armed_synth_state()
+    assert s.tracks[0].quantized is True
+    s2 = reduce(s, SoftkeyPressed(key=3))
+    assert s2.tracks[0].quantized is False
+
+
+def test_synth_sk4_quant_in_free_mode_converts_and_switches():
+    """SK4 in free mode runs quantize and switches back to step mode."""
+    from eden.state import NoteEvent
+    s = dataclasses.replace(_armed_synth_state())
+    # Enter free mode
+    s = reduce(s, SoftkeyPressed(key=3))
+    assert s.tracks[0].quantized is False
+    # Plant a free_event to simulate a recorded note
+    loop = s.tracks[0].loops[0]
+    spb = loop.steps_per_bar
+    evt = NoteEvent(tick=0, pitch=60, velocity=80, gate=0.5, aftertouch=0.0)
+    new_loop = dataclasses.replace(loop, free_events=(evt,))
+    new_loops = (new_loop,) + s.tracks[0].loops[1:]
+    new_track = dataclasses.replace(s.tracks[0], loops=new_loops)
+    s = dataclasses.replace(s, tracks=(new_track,) + s.tracks[1:])
+    # Press SK4 (QUANT) in free mode
+    s2 = reduce(s, SoftkeyPressed(key=3))
+    assert s2.tracks[0].quantized is True
+    assert s2.tracks[0].loops[0].steps[0].on is True
+    assert s2.tracks[0].loops[0].free_events == ()
+
+
+def test_synth_sk4_shift_toggles_aftertouch():
+    # Shift+SK4 = toggle aftertouch
+    s = dataclasses.replace(_armed_synth_state(), shift_held=True)
+    before = s.tracks[0].aftertouch
+    s2 = reduce(s, SoftkeyPressed(key=3))
+    assert s2.tracks[0].aftertouch is not before
+
+
+def test_synth_sk5_shift_opens_release():
+    # Shift+SK5 = RELEASE
+    s = dataclasses.replace(_armed_synth_state(), shift_held=True)
+    s2 = reduce(s, SoftkeyPressed(key=4))
+    assert s2.instrument_active_ctrl == "RELEASE"
+
+
+def test_synth_encoder_increases_attack():
+    s = dataclasses.replace(_armed_synth_state(), instrument_active_ctrl="ATTACK")
+    original = s.tracks[0].amp_attack
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=1))
+    assert s2.tracks[0].amp_attack > original
+
+
+def test_synth_encoder_decreases_attack():
+    s = dataclasses.replace(_armed_synth_state(), instrument_active_ctrl="ATTACK")
+    original = s.tracks[0].amp_attack
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=-1))
+    assert s2.tracks[0].amp_attack < original
+
+
+def test_synth_encoder_increases_sustain():
+    s = dataclasses.replace(_armed_synth_state(), instrument_active_ctrl="SUSTAIN")
+    original = s.tracks[0].amp_sustain
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=1))
+    assert s2.tracks[0].amp_sustain > original
+
+
+def test_synth_encoder_decreases_release():
+    s = dataclasses.replace(_armed_synth_state(), instrument_active_ctrl="RELEASE")
+    original = s.tracks[0].amp_release
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=-1))
+    assert s2.tracks[0].amp_release < original
 
 
 def test_synth_encoder_cycles_osc_forward():
@@ -433,12 +535,12 @@ def test_oled_synth_shows_root_button():
     assert out[OLED_BTN2_TITLE][0] == "ROOT"
 
 
-def test_oled_synth_shows_range_button():
-    # Normal page SK3 is RANGE
+def test_oled_synth_shows_len_button():
+    # Normal page SK3 is LEN (loop bars)
     s = _armed_synth_state()
     out = render_oled(s)
     from controller_map import OLED_BTN3_TITLE
-    assert out[OLED_BTN3_TITLE][0] == "RANGE"
+    assert out[OLED_BTN3_TITLE][0] == "LEN"
 
 
 def test_oled_synth_shift_shows_osc_button():
@@ -455,12 +557,12 @@ def test_oled_synth_shift_shows_cutoff_button():
     assert out[OLED_BTN2_TITLE][0] == "CUTOFF"
 
 
-def test_oled_synth_shift_shows_len_button():
-    # Shift page SK3 is LEN
+def test_oled_synth_shift_shows_attack_button():
+    # Shift page SK3 is ATTACK
     s = dataclasses.replace(_armed_synth_state(), shift_held=True)
     out = render_oled(s)
     from controller_map import OLED_BTN3_TITLE
-    assert out[OLED_BTN3_TITLE][0] == "LEN"
+    assert out[OLED_BTN3_TITLE][0] == "ATTACK"
 
 
 def test_oled_drum_still_shows_bars():
@@ -517,16 +619,18 @@ def test_synth_free_sk2_opens_root():
     assert s2.instrument_active_ctrl == "ROOT"
 
 
-def test_synth_free_sk3_opens_range():
+def test_synth_free_sk3_opens_bars():
+    # SK3 normal = LEN (opens BARS ctrl)
     s = _free_synth_state()
     s2 = reduce(s, SoftkeyPressed(key=2))
-    assert s2.instrument_active_ctrl == "RANGE"
+    assert s2.instrument_active_ctrl == "BARS"
 
 
-def test_synth_sk3_opens_range():
+def test_synth_sk3_opens_bars():
+    # SK3 normal = LEN (opens BARS ctrl)
     s = _armed_synth_state()
     s2 = reduce(s, SoftkeyPressed(key=2))
-    assert s2.instrument_active_ctrl == "RANGE"
+    assert s2.instrument_active_ctrl == "BARS"
 
 
 def test_synth_free_sk5_opens_octave():
@@ -612,18 +716,17 @@ def test_oled_synth_free_line2_recording_shows_rec():
     s = _free_synth_state()  # free_recording=True
     out = render_oled(s)
     line2 = out[OLED_MAIN_LINE2][0]
-    assert "REC" in line2
+    assert "●" in line2
     assert "L1" in line2
 
 
-def test_oled_synth_free_line2_free_play_shows_beat_counter():
+def test_oled_synth_free_line2_free_play_shows_bbt_position():
     from controller_map import OLED_MAIN_LINE2
     s = dataclasses.replace(_free_synth_state(), free_recording=False)
     out = render_oled(s)
     line2 = out[OLED_MAIN_LINE2][0]
-    assert "/" in line2   # beat/numer format
+    assert "." in line2   # BBT format (bar.beat.sub)
     assert "L1" in line2
-    assert "FREE PLAY" not in line2
 
 
 def test_oled_synth_free_line2_pending_shows_arm():
@@ -663,26 +766,23 @@ def test_free_pad_press_writes_note_no_cursor_advance():
     assert s2.step_cursor == 0  # cursor stays until release
 
 
-def test_free_initial_recording_does_not_auto_start_loop():
-    """During the initial recording pass (no existing loop), loop should NOT enter
-    playing_loops on pad press — playback deferred until recording is finalized."""
-    # Use track slot 2 (no pre-existing playing loop) for a clean test
+def test_free_clock_wrap_starts_loop_and_recording():
+    """ClockTicked at bar boundary starts both loop playback and recording."""
     s = default_state()
     synth = SynthTrack(name="SAW", loops=default_track_loops(), quantized=False)
     tracks = s.tracks[:2] + (synth,) + s.tracks[3:]
     s = dataclasses.replace(
-        s,
-        tracks=tracks,
-        armed_tracks=(2,),
-        mode=Mode.INSTRUMENT,
+        s, tracks=tracks,
+        armed_tracks=(2,), mode=Mode.INSTRUMENT,
         instrument_submode=InstrumentSubmode.STEPS,
         pitch_window_offset=28,
-        free_recording=True,
+        free_record_pending=True,
+        is_playing=True, playhead=31,
     )
-    assert s.free_loop_length == 0
-    assert (2, 0) not in s.playing_loops
-    s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
-    assert (2, 0) not in s2.playing_loops
+    s2 = reduce(s, ClockTicked())
+    assert s2.playhead == 0
+    assert s2.free_recording is True
+    assert (2, 0) in s2.playing_loops
 
 
 def test_free_pad_press_placeholder_gate():
@@ -703,40 +803,48 @@ def test_free_pad_release_commits_gate():
     assert abs(s2.tracks[0].loops[0].steps[0].gate - 4.0) < 0.01
 
 
-def test_free_pad_release_advances_cursor():
-    """Cursor advances by round(gate) steps on release."""
+def test_free_pad_release_does_not_advance_cursor():
+    """Cursor does NOT advance on pad release in clock-driven mode."""
     from eden.events import PadReleased
     s = dataclasses.replace(_free_synth_state(), step_cursor=0)
     s = reduce(s, PadPressed(pad_index=0, velocity=100))
-    s2 = reduce(s, PadReleased(pad_index=0, hold_seconds=0.5))  # gate=4.0 → advance 4
-    assert s2.step_cursor == 4
+    s2 = reduce(s, PadReleased(pad_index=0, hold_seconds=0.5))
+    assert s2.step_cursor == 0
 
 
-def test_free_pad_release_extends_loop():
-    """Release near end of loop auto-extends to fit next cursor position."""
-    from eden.events import PadReleased
-    s = dataclasses.replace(_free_synth_state(), step_cursor=13)
-    s = reduce(s, PadPressed(pad_index=0, velocity=100))
-    s2 = reduce(s, PadReleased(pad_index=0, hold_seconds=0.5))  # advance 4 → cursor 17
-    assert s2.tracks[0].loops[0].step_count > 16
+def test_free_pad_press_writes_at_playhead_position():
+    """With playhead at step 16, note lands at step 8 not step 0."""
+    s = dataclasses.replace(_free_synth_state(), playhead=16)  # playhead=16 → step_in_bar=8 (spb=16, 16*16//32=8)
+    # Pre-allocate the loop (simulating _start_free_recording having run)
+    from eden.state import StepNote
+    loop = s.tracks[0].loops[0]
+    alloc_steps = tuple(StepNote.off() for _ in range(16))
+    new_loop = dataclasses.replace(loop, steps=alloc_steps)
+    new_loops = s.tracks[0].loops[:0] + (new_loop,) + s.tracks[0].loops[1:]
+    new_track = dataclasses.replace(s.tracks[0], loops=new_loops)
+    s = dataclasses.replace(s, tracks=s.tracks[:0] + (new_track,) + s.tracks[1:])
+    s2 = reduce(s, PadPressed(pad_index=7, velocity=100))  # C4
+    loop2 = s2.tracks[0].loops[0]
+    assert loop2.steps[8].on
+    assert not loop2.steps[0].on
 
 
 def test_free_pad_release_short_tap_minimum_gate():
-    """Very short tap gets minimum gate of 0.1, cursor advances 1."""
+    """Very short tap gets minimum gate of 0.1."""
     from eden.events import PadReleased
     s = dataclasses.replace(_free_synth_state(), step_cursor=0)
     s = reduce(s, PadPressed(pad_index=0, velocity=100))
     s2 = reduce(s, PadReleased(pad_index=0, hold_seconds=0.001))
     assert s2.tracks[0].loops[0].steps[0].gate == pytest.approx(0.1)
-    assert s2.step_cursor == 1  # min advance
+    assert s2.step_cursor == 0  # cursor does NOT advance
 
 
-def test_oled_free_sk3_shows_range():
-    """FREE mode SK3 shows RANGE (pitch window control)."""
+def test_oled_free_sk3_shows_len():
+    """FREE mode SK3 shows LEN (loop bars control)."""
     s = _free_synth_state()
     out = render_oled(s)
     from controller_map import OLED_BTN3_TITLE
-    assert out[OLED_BTN3_TITLE][0] == "RANGE"
+    assert out[OLED_BTN3_TITLE][0] == "LEN"
 
 
 # ── RANGE encoder (granular ±1) ───────────────────────────────────────────────
@@ -958,10 +1066,10 @@ def test_free_rec_arm_sets_pending():
     assert s2.free_recording is False
 
 
-def test_free_rec_cancel_clears_pending():
-    """Second REC press while pending cancels the arm."""
+def test_free_rec_release_while_pending_cancels_arm():
+    """REC release while pending (before bar boundary) cancels the arm."""
     s = dataclasses.replace(_free_play_state(), free_record_pending=True)
-    s2 = reduce(s, TransportPressed(button="REC", pressed=True))
+    s2 = reduce(s, TransportPressed(button="REC", pressed=False))
     assert s2.free_record_pending is False
     assert s2.free_recording is False
 
@@ -998,55 +1106,74 @@ def test_free_clock_wrap_starts_overdub_on_existing_loop():
     assert s2.free_loop_length == loop.step_count
 
 
-def test_free_stop_recording_finalizes_length():
-    """REC press while recording stops and rounds up to nearest bar."""
-    s = dataclasses.replace(_free_synth_state(), step_cursor=5)
-    # step_cursor=5 with steps_per_bar=16 → 1 bar = 16 steps
-    s2 = reduce(s, TransportPressed(button="REC", pressed=True))
+def test_free_rec_release_stops_recording():
+    """REC release while recording stops recording (loop keeps playing)."""
+    s = dataclasses.replace(_free_synth_state(), free_recording=True)
+    s2 = reduce(s, TransportPressed(button="REC", pressed=False))
     assert s2.free_recording is False
-    assert s2.tracks[0].loops[0].step_count == 16
 
 
-def test_free_stop_recording_rounds_up_multi_bar():
-    """When cursor is past one bar AND bar 2 has notes, loop stays at 2 bars."""
-    s = dataclasses.replace(_free_synth_state(), step_cursor=17)
-    from eden.state import StepNote
-    loop = s.tracks[0].loops[0]
-    # Extend to 32 steps and place notes in both bars
-    new_steps = list(loop.steps) + [StepNote.off()] * 16  # grow to 32
-    new_steps[0] = StepNote(on=True, pitches=(60,))
-    new_steps[16] = StepNote(on=True, pitches=(62,))  # note in bar 2
-    new_loop = dataclasses.replace(loop, steps=tuple(new_steps), bars=2)
-    new_loops = s.tracks[0].loops[:0] + (new_loop,) + s.tracks[0].loops[1:]
-    new_track = dataclasses.replace(s.tracks[0], loops=new_loops)
-    s = dataclasses.replace(s, tracks=s.tracks[:0] + (new_track,) + s.tracks[1:])
-    s2 = reduce(s, TransportPressed(button="REC", pressed=True))
-    assert s2.free_recording is False
-    assert s2.tracks[0].loops[0].step_count == 32  # 2 bars × 16 steps
-
-
-def test_free_stop_recording_trims_blank_trailing_bar():
-    """Blank trailing bars are trimmed: cursor in bar 2 but no notes there → 1 bar."""
-    s = dataclasses.replace(_free_synth_state(), step_cursor=17)
-    from eden.state import StepNote
-    loop = s.tracks[0].loops[0]
-    new_steps = list(loop.steps)
-    new_steps[0] = StepNote(on=True, pitches=(60,))   # note only in bar 1
-    new_loop = dataclasses.replace(loop, steps=tuple(new_steps))
-    new_loops = s.tracks[0].loops[:0] + (new_loop,) + s.tracks[0].loops[1:]
-    new_track = dataclasses.replace(s.tracks[0], loops=new_loops)
-    s = dataclasses.replace(s, tracks=s.tracks[:0] + (new_track,) + s.tracks[1:])
-    s2 = reduce(s, TransportPressed(button="REC", pressed=True))
-    assert s2.free_recording is False
-    assert s2.tracks[0].loops[0].step_count == 16  # trimmed to 1 bar
-
-
-def test_free_shift_rec_resets_pattern():
-    """Shift+REC in FREE mode resets the pattern."""
+def test_free_shift_rec_press_starts_hold_timer():
+    """Shift+REC press starts the hold timer (doesn't clear immediately)."""
     s = dataclasses.replace(_free_synth_state(), shift_held=True)
     s2 = reduce(s, TransportPressed(button="REC", pressed=True))
+    assert s2.rec_held_shift is True
+    assert s2.rec_held_ticks == 0
+    assert s2.free_recording is False  # recording paused while shift held
+
+
+def test_free_shift_rec_short_release_undoes_session():
+    """Shift+REC quick release (< 32 ticks) undoes the last recording session."""
+    from eden.state import StepNote
+    s = dataclasses.replace(_free_synth_state(), shift_held=True,
+                             rec_held_shift=True, rec_held_ticks=5)
+    # Set up a note in the loop to verify it gets undone
+    loop = s.tracks[0].loops[0]
+    note_step = StepNote(on=True, pitches=(60,))
+    new_loop = dataclasses.replace(loop, steps=(note_step,) + loop.steps[1:])
+    new_loops = s.tracks[0].loops[:0] + (new_loop,) + s.tracks[0].loops[1:]
+    new_track = dataclasses.replace(s.tracks[0], loops=new_loops)
+    s = dataclasses.replace(s, tracks=s.tracks[:0] + (new_track,) + s.tracks[1:],
+                            free_undo_loops=((0, 0, loop),))
+    s2 = reduce(s, TransportPressed(button="REC", pressed=False))
+    # Note is gone (loop restored to snapshot)
+    assert not s2.tracks[0].loops[0].steps[0].on
+    assert s2.rec_held_shift is False
+
+
+def test_free_undo_removes_from_playing_loops_when_snapshot_empty():
+    """Undo restores an empty snapshot loop and removes it from playing_loops."""
+    s = dataclasses.replace(_free_synth_state(), shift_held=True,
+                             rec_held_shift=True, rec_held_ticks=5)
+    empty_loop = s.tracks[0].loops[0]  # default empty loop = snapshot
+    # Simulate loop got pre-allocated and added to playing_loops during REC
+    from eden.state import StepNote
+    filled_loop = dataclasses.replace(empty_loop, steps=tuple(StepNote.off() for _ in range(16)))
+    new_loops = (filled_loop,) + s.tracks[0].loops[1:]
+    new_track = dataclasses.replace(s.tracks[0], loops=new_loops)
+    s = dataclasses.replace(s,
+                             tracks=(new_track,) + s.tracks[1:],
+                             playing_loops=frozenset({(0, 0)}),
+                             free_undo_loops=((0, 0, empty_loop),))
+    s2 = reduce(s, TransportPressed(button="REC", pressed=False))
+    assert (0, 0) not in s2.playing_loops
     assert s2.free_recording is False
-    assert s2.free_record_pending is False
+
+
+def test_free_shift_rec_long_release_clears_all():
+    """Shift+REC held for >=32 ticks then released clears the whole pattern."""
+    from eden.state import StepNote
+    s = dataclasses.replace(_free_synth_state(), shift_held=True,
+                             rec_held_shift=True, rec_held_ticks=32)
+    loop = s.tracks[0].loops[0]
+    note_step = StepNote(on=True, pitches=(60,))
+    new_loop = dataclasses.replace(loop, steps=(note_step,) + loop.steps[1:])
+    new_loops = s.tracks[0].loops[:0] + (new_loop,) + s.tracks[0].loops[1:]
+    new_track = dataclasses.replace(s.tracks[0], loops=new_loops)
+    s = dataclasses.replace(s, tracks=s.tracks[:0] + (new_track,) + s.tracks[1:])
+    s2 = reduce(s, TransportPressed(button="REC", pressed=False))
+    assert s2.free_recording is False
+    assert s2.rec_held_shift is False
     assert not any(step.on for step in s2.tracks[0].loops[0].steps)
 
 

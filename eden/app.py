@@ -42,6 +42,7 @@ from eden.render import render_pads, render_oled, render_button_leds
 from eden.scales import degree_to_pitch, white_idx_to_midi, black_key_at
 from eden.arp import expand_chord, compute_arp_sequence, arp_ticks_per_note
 from eden.state import default_state, AppState, DrumTrack, SynthTrack, InstrumentSubmode, Mode
+from eden.fx import FXProcessor
 from eden.events import AftertouchChanged, ClockTicked, InstrumentReset, InstrumentUndo, PadPressed, PadReleased, PlusMinusPressed, SessionLoaded, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
 from eden.state import Mode
 import eden.sessions as sessions
@@ -92,6 +93,10 @@ class EdenApp:
         self._free_pad_down_times: dict[int, float] = {}
         # FREE arp mode: held pads per track so multi-pad arps cycle all pitches
         self._held_arp_pitches: dict[int, dict[int, int]] = {}  # track_idx → {pad_idx → pitch}
+        self._fx_processors: dict[int, FXProcessor] = {}
+        self._master_fx: FXProcessor = FXProcessor(sample_rate=44100)
+        self._mixer.set_master_fx(self._master_fx)
+        self._init_fx(self._state)
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -168,6 +173,7 @@ class EdenApp:
             if new_state is not self._state:
                 old_bpm = self._state.tempo_bpm
                 self._sync_engines(self._state, new_state)
+                self._sync_fx(self._state, new_state)
                 self._state = new_state
                 self._state_ref.set(new_state)
                 self._flush_render()
@@ -244,22 +250,25 @@ class EdenApp:
             gate = max(1, int(0.25 * self._mixer._sr))
             amplitude = event.velocity / 127.0
 
+        # Chord/arp settings come from the selected loop (per-loop, not per-track)
+        sel_loop = track.loops[self._state.selected_loop]
+
         # Chord expansion (applies in both FREE and STEPS/PADS modes)
         pitches: tuple[int, ...] = (pitch,)
-        if track.chord_on:
-            pitches = expand_chord(pitches, track.chord_type)
+        if sel_loop.chord_on:
+            pitches = expand_chord(pitches, sel_loop.chord_type)
 
         # In FREE mode with arp on: drive the arp via the clock tick scheduler.
         # Accumulate all held pads so holding multiple keys arpeggios through all of them.
-        if track.arp_on and not track.quantized:
+        if sel_loop.arp_on and not track.quantized:
             held = self._held_arp_pitches.setdefault(track_idx, {})
             held[pad] = pitch
             all_pitches: tuple[int, ...] = tuple(sorted(set(held.values())))
-            if track.chord_on:
-                all_pitches = expand_chord(all_pitches, track.chord_type)
-            seq = compute_arp_sequence(all_pitches, track.arp_mode, track.arp_octaves)
+            if sel_loop.chord_on:
+                all_pitches = expand_chord(all_pitches, sel_loop.chord_type)
+            seq = compute_arp_sequence(all_pitches, sel_loop.arp_mode, sel_loop.arp_octaves)
             if seq:
-                tpn = arp_ticks_per_note(track.arp_rate)
+                tpn = arp_ticks_per_note(sel_loop.arp_rate)
                 bpm = self._state.tempo_bpm
                 arp_gate = max(1, int(0.8 * tpn * 60.0 / bpm / 8.0 * self._mixer._sr))
                 self._scheduler.merge_live_arp(
@@ -318,17 +327,20 @@ class EdenApp:
             pitch = degree_to_pitch(track.root_note, track.scale, degree)
         pitch = max(0, min(127, pitch + self._state.octave_offset * 12))
 
+        # Chord/arp from selected loop
+        sel_loop = track.loops[self._state.selected_loop]
+
         # Live arp: remove this pad from held set; if others still down, update
         # sequence; if none remain, stop the arp entirely.
-        if track.arp_on:
+        if sel_loop.arp_on:
             held = self._held_arp_pitches.get(track_idx, {})
             held.pop(pad, None)
             if held:
                 all_pitches: tuple[int, ...] = tuple(sorted(set(held.values())))
-                if track.chord_on:
-                    all_pitches = expand_chord(all_pitches, track.chord_type)
-                seq = compute_arp_sequence(all_pitches, track.arp_mode, track.arp_octaves)
-                tpn = arp_ticks_per_note(track.arp_rate)
+                if sel_loop.chord_on:
+                    all_pitches = expand_chord(all_pitches, sel_loop.chord_type)
+                seq = compute_arp_sequence(all_pitches, sel_loop.arp_mode, sel_loop.arp_octaves)
+                tpn = arp_ticks_per_note(sel_loop.arp_rate)
                 bpm = self._state.tempo_bpm
                 arp_gate = max(1, int(0.8 * tpn * 60.0 / bpm / 8.0 * self._mixer._sr))
                 # Keep existing amplitude from running context; it was set on press
@@ -344,8 +356,8 @@ class EdenApp:
             return
 
         pitches: tuple[int, ...] = (pitch,)
-        if track.chord_on:
-            pitches = expand_chord(pitches, track.chord_type)
+        if sel_loop.chord_on:
+            pitches = expand_chord(pitches, sel_loop.chord_type)
         for p in pitches:
             engine.note_off(p)
 
@@ -356,6 +368,41 @@ class EdenApp:
         for i, track in enumerate(state.tracks):
             if track is not None:
                 self._mixer.assign_engine(i, self._mixer.create_engine_for(track))
+
+    def _init_fx(self, state: AppState) -> None:
+        """Create FX processors for all non-None tracks with fx attribute."""
+        self._master_fx.update_async(state.global_fx)
+        for i, track in enumerate(state.tracks):
+            if track is not None and hasattr(track, "fx"):
+                proc = FXProcessor(sample_rate=self._mixer._sr)
+                self._fx_processors[i] = proc
+                self._mixer.assign_fx_processor(i, proc)
+                proc.update_async(track.fx)
+
+    def _sync_fx(self, old_state: AppState, new_state: AppState) -> None:
+        """Sync FX processors after a state transition."""
+        if old_state.global_fx is not new_state.global_fx:
+            self._master_fx.update_async(new_state.global_fx)
+
+        for i, (old_t, new_t) in enumerate(zip(old_state.tracks, new_state.tracks)):
+            if new_t is None:
+                if i in self._fx_processors:
+                    self._mixer.remove_fx_processor(i)
+                    del self._fx_processors[i]
+            elif not hasattr(new_t, "fx"):
+                pass
+            elif old_t is None or not hasattr(old_t, "fx"):
+                proc = FXProcessor(sample_rate=self._mixer._sr)
+                self._fx_processors[i] = proc
+                self._mixer.assign_fx_processor(i, proc)
+                proc.update_async(new_t.fx)
+            elif old_t.fx is not new_t.fx:
+                proc = self._fx_processors.get(i)
+                if proc is None:
+                    proc = FXProcessor(sample_rate=self._mixer._sr)
+                    self._fx_processors[i] = proc
+                    self._mixer.assign_fx_processor(i, proc)
+                proc.update_async(new_t.fx)
 
     def _sync_engines(self, old_state: AppState, new_state: AppState) -> None:
         """
@@ -457,6 +504,7 @@ class EdenApp:
         if new_state is not self._state:
             old_bpm = self._state.tempo_bpm
             self._sync_engines(self._state, new_state)
+            self._sync_fx(self._state, new_state)
             self._state = new_state
             self._state_ref.set(new_state)
             self._flush_render()
