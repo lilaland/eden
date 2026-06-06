@@ -2,15 +2,22 @@
 
 Serves on http://localhost:8765, zero extra deps (stdlib http.server + SSE).
 Streams state at ~30 fps via Server-Sent Events.
+
+Panels (top → bottom):
+  • Session view  — Ableton-style 16×16 clip grid (SESSION mode only)
+  • Waveform editor — sample + chop editor (INSTRUMENT + SampleTrack only)
+  • Controller mirror — always visible
 """
 
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 from eden.audio import StateRef
 from eden.render import render_pads, render_oled, render_button_leds
@@ -20,10 +27,14 @@ from controller_map import (
 )
 
 PORT = 8765
+_SLOT_LETTERS = "ABCDEFGH"
+
 
 # ── State serializer ──────────────────────────────────────────────────────────
 
-def _to_json(state) -> str:
+def _to_json(state, sessions_dir: str = "") -> str:
+    from eden.state import DrumTrack, SynthTrack, SampleTrack, Mode
+
     pads = render_pads(state)
     oled = render_oled(state)
     leds = render_button_leds(state)
@@ -34,36 +45,125 @@ def _to_json(state) -> str:
         for k, (t, r, g, b) in oled.items()
     }
 
+    # Session grid: 16 tracks × 16 loops
+    track_data = []
+    loop_matrix = []
+    for ti, track in enumerate(state.tracks):
+        if track is None:
+            track_data.append(None)
+            loop_matrix.append(None)
+        else:
+            if isinstance(track, DrumTrack):
+                ttype = "drum"
+            elif isinstance(track, SynthTrack):
+                ttype = "synth"
+            else:
+                ttype = "sample"
+            track_data.append({
+                "name": track.name,
+                "type": ttype,
+                "muted": ti in state.muted_tracks,
+                "soloed": ti in state.soloed_tracks,
+            })
+            loops = []
+            for li, loop in enumerate(track.loops):
+                key = (ti, li)
+                loops.append({
+                    "filled": not loop.is_empty,
+                    "playing": key in state.playing_loops,
+                    "active": key in state.active_loops,
+                    "finishing": key in state.finishing_loops,
+                })
+            loop_matrix.append(loops)
+
+    # Current SampleTrack chop data
+    sample_key = None
+    chops = []
+    sel_track = state.tracks[state.selected_track] if state.selected_track < len(state.tracks) else None
+    if isinstance(sel_track, SampleTrack):
+        sample_key = sel_track.sample_key
+        chops = [[c.start_offset, c.end_offset, c.name] for c in sel_track.chops]
+
+    # Which AppState scene slots are occupied
+    scenes_saved = [s is not None for s in state.scenes]
+
+    # Which session slots have files on disk
+    disk_slots = [False] * 8
+    if sessions_dir:
+        for i, letter in enumerate(_SLOT_LETTERS):
+            path = os.path.join(sessions_dir, f"session_{letter.lower()}.json")
+            disk_slots[i] = os.path.isfile(path)
+
     return json.dumps({
-        "pads":      pad_data,
-        "oled":      oled_data,
-        "play":      leds.get(NATIVE_LED_PLAY, False),
-        "stop":      leds.get(NATIVE_LED_STOP, False),
-        "rec":       leds.get(NATIVE_LED_REC, False),
-        "song":      leds.get(NATIVE_LED_SONG, False),
-        "inst":      leds.get(NATIVE_LED_INST, False),
-        "mode":      state.mode.name,
-        "bpm":       state.tempo_bpm,
-        "playhead":  state.playhead,
-        "shift":     state.shift_held,
-        "metro":     state.metronome_held,
-        "track":     state.selected_track,
-        "slot":      state.active_session_slot,
-        "armed":     list(state.armed_tracks),
-        "playing":   state.is_playing,
-        "finishing": len(state.finishing_loops) > 0,
+        "pads":           pad_data,
+        "oled":           oled_data,
+        "play":           leds.get(NATIVE_LED_PLAY, False),
+        "stop":           leds.get(NATIVE_LED_STOP, False),
+        "rec":            leds.get(NATIVE_LED_REC, False),
+        "song":           leds.get(NATIVE_LED_SONG, False),
+        "inst":           leds.get(NATIVE_LED_INST, False),
+        "mode":           state.mode.name,
+        "bpm":            state.tempo_bpm,
+        "playhead":       state.playhead,
+        "shift":          state.shift_held,
+        "metro":          state.metronome_held,
+        "track":          state.selected_track,
+        "loop":           state.selected_loop,
+        "slot":           state.active_session_slot,
+        "armed":          list(state.armed_tracks),
+        "playing":        state.is_playing,
+        "finishing":      len(state.finishing_loops) > 0,
+        "track_data":     track_data,
+        "loop_matrix":    loop_matrix,
+        "sample_key":     sample_key,
+        "chops":          chops,
+        "scenes_saved":   scenes_saved,
+        "disk_slots":     disk_slots,
+        "selected_track": state.selected_track,
+        "selected_loop":  state.selected_loop,
     })
+
+
+# ── Action dispatcher ─────────────────────────────────────────────────────────
+
+def _handle_action(action: dict, state_ref, dispatch_fn) -> None:
+    from eden.events import SongSlotPressed, SetChops, WebSelectCell
+    from eden.state import ChopPoint
+
+    atype = action.get("type")
+
+    if atype == "song_slot":
+        slot = int(action["slot"])
+        dispatch_fn(SongSlotPressed(slot=slot, pressed=True))
+        dispatch_fn(SongSlotPressed(slot=slot, pressed=False))
+
+    elif atype == "select_cell":
+        dispatch_fn(WebSelectCell(track=int(action["track"]), loop=int(action["loop"])))
+
+    elif atype == "set_chops":
+        raw = action.get("chops", [])
+        chops = tuple(
+            ChopPoint(
+                start_offset=float(c[0]),
+                end_offset=float(c[1]),
+                name=c[2] if len(c) > 2 else "",
+            )
+            for c in raw
+        )
+        dispatch_fn(SetChops(track_idx=int(action["track_idx"]), chops=chops))
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
-def _make_handler(state_ref: StateRef):
+def _make_handler(state_ref: StateRef, dispatch_fn, sessions_dir: str, get_peaks_fn):
     class _Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
 
         def do_GET(self):
-            if self.path == "/":
+            parsed = urlparse(self.path)
+
+            if parsed.path == "/":
                 body = _HTML.encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -71,7 +171,7 @@ def _make_handler(state_ref: StateRef):
                 self.end_headers()
                 self.wfile.write(body)
 
-            elif self.path == "/events":
+            elif parsed.path == "/events":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
@@ -79,13 +179,43 @@ def _make_handler(state_ref: StateRef):
                 self.end_headers()
                 try:
                     while True:
-                        data = _to_json(state_ref.get())
+                        data = _to_json(state_ref.get(), sessions_dir)
                         self.wfile.write(f"data: {data}\n\n".encode())
                         self.wfile.flush()
                         time.sleep(1 / 30)
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
 
+            elif parsed.path == "/waveform":
+                qs = parse_qs(parsed.query)
+                key = (qs.get("key") or [None])[0]
+                peaks = get_peaks_fn(key) if key and get_peaks_fn else None
+                if peaks is not None:
+                    body = json.dumps({"peaks": peaks}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", len(body))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_POST(self):
+            if self.path == "/action" and dispatch_fn is not None:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                try:
+                    _handle_action(json.loads(body), state_ref, dispatch_fn)
+                    self.send_response(204)
+                    self.end_headers()
+                except Exception:
+                    self.send_response(400)
+                    self.end_headers()
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -96,14 +226,31 @@ def _make_handler(state_ref: StateRef):
 # ── Public class ──────────────────────────────────────────────────────────────
 
 class WebUI:
-    def __init__(self, state_ref: StateRef, port: int = PORT) -> None:
+    def __init__(
+        self,
+        state_ref: StateRef,
+        port: int = PORT,
+        dispatch_fn=None,
+        sessions_dir: str = "",
+        mixer=None,
+    ) -> None:
         self._state_ref = state_ref
         self._port = port
+        self._dispatch_fn = dispatch_fn
+        self._sessions_dir = sessions_dir
+        self._mixer = mixer
+
+    def _get_peaks(self, key: str):
+        return self._mixer.get_peaks(key) if self._mixer is not None else None
 
     def run_blocking(self) -> None:
-        server = ThreadingHTTPServer(
-            ("127.0.0.1", self._port), _make_handler(self._state_ref)
+        handler_cls = _make_handler(
+            self._state_ref,
+            self._dispatch_fn,
+            self._sessions_dir,
+            self._get_peaks,
         )
+        server = ThreadingHTTPServer(("127.0.0.1", self._port), handler_cls)
         url = f"http://localhost:{self._port}"
         print(f"[UI] Controller mirror -> {url}")
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
@@ -117,39 +264,152 @@ class WebUI:
 
 # ── HTML (embedded) ───────────────────────────────────────────────────────────
 
-_HTML = """<!DOCTYPE html>
+_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Eden - Controller Mirror</title>
+<title>Eden</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{
-  background:#060606;min-height:100vh;
-  display:flex;flex-direction:column;align-items:center;justify-content:center;
-  font-family:'Courier New',Consolas,monospace;color:#bbb;padding:24px 16px;
+  background:#040405;min-height:100vh;
+  display:flex;flex-direction:column;align-items:center;
+  font-family:'Courier New',Consolas,monospace;color:#bbb;
+  padding:20px 16px 32px;gap:10px;
 }
-h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-bottom:14px}
+h1{font-size:10px;color:#333;letter-spacing:3px;text-transform:uppercase}
 
-/* chassis */
+/* ── Session view ─────────────────────────────────────────────────── */
+#session-panel{
+  width:1110px;background:#0a0a0d;border-radius:10px;
+  padding:10px 12px 12px;
+  box-shadow:0 0 0 1px rgba(255,255,255,.04),0 8px 32px rgba(0,0,0,.7);
+}
+#session-panel.hidden{display:none}
+#sess-top{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+#sess-title{font-size:9px;color:#444;letter-spacing:2px;text-transform:uppercase;flex:1}
+.sess-slots{display:flex;gap:3px}
+.sess-slot{
+  width:34px;height:22px;border-radius:3px;
+  background:#111118;border:1px solid #222230;
+  color:#444;font-size:8px;text-align:center;line-height:22px;
+  cursor:pointer;transition:all .08s;user-select:none;
+}
+.sess-slot:hover{border-color:#3a3a50;color:#777}
+.sess-slot.active{background:#e07800;border-color:#e07800;color:#000;box-shadow:0 0 6px rgba(224,120,0,.45)}
+.sess-slot.on-disk{border-color:#2a2a50;color:#5060a0}
+.sess-slot.on-disk:hover{border-color:#4040a0;color:#8090e0}
+.sess-slot.active.on-disk{background:#e07800;border-color:#e07800;color:#000}
+#bpm-badge{font-size:9px;color:#555;letter-spacing:1px}
+
+/* session grid */
+#session-grid{
+  display:grid;
+  grid-template-columns:24px repeat(16,1fr);
+  gap:1px;background:#111116;border-radius:4px;overflow:hidden;
+}
+.sg-corner{background:#0c0c10}
+.sg-track-hdr{
+  background:#111118;padding:3px 2px 3px;cursor:pointer;
+  min-width:0;overflow:hidden;text-align:center;
+}
+.sg-track-hdr:hover{background:#18181e}
+.sg-track-hdr.selected-col{background:#1a1a25}
+.sg-track-name{
+  font-size:7px;color:#555;text-transform:uppercase;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  letter-spacing:.3px;
+}
+.sg-track-type{font-size:6px;color:#333;text-transform:uppercase;margin-top:1px}
+.sg-track-hdr.t-drum .sg-track-type{color:#604010}
+.sg-track-hdr.t-synth .sg-track-type{color:#104040}
+.sg-track-hdr.t-sample .sg-track-type{color:#103040}
+.sg-track-hdr.muted .sg-track-name{opacity:.35}
+.sg-track-hdr.soloed .sg-track-name{color:#e0a020}
+.sg-loop-num{
+  background:#0c0c0f;font-size:7px;color:#282830;
+  text-align:right;padding-right:3px;line-height:20px;
+}
+.sg-cell{
+  height:20px;background:#0c0c10;cursor:pointer;
+  position:relative;transition:background .06s;border:1px solid transparent;
+}
+.sg-cell.empty-track{background:#080809;cursor:default}
+.sg-cell.has-content{background:#181825}
+.sg-cell.is-playing{background:#0a2a18}
+.sg-cell.is-active{background:#0f1e2d}
+.sg-cell.is-finishing{background:#1e1a08}
+.sg-cell.selected{border-color:#e07800!important;z-index:1}
+.sg-cell:not(.empty-track):hover{filter:brightness(1.35)}
+
+/* play dot inside cells */
+.sg-cell.is-playing::after{
+  content:'';position:absolute;top:50%;left:50%;
+  transform:translate(-50%,-50%);
+  width:5px;height:5px;border-radius:50%;
+  background:#20c060;box-shadow:0 0 4px rgba(32,192,96,.7);
+}
+.sg-cell.is-finishing::after{
+  background:#c0a020;box-shadow:0 0 4px rgba(192,160,32,.7);
+}
+.sg-cell.is-active:not(.is-playing)::after{
+  background:#2060a0;box-shadow:0 0 4px rgba(32,96,160,.5);
+}
+
+/* ── Waveform editor ──────────────────────────────────────────────── */
+#waveform-panel{
+  width:1110px;background:#06060a;border-radius:10px;
+  box-shadow:0 0 0 1px rgba(255,255,255,.04),0 8px 32px rgba(0,0,0,.7);
+  overflow:hidden;
+}
+#waveform-panel.hidden{display:none}
+#wform-top{
+  display:flex;align-items:center;gap:8px;
+  padding:7px 12px 5px;border-bottom:1px solid #111120;
+}
+#wform-title{font-size:9px;color:#444;letter-spacing:2px;text-transform:uppercase}
+#wform-sample-name{font-size:10px;color:#6080a0;letter-spacing:.5px;flex:1}
+#wform-chop-count{font-size:9px;color:#446060}
+.wform-btn{
+  padding:2px 8px;border-radius:3px;border:1px solid #222240;
+  background:#0e0e1e;color:#5060a0;font-size:8px;font-family:inherit;
+  cursor:pointer;text-transform:uppercase;letter-spacing:.5px;
+  transition:all .08s;
+}
+.wform-btn:hover{border-color:#4040a0;color:#8090e0;background:#121230}
+#wform-canvas-wrap{
+  position:relative;height:120px;cursor:crosshair;
+  background:#050508;
+}
+#wform-canvas{display:block;width:100%;height:120px}
+.chop-handle{
+  position:absolute;top:0;bottom:0;width:2px;
+  background:#c02020;cursor:col-resize;z-index:10;
+}
+.chop-handle::before{
+  content:'';position:absolute;top:0;left:50%;transform:translateX(-50%);
+  width:10px;height:10px;border-radius:50%;
+  background:#c02020;border:1px solid #ff4040;
+}
+.chop-handle:hover{background:#ff3030}
+.chop-label{
+  position:absolute;bottom:3px;left:3px;
+  font-size:7px;color:#c02020;pointer-events:none;
+}
+
+/* ── Controller chassis (unchanged structure) ─────────────────────── */
 #ctrl{
   background:linear-gradient(175deg,#222 0%,#1a1a1a 60%,#161616 100%);
   border-radius:14px;padding:14px;width:1110px;
   box-shadow:0 0 0 1px rgba(255,255,255,.06),0 16px 48px rgba(0,0,0,.85);
 }
-
-/* sections */
 #top{display:flex;align-items:flex-start;gap:10px;margin-bottom:8px}
 #mid{display:flex;align-items:center;gap:8px;margin-bottom:8px}
 #pads{background:#0f0f0f;border-radius:8px;padding:10px 10px 8px;overflow:visible}
-
-/* logo */
 #logo{min-width:60px;padding-top:6px;font-size:11px;font-weight:bold;
   letter-spacing:2px;text-transform:uppercase;color:#555;line-height:1.6}
 #logo .o{color:#e07800}
 #logo small{display:block;font-size:7px;letter-spacing:1px;color:#333;margin-top:1px}
-
-/* encoders: row1 has spacer, row2 has +/- pair — both flush left, enc cols align */
 #encs{display:flex;flex-direction:column;gap:6px;padding-top:2px}
 .enc-row{display:flex;gap:14px;align-items:center}
 .enc-spacer{width:63px;flex-shrink:0}
@@ -161,18 +421,13 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
   font-size:8px;color:#3a3a3a;
   box-shadow:0 3px 7px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.06);
 }
-/* +/- pair left of enc row 2 */
 .pm-pair{display:flex;gap:3px;flex-shrink:0}
 .pm-btn{
   width:30px;height:28px;border-radius:3px;
   background:#1a1a1a;border:1px solid #272727;
   color:#555;font-size:12px;text-align:center;line-height:28px;cursor:default;
 }
-
-/* right panel */
 #rpanel{display:flex;align-items:flex-start;gap:8px;margin-left:auto}
-
-/* mode buttons: single column */
 #mode-col{display:flex;flex-direction:column;gap:4px;padding-top:2px}
 .mode-btn{
   width:62px;height:30px;border-radius:4px;
@@ -181,8 +436,6 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
   text-transform:uppercase;letter-spacing:.4px;cursor:default;transition:all .06s;
 }
 .mode-btn.lit{background:#e07800;border-color:#e07800;color:#000;box-shadow:0 0 8px rgba(224,120,0,.55)}
-
-/* OLED block: sk row | screen | sk row */
 #oled-block{display:flex;flex-direction:column;gap:3px}
 .sk-btn-row{display:flex;gap:3px}
 .sk-btn{
@@ -201,8 +454,6 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
   box-shadow:inset 0 0 18px rgba(0,0,20,.9);
 }
 .main-line{font-size:11px;color:#ddd;white-space:nowrap;overflow:hidden;line-height:1.5}
-
-/* nav column: enc9 (jog) | back/fwd */
 #nav-col{display:flex;flex-direction:column;align-items:center;gap:5px}
 #enc9{
   width:56px;height:56px;border-radius:50%;
@@ -217,8 +468,6 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
   background:#1a1a1a;border:1px solid #272727;
   color:#444;font-size:10px;text-align:center;line-height:22px;cursor:default;
 }
-
-/* A-H slots: 2 rows of 4 */
 .slots{display:flex;gap:3px;margin-bottom:3px}
 .slot-btn{
   width:32px;height:28px;border-radius:3px;
@@ -227,8 +476,6 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
   cursor:default;transition:all .06s;
 }
 .slot-btn.active{background:#e07800;border-color:#e07800;color:#000;box-shadow:0 0 6px rgba(224,120,0,.5)}
-
-/* transport */
 .tr-row{display:flex;gap:4px;margin-top:4px}
 .tr-btn{
   width:42px;height:36px;border-radius:4px;
@@ -240,12 +487,8 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
 .tr-btn.stop.lit {background:#444;border-color:#555;color:#ddd}
 .tr-btn.rec.lit  {background:#c0302a;border-color:#c0302a;color:#fff;box-shadow:0 0 7px rgba(192,48,42,.5)}
 .tr-btn.metro.lit{background:#555;border-color:#666;color:#ddd}
-
-/* touchstrip */
 #ts-wrap{flex:1;height:18px;background:#0d0d0d;border-radius:8px;border:1px solid #202020;position:relative;overflow:hidden}
 #ts-pos{position:absolute;width:22px;height:100%;background:#e07800;border-radius:7px;left:50%;transform:translateX(-50%);opacity:0;transition:left .04s,opacity .1s}
-
-/* nav cross: 3x3 grid, corners empty */
 #nav-cross{
   display:grid;
   grid-template-columns:repeat(3,28px);
@@ -257,8 +500,6 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
   background:#1e1e1e;border:1px solid #2a2a2a;
   color:#555;font-size:11px;text-align:center;line-height:28px;cursor:default;
 }
-
-/* shift */
 #btn-shift{
   width:64px;height:28px;border-radius:4px;
   background:#e07800;border:1px solid #b05800;
@@ -267,8 +508,6 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
   cursor:default;transition:all .06s;margin-top:5px;
 }
 #btn-shift.held{background:#ffaa00;box-shadow:0 0 10px rgba(255,170,0,.65)}
-
-/* pad grid: top row offset right ~half pad width for stagger */
 .pad-row{display:flex;gap:3px;margin-bottom:4px}
 .pad-row:last-child{margin-bottom:0}
 #pr-top{padding-left:30px}
@@ -278,20 +517,42 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
   position:relative;transition:background-color .04s;flex-shrink:0;
 }
 .pad-lbl{position:absolute;bottom:3px;left:4px;font-size:7px;color:rgba(255,255,255,.12)}
-
-/* status */
-#status{text-align:center;font-size:9px;color:#383838;padding-top:7px;letter-spacing:.5px}
+#status{text-align:center;font-size:9px;color:#383838;padding-top:4px;letter-spacing:.5px}
 </style>
 </head>
 <body>
-<h1>Eden &mdash; Controller Mirror</h1>
+<h1>Eden</h1>
+
+<!-- ── Session view ─────────────────────────────────────────────────────── -->
+<div id="session-panel" class="hidden">
+  <div id="sess-top">
+    <div id="sess-title">Session</div>
+    <div id="bpm-badge"></div>
+    <div class="sess-slots" id="sess-slots"></div>
+  </div>
+  <div id="session-grid"></div>
+</div>
+
+<!-- ── Waveform editor ──────────────────────────────────────────────────── -->
+<div id="waveform-panel" class="hidden">
+  <div id="wform-top">
+    <div id="wform-title">Sample</div>
+    <div id="wform-sample-name">—</div>
+    <div id="wform-chop-count"></div>
+    <button class="wform-btn" id="btn-auto4">÷4</button>
+    <button class="wform-btn" id="btn-auto8">÷8</button>
+    <button class="wform-btn" id="btn-auto16">÷16</button>
+    <button class="wform-btn" id="btn-chop-clear">Clear</button>
+  </div>
+  <div id="wform-canvas-wrap">
+    <canvas id="wform-canvas"></canvas>
+  </div>
+</div>
+
+<!-- ── Controller chassis ───────────────────────────────────────────────── -->
 <div id="ctrl">
-
-  <!-- TOP: logo | encoders (staggered) | mode col | oled block | nav col -->
   <div id="top">
-
-    <div id="logo">AT<span class="o">O</span>M&nbsp;SQ<small>Eden M2</small></div>
-
+    <div id="logo">AT<span class="o">O</span>M&nbsp;SQ<small>Eden M5</small></div>
     <div id="encs">
       <div class="enc-row">
         <div class="enc-spacer"></div>
@@ -307,18 +568,13 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
         <div class="enc">7</div><div class="enc">8</div>
       </div>
     </div>
-
     <div id="rpanel">
-
-      <!-- Song / Inst / Edit / User — single column -->
       <div id="mode-col">
         <button id="btn-song" class="mode-btn">Song</button>
         <button id="btn-inst" class="mode-btn">Inst</button>
         <button id="btn-edit" class="mode-btn">Edit</button>
         <button id="btn-user" class="mode-btn">User</button>
       </div>
-
-      <!-- OLED block: 3 SK above | screen | 3 SK below -->
       <div id="oled-block">
         <div class="sk-btn-row">
           <div class="sk-btn" id="sk1"><div class="sk-btn-title" id="sk1t"></div><div class="sk-btn-val" id="sk1v"></div></div>
@@ -335,8 +591,6 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
           <div class="sk-btn" id="sk6"><div class="sk-btn-title" id="sk6t"></div><div class="sk-btn-val" id="sk6v"></div></div>
         </div>
       </div>
-
-      <!-- Nav column: enc9 (jog wheel) | back/fwd -->
       <div id="nav-col">
         <div id="enc9">NAV</div>
         <div class="nav-pair">
@@ -344,11 +598,9 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
           <div class="nav-sm" title="Forward">&#9654;</div>
         </div>
       </div>
-
     </div>
   </div>
 
-  <!-- MIDDLE: slots (2x4) | transport | touchstrip | nav cross + shift -->
   <div id="mid">
     <div>
       <div class="slots">
@@ -370,27 +622,17 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
         <div class="tr-btn metro" id="btn-metro">&#9833;</div>
       </div>
     </div>
-
     <div id="ts-wrap"><div id="ts-pos"></div></div>
-
-    <!-- nav cross (proper cross: up/left/right/down) + shift -->
     <div style="display:flex;flex-direction:column;align-items:center;gap:5px;flex-shrink:0">
       <div id="nav-cross">
-        <div></div>
-        <div class="nav-btn">&#9650;</div>
-        <div></div>
-        <div class="nav-btn">&#9664;</div>
-        <div></div>
-        <div class="nav-btn">&#9654;</div>
-        <div></div>
-        <div class="nav-btn">&#9660;</div>
-        <div></div>
+        <div></div><div class="nav-btn">&#9650;</div><div></div>
+        <div class="nav-btn">&#9664;</div><div></div><div class="nav-btn">&#9654;</div>
+        <div></div><div class="nav-btn">&#9660;</div><div></div>
       </div>
       <button id="btn-shift">SHIFT</button>
     </div>
   </div>
 
-  <!-- PADS: top row (16-31) staggered right 30px; bottom row (0-15) flush -->
   <div id="pads">
     <div class="pad-row" id="pr-top"></div>
     <div class="pad-row" id="pr-bot"></div>
@@ -400,7 +642,7 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
 </div>
 
 <script>
-// Build pad rows dynamically
+// ── Pad rows ────────────────────────────────────────────────────────────────
 (function(){
   const top=document.getElementById('pr-top');
   const bot=document.getElementById('pr-bot');
@@ -416,13 +658,7 @@ h1{font-size:11px;color:#444;letter-spacing:3px;text-transform:uppercase;margin-
   }
 })();
 
-// OLED slot-id -> element id
-// IDs from controller_map.py:
-//  0=BTN1_TITLE  1=BTN2_TITLE  2=BTN3_TITLE
-//  3=BTN1_VAL    4=BTN2_VAL    5=BTN3_VAL
-//  6=MAIN_LINE1  7=MAIN_LINE2
-//  8=BTN4_TITLE  9=BTN5_TITLE  10=BTN6_TITLE
-//  11=BTN4_VAL   12=BTN5_VAL   13=BTN6_VAL
+// ── OLED mapping ────────────────────────────────────────────────────────────
 const SK_TEXT={
   '0':'sk1t','1':'sk2t','2':'sk3t',
   '3':'sk1v','4':'sk2v','5':'sk3v',
@@ -430,13 +666,390 @@ const SK_TEXT={
   '8':'sk4t','9':'sk5t','10':'sk6t',
   '11':'sk4v','12':'sk5v','13':'sk6v',
 };
-// title slot-id -> sk container id (for border-top color)
 const SK_BORDER={'0':'sk1','1':'sk2','2':'sk3','8':'sk4','9':'sk5','10':'sk6'};
-
 const rgb=(r,g,b)=>`rgb(${r},${g},${b})`;
 const setLit=(id,on)=>{const e=document.getElementById(id);if(e)e.classList.toggle('lit',!!on);};
 
+// ── Session view builder ────────────────────────────────────────────────────
+const SLOTS='ABCDEFGH';
+
+// Build slot buttons in session panel header
+(function(){
+  const wrap=document.getElementById('sess-slots');
+  for(let i=0;i<8;i++){
+    const btn=document.createElement('div');
+    btn.className='sess-slot';
+    btn.id='sess-slot-'+i;
+    btn.textContent=SLOTS[i];
+    btn.title=`Load session ${SLOTS[i]}`;
+    btn.addEventListener('click',()=>post({type:'song_slot',slot:i}));
+    wrap.appendChild(btn);
+  }
+})();
+
+let _gridBuilt=false;
+
+function buildSessionGrid(trackData){
+  if(_gridBuilt) return;
+  _gridBuilt=true;
+  const grid=document.getElementById('session-grid');
+  grid.innerHTML='';
+
+  // corner
+  const corner=document.createElement('div');
+  corner.className='sg-corner';
+  grid.appendChild(corner);
+
+  // track headers
+  for(let ti=0;ti<16;ti++){
+    const hdr=document.createElement('div');
+    hdr.className='sg-track-hdr';
+    hdr.id='sg-hdr-'+ti;
+    const t=trackData[ti];
+    if(t){
+      hdr.classList.add('t-'+t.type);
+      hdr.innerHTML=`<div class="sg-track-name">${t.name}</div><div class="sg-track-type">${t.type}</div>`;
+    } else {
+      hdr.innerHTML='<div class="sg-track-name" style="color:#222">—</div>';
+    }
+    hdr.addEventListener('click',()=>post({type:'select_cell',track:ti,loop:0}));
+    grid.appendChild(hdr);
+  }
+
+  // loop rows
+  for(let li=0;li<16;li++){
+    const numCell=document.createElement('div');
+    numCell.className='sg-loop-num';
+    numCell.textContent=li;
+    grid.appendChild(numCell);
+    for(let ti=0;ti<16;ti++){
+      const cell=document.createElement('div');
+      cell.className='sg-cell';
+      cell.id=`sg-${ti}-${li}`;
+      cell.addEventListener('click',()=>post({type:'select_cell',track:ti,loop:li}));
+      grid.appendChild(cell);
+    }
+  }
+}
+
+function updateSessionGrid(s){
+  // Update header state
+  for(let ti=0;ti<16;ti++){
+    const hdr=document.getElementById('sg-hdr-'+ti);
+    if(!hdr) continue;
+    const t=s.track_data[ti];
+    hdr.className='sg-track-hdr'+(t?' t-'+t.type:'');
+    if(t){
+      if(t.muted) hdr.classList.add('muted');
+      if(t.soloed) hdr.classList.add('soloed');
+    }
+    if(ti===s.selected_track) hdr.classList.add('selected-col');
+    // Rebuild name if track appeared/disappeared
+    if(t){
+      const nameEl=hdr.querySelector('.sg-track-name');
+      if(nameEl && nameEl.textContent!==t.name){ nameEl.textContent=t.name; }
+    }
+  }
+
+  // Update cells
+  for(let ti=0;ti<16;ti++){
+    for(let li=0;li<16;li++){
+      const cell=document.getElementById(`sg-${ti}-${li}`);
+      if(!cell) continue;
+      const loops=s.loop_matrix[ti];
+      let cls='sg-cell';
+      if(!loops){ cls+=' empty-track'; }
+      else {
+        const lp=loops[li];
+        if(lp.filled) cls+=' has-content';
+        if(lp.playing) cls+=' is-playing';
+        else if(lp.active) cls+=' is-active';
+        if(lp.finishing) cls+=' is-finishing';
+        if(ti===s.selected_track && li===s.selected_loop) cls+=' selected';
+      }
+      cell.className=cls;
+    }
+  }
+}
+
+// ── Waveform editor ─────────────────────────────────────────────────────────
+const canvas=document.getElementById('wform-canvas');
+const canvasWrap=document.getElementById('wform-canvas-wrap');
+
+let wfPeaks=null;
+let wfDividers=[];      // sorted array of 0..1 positions (interior chop boundaries)
+let wfSampleKey=null;
+let wfTrackIdx=-1;
+let wfDragIdx=-1;       // index into wfDividers being dragged, or -1
+let wfDragStartX=0;
+
+function chopsToDiv(chops){
+  // chops = [[start, end, name], ...]  → extract interior dividers
+  if(!chops || chops.length<=1) return [];
+  const divs=[];
+  for(let i=0;i<chops.length-1;i++) divs.push(chops[i][1]);
+  return divs.filter(d=>d>0&&d<1).sort((a,b)=>a-b);
+}
+
+function divToChops(dividers){
+  const bounds=[0,...dividers.sort((a,b)=>a-b),1];
+  return bounds.slice(0,-1).map((s,i)=>[s,bounds[i+1],'']);
+}
+
+function drawWaveform(){
+  const W=canvas.width, H=canvas.height;
+  const ctx=canvas.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+
+  const allBounds=[0,...wfDividers,1];
+
+  // Alternating chop region backgrounds
+  for(let i=0;i<allBounds.length-1;i++){
+    const x0=allBounds[i]*W, x1=allBounds[i+1]*W;
+    ctx.fillStyle=i%2===0?'#050510':'#070718';
+    ctx.fillRect(x0,0,x1-x0,H);
+  }
+
+  if(wfPeaks && wfPeaks.length>0){
+    const centerY=H/2;
+    const barW=Math.max(1,W/wfPeaks.length);
+    // Filled waveform body
+    ctx.fillStyle='#122840';
+    for(let i=0;i<wfPeaks.length;i++){
+      const x=(i/wfPeaks.length)*W;
+      const h=wfPeaks[i]*H*0.88;
+      ctx.fillRect(x,centerY-h/2,barW,h);
+    }
+    // Peak outline (top)
+    ctx.strokeStyle='#3070a0';ctx.lineWidth=1;ctx.beginPath();
+    for(let i=0;i<wfPeaks.length;i++){
+      const x=(i/wfPeaks.length)*W+barW/2;
+      const y=centerY-wfPeaks[i]*H*0.88/2;
+      i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+    // Peak outline (bottom)
+    ctx.beginPath();
+    for(let i=0;i<wfPeaks.length;i++){
+      const x=(i/wfPeaks.length)*W+barW/2;
+      const y=centerY+wfPeaks[i]*H*0.88/2;
+      i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+    // Centre line
+    ctx.strokeStyle='#0a1e30';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(0,centerY);ctx.lineTo(W,centerY);ctx.stroke();
+  }
+
+  // Chop divider lines
+  for(let i=0;i<wfDividers.length;i++){
+    const x=wfDividers[i]*W;
+    const hot=i===wfDragIdx;
+    ctx.strokeStyle=hot?'#ff5050':'#cc2222';
+    ctx.lineWidth=hot?3:2;
+    ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();
+    // Handle dot at top
+    ctx.fillStyle=hot?'#ff5050':'#cc2222';
+    ctx.beginPath();ctx.arc(x,10,5,0,Math.PI*2);ctx.fill();
+    // Chop number label
+    ctx.fillStyle='#cc2222';ctx.font='bold 8px monospace';
+    ctx.fillText(String(i+1),x+3,H-4);
+  }
+
+  // Chop region index labels (small, bottom-right of each region)
+  ctx.font='9px monospace';
+  for(let i=0;i<allBounds.length-1;i++){
+    const x0=allBounds[i]*W, x1=allBounds[i+1]*W;
+    if(x1-x0<16) continue;
+    ctx.fillStyle='rgba(80,120,160,.5)';
+    ctx.fillText(String(i),x0+3,14);
+  }
+}
+
+function posToRatio(clientX){
+  const rect=canvas.getBoundingClientRect();
+  return Math.max(0,Math.min(1,(clientX-rect.left)/rect.width));
+}
+
+function nearestDivider(ratio,threshPx=10){
+  const W=canvas.getBoundingClientRect().width;
+  let best=-1, bestDist=threshPx/W;
+  for(let i=0;i<wfDividers.length;i++){
+    const d=Math.abs(wfDividers[i]-ratio);
+    if(d<bestDist){bestDist=d;best=i;}
+  }
+  return best;
+}
+
+canvas.addEventListener('mousedown',e=>{
+  e.preventDefault();
+  const ratio=posToRatio(e.clientX);
+  const near=nearestDivider(ratio);
+  if(near>=0){
+    wfDragIdx=near;
+    wfDragStartX=e.clientX;
+  }
+});
+
+canvas.addEventListener('mousemove',e=>{
+  if(wfDragIdx<0) return;
+  const ratio=posToRatio(e.clientX);
+  wfDividers[wfDragIdx]=Math.max(0.001,Math.min(0.999,ratio));
+  wfDividers.sort((a,b)=>a-b);
+  // re-find the dragged index after sort
+  const nearR=posToRatio(e.clientX);
+  wfDragIdx=nearestDivider(nearR,40);
+  drawWaveform();
+  updateChopCount();
+});
+
+canvas.addEventListener('mouseup',e=>{
+  if(wfDragIdx>=0){
+    wfDragIdx=-1;
+    dispatchChops();
+  }
+});
+
+canvas.addEventListener('mouseleave',e=>{
+  if(wfDragIdx>=0){ wfDragIdx=-1; dispatchChops(); }
+});
+
+canvas.addEventListener('dblclick',e=>{
+  const ratio=posToRatio(e.clientX);
+  const near=nearestDivider(ratio,12);
+  if(near<0){
+    wfDividers.push(ratio);
+    wfDividers.sort((a,b)=>a-b);
+    drawWaveform();
+    updateChopCount();
+    dispatchChops();
+  }
+});
+
+canvas.addEventListener('contextmenu',e=>{
+  e.preventDefault();
+  const ratio=posToRatio(e.clientX);
+  const near=nearestDivider(ratio,16);
+  if(near>=0){
+    wfDividers.splice(near,1);
+    drawWaveform();
+    updateChopCount();
+    dispatchChops();
+  }
+});
+
+function updateChopCount(){
+  document.getElementById('wform-chop-count').textContent=
+    wfDividers.length+1+' chop'+(wfDividers.length!==0?'s':'');
+}
+
+function dispatchChops(){
+  if(wfTrackIdx<0) return;
+  post({type:'set_chops',track_idx:wfTrackIdx,chops:divToChops(wfDividers)});
+}
+
+function autoSlice(n){
+  wfDividers=[];
+  for(let i=1;i<n;i++) wfDividers.push(i/n);
+  drawWaveform();
+  updateChopCount();
+  dispatchChops();
+}
+
+document.getElementById('btn-auto4').addEventListener('click',()=>autoSlice(4));
+document.getElementById('btn-auto8').addEventListener('click',()=>autoSlice(8));
+document.getElementById('btn-auto16').addEventListener('click',()=>autoSlice(16));
+document.getElementById('btn-chop-clear').addEventListener('click',()=>{
+  wfDividers=[];drawWaveform();updateChopCount();dispatchChops();
+});
+
+let _lastSampleKey=null;
+
+function resizeCanvas(){
+  const w=canvasWrap.getBoundingClientRect().width;
+  canvas.width=Math.floor(w)||1086;
+  canvas.height=120;
+  drawWaveform();
+}
+window.addEventListener('resize',resizeCanvas);
+resizeCanvas();
+
+async function fetchWaveform(key){
+  try{
+    const r=await fetch('/waveform?key='+encodeURIComponent(key));
+    if(!r.ok){wfPeaks=null;}
+    else{const j=await r.json();wfPeaks=j.peaks;}
+  }catch(e){wfPeaks=null;}
+  drawWaveform();
+}
+
+// ── POST helper ─────────────────────────────────────────────────────────────
+async function post(action){
+  try{
+    await fetch('/action',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(action),
+    });
+  }catch(e){}
+}
+
+// ── Main update ─────────────────────────────────────────────────────────────
+let _firstUpdate=true;
+
 function update(s){
+  const isSession=s.mode==='SESSION';
+  const isSampleInst=s.mode==='INSTRUMENT'&&s.sample_key!=null;
+
+  // Panel visibility
+  document.getElementById('session-panel').classList.toggle('hidden',!isSession);
+  document.getElementById('waveform-panel').classList.toggle('hidden',!isSampleInst);
+
+  // Session view
+  if(isSession){
+    if(_firstUpdate){
+      buildSessionGrid(s.track_data);
+      _firstUpdate=false;
+    }
+    updateSessionGrid(s);
+    document.getElementById('bpm-badge').textContent=s.bpm.toFixed(0)+' BPM';
+    // Session slot A-H with disk state
+    for(let i=0;i<8;i++){
+      const btn=document.getElementById('sess-slot-'+i);
+      if(!btn) continue;
+      btn.className='sess-slot';
+      if(i===s.slot) btn.classList.add('active');
+      if(s.disk_slots[i]) btn.classList.add('on-disk');
+    }
+  }
+
+  // Waveform editor
+  if(isSampleInst){
+    const key=s.sample_key;
+    const ti=s.selected_track;
+    if(key!==_lastSampleKey){
+      _lastSampleKey=key;
+      wfSampleKey=key;
+      wfTrackIdx=ti;
+      document.getElementById('wform-sample-name').textContent=key||'—';
+      wfPeaks=null;
+      fetchWaveform(key);
+    }
+    wfTrackIdx=ti;
+    // Sync dividers from state (if not currently dragging)
+    if(wfDragIdx<0){
+      const newDiv=chopsToDiv(s.chops);
+      if(JSON.stringify(newDiv)!==JSON.stringify(wfDividers)){
+        wfDividers=newDiv;
+        drawWaveform();
+      }
+    }
+    updateChopCount();
+  } else {
+    _lastSampleKey=null;
+    wfTrackIdx=-1;
+  }
+
   // Pads
   for(let i=0;i<32;i++){
     const [r,g,b]=s.pads[i];
@@ -444,7 +1057,7 @@ function update(s){
     if(el) el.style.backgroundColor=(r+g+b>6)?rgb(r,g,b):'#0a0a0a';
   }
 
-  // Reset OLED
+  // OLED reset
   for(const id of Object.values(SK_TEXT)){
     const el=document.getElementById(id);
     if(el){el.textContent=' ';el.style.color='';}
@@ -453,21 +1066,18 @@ function update(s){
     const el=document.getElementById(id);
     if(el) el.style.borderTopColor='#1e1e1e';
   }
-
-  // Fill OLED
+  // OLED fill
   for(const [sid,elId] of Object.entries(SK_TEXT)){
     const entry=s.oled[sid];
     const el=document.getElementById(elId);
-    if(!el) continue;
-    if(entry){
-      const [text,r,g,b]=entry;
-      el.textContent=text||' ';
-      if(sid in SK_BORDER){
-        const col=rgb(r,g,b);
-        el.style.color=col;
-        const sk=document.getElementById(SK_BORDER[sid]);
-        if(sk) sk.style.borderTopColor=col;
-      }
+    if(!el||!entry) continue;
+    const [text,r,g,b]=entry;
+    el.textContent=text||' ';
+    if(sid in SK_BORDER){
+      const col=rgb(r,g,b);
+      el.style.color=col;
+      const sk=document.getElementById(SK_BORDER[sid]);
+      if(sk) sk.style.borderTopColor=col;
     }
   }
 
@@ -475,11 +1085,9 @@ function update(s){
   setLit('btn-play',s.play); setLit('btn-stop',s.stop);
   setLit('btn-rec',s.rec);   setLit('btn-song',s.song);
   setLit('btn-inst',s.inst); setLit('btn-metro',s.metro);
-
-  // Shift
   document.getElementById('btn-shift').classList.toggle('held',!!s.shift);
 
-  // Session slots
+  // Session slots (controller mirror)
   for(let i=0;i<8;i++)
     document.getElementById('slot-'+i).classList.toggle('active',i===s.slot);
 
@@ -494,11 +1102,12 @@ function update(s){
 
 const es=new EventSource('/events');
 es.onmessage=e=>{try{update(JSON.parse(e.data));}catch(err){console.error(err);}};
-es.onerror=()=>{document.getElementById('status').textContent='disconnected -- reload to reconnect';};
+es.onerror=()=>{document.getElementById('status').textContent='disconnected — reload to reconnect';};
 </script>
 </body>
 </html>
 """
+
 
 # ── Standalone entry point ────────────────────────────────────────────────────
 

@@ -596,7 +596,12 @@ if __name__ == "__main__":
     ui = None
     if args.web:
         from eden.web_ui import WebUI
-        ui = WebUI(app._state_ref)
+        ui = WebUI(
+            app._state_ref,
+            dispatch_fn=app._eq.put,
+            sessions_dir=app._sessions_dir,
+            mixer=app._mixer,
+        )
     elif args.ui:
         from eden.debug_ui import DebugUI
         ui = DebugUI(app._state_ref)

@@ -113,3 +113,17 @@ class PlusMinusPressed(Event):
 @dataclass(frozen=True)
 class AftertouchChanged(Event):
     value: int  # 0-127 channel pressure from hardware
+
+
+@dataclass(frozen=True)
+class SetChops(Event):
+    """Set chop points on a SampleTrack from the web UI."""
+    track_idx: int
+    chops: tuple  # tuple[ChopPoint, ...]
+
+
+@dataclass(frozen=True)
+class WebSelectCell(Event):
+    """Select a track+loop cell from the web session view."""
+    track: int  # 0-15
+    loop: int   # 0-15

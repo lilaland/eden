@@ -35,6 +35,7 @@ from eden.events import (
     PadReleased,
     PlusMinusPressed,
     SessionLoaded,
+    SetChops,
     ShiftChanged,
     SoftkeyPressed,
     SongSlotPressed,
@@ -43,6 +44,7 @@ from eden.events import (
     TransportPressed,
     InstrumentUndo,
     InstrumentReset,
+    WebSelectCell,
 )
 from eden.scales import (
     SCALES, SCALE_NAMES, degree_to_pitch, pitch_to_degree,
@@ -72,6 +74,12 @@ def reduce(state: AppState, event: Event) -> AppState:
         return _on_session_loaded(state, event)
     if isinstance(event, SongSlotPressed):
         return state  # handled entirely by app layer (requires file I/O)
+    if isinstance(event, SetChops):
+        return _set_chops(state, event)
+    if isinstance(event, WebSelectCell):
+        t = max(0, min(15, event.track))
+        lo = max(0, min(15, event.loop))
+        return dataclasses.replace(state, selected_track=t, selected_loop=lo)
     # Metronome+jog intercepts encoder before mode dispatch.
     if isinstance(event, EncoderTurned) and state.metronome_held and event.encoder == 9:
         new_bpm = max(20.0, min(300.0, state.tempo_bpm + event.delta))
@@ -2197,6 +2205,19 @@ def _drop_fully_empty_tracks(
         mode=new_mode,
         loop_measure_offsets=new_offsets,
     )
+
+
+def _set_chops(state: AppState, event: SetChops) -> AppState:
+    """Apply chop points from web UI to a SampleTrack."""
+    ti = event.track_idx
+    if ti < 0 or ti >= len(state.tracks):
+        return state
+    track = state.tracks[ti]
+    if not isinstance(track, SampleTrack):
+        return state
+    new_track = dataclasses.replace(track, chops=event.chops)
+    new_tracks = state.tracks[:ti] + (new_track,) + state.tracks[ti + 1:]
+    return dataclasses.replace(state, tracks=new_tracks)
 
 
 def _toggle_sample_one_shot(state: AppState) -> AppState:

@@ -127,6 +127,24 @@ class AudioMixer:
         # Convert to float64 so DrumEngine mixes into float64 buf without casting
         self._samples[name] = data.astype(np.float64)
 
+    def get_peaks(self, name: str, n_points: int = 1500) -> list[float] | None:
+        """Return downsampled peak values for waveform display (0.0–1.0 each)."""
+        sample = self._samples.get(name)
+        if sample is None:
+            return None
+        mono = np.abs(sample).max(axis=1)
+        n = len(mono)
+        if n == 0:
+            return [0.0] * n_points
+        chunk = max(1, n // n_points)
+        peaks = []
+        for i in range(n_points):
+            s = i * chunk
+            e = min(s + chunk, n)
+            peaks.append(float(mono[s:e].max()) if s < n else 0.0)
+        peak_max = max(peaks) or 1.0
+        return [p / peak_max for p in peaks]
+
     # ------------------------------------------------------------------
     # Engine management (called from main thread)
     # ------------------------------------------------------------------
