@@ -56,6 +56,7 @@ from eden.scales import (
     SCALES, SCALE_NAMES, degree_to_pitch, pitch_to_degree,
     white_idx_to_midi, black_key_at,
 )
+from eden.arp import expand_chord
 
 _REC_HOLD_TICKS = 32  # clock ticks for shift+hold-REC to trigger full clear
 
@@ -1548,15 +1549,22 @@ def _piano_pad_pressed(
     step_in_bar = state.playhead * spb // 32
     step_idx = (bar_offset * spb + step_in_bar) % max(1, loop.step_count)
 
+    # Expand chord if active so recorded steps contain all sounding pitches
+    record_pitches: tuple[int, ...] = (pitch,)
+    if loop.chord_on:
+        record_pitches = expand_chord(record_pitches, loop.chord_type)
+
     # Write to step (additive — handles simultaneous multi-pad polyphony)
     if step_idx < loop.step_count:
         old_step = loop.steps[step_idx]
         if not old_step.on:
-            new_step = StepNote(on=True, pitches=(pitch,), velocity=event.velocity, gate=1.0)
-        elif pitch not in old_step.pitches:
-            new_step = dataclasses.replace(old_step, pitches=old_step.pitches + (pitch,))
+            new_step = StepNote(on=True, pitches=record_pitches, velocity=event.velocity, gate=1.0)
         else:
-            new_step = old_step
+            new_pitches = old_step.pitches
+            for p in record_pitches:
+                if p not in new_pitches:
+                    new_pitches = new_pitches + (p,)
+            new_step = dataclasses.replace(old_step, pitches=new_pitches)
         new_steps = loop.steps[:step_idx] + (new_step,) + loop.steps[step_idx + 1:]
         new_loop = dataclasses.replace(loop, steps=new_steps)
         new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
@@ -1565,6 +1573,7 @@ def _piano_pad_pressed(
         state = dataclasses.replace(state, tracks=new_tracks)
 
     # Register pending tick so release can finalize gate + commit NoteEvent
+    # Use the base pitch (not expanded) as the canonical pitch for the pending entry
     pending = state.free_pending_ticks + ((pad, step_idx, pitch, event.velocity),)
     return dataclasses.replace(state, free_pending_ticks=pending)
 

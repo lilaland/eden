@@ -41,7 +41,7 @@ from eden.reduce import reduce
 from eden.render import render_pads, render_oled, render_button_leds
 from eden.scales import degree_to_pitch, white_idx_to_midi, black_key_at
 from eden.arp import expand_chord, compute_arp_sequence, arp_ticks_per_note
-from eden.state import default_state, AppState, DrumTrack, SynthTrack, InstrumentSubmode, Mode
+from eden.state import default_state, AppState, DrumTrack, SynthTrack, InstrumentSubmode, Mode, NoteEvent
 from eden.fx import FXProcessor
 from eden.events import AftertouchChanged, ClockTicked, InstrumentReset, InstrumentUndo, PadPressed, PadReleased, PlusMinusPressed, SessionLoaded, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
 from eden.state import Mode
@@ -79,7 +79,11 @@ class EdenApp:
         self._clock = SequencerClock(
             bpm=self._state.tempo_bpm, steps=32, ppq=8, event_queue=self._eq
         )
-        self._scheduler = StepScheduler(mixer=self._mixer, state_ref=self._state_ref)
+        self._scheduler = StepScheduler(
+            mixer=self._mixer,
+            state_ref=self._state_ref,
+            record_fn=self._record_arp_note,
+        )
         self._init_engines(self._state)
 
         # Render delta state: compare against previous render to send only diffs.
@@ -169,6 +173,11 @@ class EdenApp:
                 continue  # don't dispatch to reducer
 
             new_state = reduce(self._state, event)
+
+            # When free_recording just became True, retroactively capture any notes
+            # that were already being held before record was pressed.
+            if not self._state.free_recording and new_state.free_recording:
+                new_state = self._inject_held_notes_at_record_start(new_state)
 
             if new_state is not self._state:
                 old_bpm = self._state.tempo_bpm
@@ -360,6 +369,56 @@ class EdenApp:
             pitches = expand_chord(pitches, sel_loop.chord_type)
         for p in pitches:
             engine.note_off(p)
+
+    def _inject_held_notes_at_record_start(self, state):
+        """
+        When free_recording just became True, inject synthetic PadPressed events
+        for any pads currently held (piano mode) so they appear in free_pending_ticks
+        and get properly captured on release.
+        """
+        if not self._free_pad_down_times:
+            return state
+        for pad in list(self._free_pad_down_times.keys()):
+            synth_press = PadPressed(pad_index=pad, velocity=100)
+            state = reduce(state, synth_press)
+        return state
+
+    def _record_arp_note(self, track_idx: int, pitch: int, velocity: int, tpn: int) -> None:
+        """
+        Called by the scheduler each time a live arp fires during free_recording.
+        Appends a NoteEvent to the current loop so the arp pattern is written out.
+        """
+        state = self._state
+        if not state.free_recording:
+            return
+        loop_idx = state.selected_loop
+        if track_idx >= len(state.tracks):
+            return
+        track = state.tracks[track_idx]
+        if not isinstance(track, SynthTrack):
+            return
+        loop = track.loops[loop_idx]
+
+        # Gate in loop-step units (tpn clock ticks → fraction of one step)
+        bpm = state.tempo_bpm
+        # One clock tick = 1/8 of a step at 32ppb, so gate in steps = tpn/8
+        gate = max(0.1, tpn / 8.0)
+
+        loop_offsets = dict(state.loop_measure_offsets)
+        bar_offset = loop_offsets.get((track_idx, loop_idx), 0)
+        spb = loop.steps_per_bar
+        step_in_bar = state.playhead * spb // 32
+        tick = (bar_offset * spb + step_in_bar) % max(1, loop.step_count)
+
+        note_event = NoteEvent(tick=tick, pitch=pitch, velocity=velocity, gate=gate, aftertouch=0.0)
+        new_free = loop.free_events + (note_event,)
+        new_loop = dataclasses.replace(loop, free_events=new_free)
+        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+        new_track = dataclasses.replace(track, loops=new_loops)
+        new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+        new_state = dataclasses.replace(state, tracks=new_tracks)
+        self._state = new_state
+        self._state_ref.set(new_state)
 
     # ─── Engine lifecycle ─────────────────────────────────────────────────────
 

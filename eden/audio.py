@@ -353,11 +353,12 @@ class StepScheduler:
     ticks_per_note, amplitude, gate_samples, engine, track.
     """
 
-    def __init__(self, mixer: AudioMixer, state_ref: StateRef) -> None:
+    def __init__(self, mixer: AudioMixer, state_ref: StateRef, record_fn=None) -> None:
         self._mixer = mixer
         self._state_ref = state_ref
         self._arp_tracks: dict[int, dict] = {}       # step-sequencer arp contexts
         self._live_arp_tracks: dict[int, dict] = {}  # live pad-held arp contexts
+        self._record_fn = record_fn  # optional(track_idx, pitch, velocity, tpn) called when arp fires during recording
 
     def on_tick(self) -> None:
         state = self._state_ref.get()
@@ -554,18 +555,23 @@ class StepScheduler:
 
     def _advance_arp(self) -> None:
         """Fire the next note for each active arp sequence (step and live)."""
+        state = self._state_ref.get() if self._record_fn else None
         for ctx_dict in (self._arp_tracks, self._live_arp_tracks):
-            for ctx in list(ctx_dict.values()):
+            is_live = ctx_dict is self._live_arp_tracks
+            for track_idx, ctx in list(ctx_dict.items()):
                 ctx["ticks_until_next"] -= 1
                 if ctx["ticks_until_next"] > 0:
                     continue
                 seq = ctx["sequence"]
                 idx = ctx["idx"]
-                ctx["engine"].note_on(
-                    seq[idx], ctx["amplitude"], ctx["gate_samples"], ctx["track"]
-                )
+                pitch = seq[idx]
+                ctx["engine"].note_on(pitch, ctx["amplitude"], ctx["gate_samples"], ctx["track"])
                 ctx["idx"] = (idx + 1) % len(seq)
                 ctx["ticks_until_next"] = ctx["ticks_per_note"]
+                # Record each arp note to the loop when free_recording is active
+                if is_live and self._record_fn and state is not None and state.free_recording:
+                    velocity = int(ctx["amplitude"] * 127)
+                    self._record_fn(track_idx, pitch, velocity, ctx["ticks_per_note"])
 
 
 # ---------------------------------------------------------------------------
