@@ -49,6 +49,7 @@ from eden.events import (
     TransportPressed,
     InstrumentUndo,
     InstrumentReset,
+    LoadSample,
     WebSelectCell,
 )
 from eden.scales import (
@@ -91,6 +92,8 @@ def reduce(state: AppState, event: Event) -> AppState:
         return dataclasses.replace(state, sample_recording=True)
     if isinstance(event, SampleRecordStop):
         return _on_sample_record_stop(state, event)
+    if isinstance(event, LoadSample):
+        return _load_sample(state, event)
     if isinstance(event, WebSelectCell):
         t = max(0, min(15, event.track))
         lo = max(0, min(15, event.loop))
@@ -2293,6 +2296,23 @@ def _apply_auto_chop(state: AppState, event: AutoChop) -> AppState:
         for i in range(len(bounds) - 1)
     )
     new_track = dataclasses.replace(track, chops=chops)
+    new_tracks = state.tracks[:ti] + (new_track,) + state.tracks[ti + 1:]
+    return dataclasses.replace(state, tracks=new_tracks)
+
+
+def _load_sample(state: AppState, event: LoadSample) -> AppState:
+    """Assign a sample key to a SampleTrack or DrumTrack."""
+    from eden.state import DrumTrack
+    ti = event.track_idx
+    if ti < 0 or ti >= len(state.tracks):
+        return state
+    track = state.tracks[ti]
+    if isinstance(track, SampleTrack):
+        new_track = dataclasses.replace(track, sample_key=event.sample_key)
+    elif isinstance(track, DrumTrack):
+        new_track = dataclasses.replace(track, sample_name=event.sample_key)
+    else:
+        return state
     new_tracks = state.tracks[:ti] + (new_track,) + state.tracks[ti + 1:]
     return dataclasses.replace(state, tracks=new_tracks)
 

@@ -79,6 +79,7 @@ class AudioMixer:
 
     def __init__(self, sample_dir: str, sample_rate: int = DEFAULT_SAMPLE_RATE) -> None:
         self._sr = sample_rate
+        self._sample_dir = sample_dir
         self._samples: dict[str, np.ndarray] = {}
         self._engines: dict[int, TrackEngine] = {}
         self._finishing_engines: dict[int, TrackEngine] = {}
@@ -127,6 +128,18 @@ class AudioMixer:
             data = data[:, :2]
         # Convert to float64 so DrumEngine mixes into float64 buf without casting
         self._samples[name] = data.astype(np.float64)
+
+    @property
+    def sample_dir(self) -> str:
+        return self._sample_dir
+
+    def unload(self, name: str) -> None:
+        """Remove a sample from the in-memory cache (does not touch disk)."""
+        self._samples.pop(name, None)
+
+    def loaded_names(self) -> list[str]:
+        """Return sorted list of all loaded sample names."""
+        return sorted(self._samples.keys())
 
     def get_peaks(self, name: str, n_points: int = 1500) -> list[float] | None:
         """Return downsampled peak values for waveform display (0.0–1.0 each)."""

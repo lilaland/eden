@@ -157,3 +157,10 @@ class SetTrim(Event):
 @dataclass(frozen=True)
 class NormalizeAction(Event):
     track_idx: int
+
+
+@dataclass(frozen=True)
+class LoadSample(Event):
+    """Assign a sample (by key) to a track's sample slot."""
+    track_idx: int
+    sample_key: str

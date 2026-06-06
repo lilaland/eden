@@ -150,7 +150,7 @@ def _to_json(state, sessions_dir: str = "") -> str:
 def _handle_action(action: dict, state_ref, dispatch_fn, mixer=None) -> None:
     from eden.events import (
         SongSlotPressed, SetChops, WebSelectCell,
-        SetTrim, AutoChop, NormalizeAction,
+        SetTrim, AutoChop, NormalizeAction, LoadSample,
     )
     from eden.state import ChopPoint
 
@@ -216,6 +216,25 @@ def _handle_action(action: dict, state_ref, dispatch_fn, mixer=None) -> None:
         # SK1 (key=0) in SAMPLE_CHOPS page 1 cycles play_mode
         dispatch_fn(SoftkeyPressed(key=0))
 
+    elif atype == "load_sample":
+        track_idx = int(action["track_idx"])
+        sample_key = str(action["sample_key"])
+        if mixer is not None and sample_key not in mixer.loaded_names():
+            import os
+            path = os.path.join(mixer.sample_dir, sample_key + ".wav")
+            if os.path.isfile(path):
+                mixer.load(sample_key, path)
+        dispatch_fn(LoadSample(track_idx=track_idx, sample_key=sample_key))
+
+    elif atype == "delete_sample":
+        sample_key = str(action["sample_key"])
+        if mixer is not None:
+            import os
+            path = os.path.join(mixer.sample_dir, sample_key + ".wav")
+            if os.path.isfile(path):
+                os.remove(path)
+            mixer.unload(sample_key)
+
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
@@ -265,6 +284,15 @@ def _make_handler(state_ref: StateRef, dispatch_fn, sessions_dir: str, get_peaks
                     self.send_response(404)
                     self.end_headers()
 
+            elif parsed.path == "/samples":
+                names = mixer.loaded_names() if mixer else []
+                body = json.dumps({"samples": names}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", len(body))
+                self.end_headers()
+                self.wfile.write(body)
+
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -280,6 +308,40 @@ def _make_handler(state_ref: StateRef, dispatch_fn, sessions_dir: str, get_peaks
                 except Exception:
                     self.send_response(400)
                     self.end_headers()
+
+            elif self.path == "/upload_sample" and mixer is not None:
+                import email.parser, email.policy, os
+                ct = self.headers.get("Content-Type", "")
+                length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(length)
+                # Parse multipart/form-data manually via email module
+                msg_bytes = (f"Content-Type: {ct}\r\n\r\n").encode() + raw
+                msg = email.parser.BytesParser(policy=email.policy.compat32).parsebytes(msg_bytes)
+                saved = []
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        disp = part.get_content_disposition()
+                        if disp != "attachment" and disp != "form-data":
+                            continue
+                        fname = part.get_filename()
+                        if not fname or not fname.lower().endswith(".wav"):
+                            continue
+                        name = os.path.splitext(fname)[0]
+                        dest = os.path.join(mixer.sample_dir, fname)
+                        with open(dest, "wb") as f:
+                            f.write(part.get_payload(decode=True))
+                        try:
+                            mixer.load(name, dest)
+                            saved.append(name)
+                        except Exception as exc:
+                            print(f"[UI] upload error: {exc}", file=sys.stderr)
+                resp = json.dumps({"saved": saved}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", len(resp))
+                self.end_headers()
+                self.wfile.write(resp)
+
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -682,6 +744,98 @@ h1{font-size:10px;color:#5a3878;letter-spacing:3px;text-transform:uppercase}
   text-align:center;font-size:9px;color:#4a2870;padding-top:4px;letter-spacing:.5px;
 }
 
+/* ── Sample library panel ───────────────────────────────────────────── */
+#sample-lib{
+  width:1110px;
+  background:linear-gradient(160deg,#120824 0%,#0c0518 100%);
+  border-radius:10px;
+  box-shadow:0 0 0 1px rgba(255,62,160,.12),0 8px 32px rgba(0,0,0,.8);
+}
+#sample-lib-top{
+  display:flex;align-items:center;gap:8px;padding:8px 12px;
+  cursor:pointer;user-select:none;
+}
+#sample-lib-title{font-size:9px;color:#7040a0;letter-spacing:2px;text-transform:uppercase;flex:1}
+#sample-lib-toggle{font-size:9px;color:#5030a0;transition:transform .15s}
+#sample-lib-body{padding:0 12px 12px;display:none}
+#sample-lib-body.open{display:block}
+#sample-lib-toolbar{
+  display:flex;align-items:center;gap:8px;margin-bottom:8px;
+  border-top:1px solid rgba(176,64,255,.12);padding-top:8px;
+}
+#sample-search{
+  flex:1;background:#0e0424;border:1px solid #3a1860;border-radius:4px;
+  color:#d8c8f8;font-size:9px;font-family:inherit;padding:3px 8px;
+  outline:none;
+}
+#sample-search::placeholder{color:#4a2870}
+#sample-search:focus{border-color:#ff3ea0}
+#sample-upload-btn{
+  padding:3px 10px;border-radius:3px;font-size:8px;font-family:inherit;
+  border:1px solid rgba(0,229,255,.35);background:rgba(0,80,100,.4);
+  color:#00e5ff;cursor:pointer;text-transform:uppercase;letter-spacing:.5px;transition:all .1s;
+}
+#sample-upload-btn:hover{border-color:#00e5ff;box-shadow:0 0 8px rgba(0,229,255,.3)}
+#sample-upload-input{display:none}
+#sample-count{font-size:8px;color:#5030a0}
+#sample-list{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:3px;
+  max-height:280px;overflow-y:auto;
+}
+#sample-list::-webkit-scrollbar{width:4px}
+#sample-list::-webkit-scrollbar-track{background:#0a0318}
+#sample-list::-webkit-scrollbar-thumb{background:#3a1860;border-radius:2px}
+.sl-item{
+  display:flex;align-items:center;gap:4px;padding:3px 6px;border-radius:3px;
+  background:#150628;border:1px solid #2a0e50;
+  transition:border-color .06s;
+}
+.sl-item:hover{border-color:#6030a0}
+.sl-item.active{border-color:#ff3ea0;background:#1e0838}
+.sl-name{
+  flex:1;font-size:8px;color:#b090d8;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;
+}
+.sl-item.active .sl-name{color:#ff3ea0}
+.sl-load{
+  padding:1px 6px;border-radius:2px;font-size:7px;font-family:inherit;
+  border:1px solid rgba(255,62,160,.3);background:transparent;
+  color:#c060a0;cursor:pointer;text-transform:uppercase;letter-spacing:.3px;transition:all .08s;
+  flex-shrink:0;
+}
+.sl-load:hover{background:rgba(255,62,160,.15);border-color:#ff3ea0;color:#ff3ea0}
+.sl-del{
+  padding:1px 5px;border-radius:2px;font-size:7px;font-family:inherit;
+  border:1px solid rgba(255,50,80,.25);background:transparent;
+  color:#804050;cursor:pointer;transition:all .08s;flex-shrink:0;
+}
+.sl-del:hover{background:rgba(255,50,80,.15);border-color:#ff3050;color:#ff3050}
+
+/* Light mode overrides for sample lib */
+body.light #sample-lib{
+  background:#fff;
+  box-shadow:0 0 0 1px rgba(176,64,255,.15),0 4px 20px rgba(120,60,200,.12);
+}
+body.light #sample-lib-title{color:#8040b0}
+body.light #sample-lib-top{cursor:pointer}
+body.light #sample-lib-toggle{color:#8040b0}
+body.light #sample-lib-toolbar{border-top-color:rgba(176,64,255,.15)}
+body.light #sample-search{background:#f4f0fc;border-color:#c0a8e0;color:#2a1050}
+body.light #sample-search::placeholder{color:#a090c0}
+body.light #sample-upload-btn{background:rgba(200,240,255,.6);border-color:#0090c0;color:#0060a0}
+body.light #sample-count{color:#8060b0}
+body.light #sample-list::-webkit-scrollbar-track{background:#f5f0ff}
+body.light #sample-list::-webkit-scrollbar-thumb{background:#c0a8e0}
+body.light .sl-item{background:#f5f0ff;border-color:#d0c0ec}
+body.light .sl-item:hover{border-color:#9060c0}
+body.light .sl-item.active{border-color:#ff3ea0;background:#fff0f8}
+body.light .sl-name{color:#6040a0}
+body.light .sl-item.active .sl-name{color:#d0005a}
+body.light .sl-load{border-color:rgba(200,50,120,.3);color:#a02080}
+body.light .sl-load:hover{background:rgba(255,62,160,.1);border-color:#ff3ea0;color:#d0005a}
+body.light .sl-del{border-color:rgba(200,40,60,.25);color:#a06070}
+body.light .sl-del:hover{background:rgba(220,40,60,.1);border-color:#e03050;color:#c02040}
+
 /* ── Theme toggle button ────────────────────────────────────────────── */
 #header-row{display:flex;align-items:center;gap:10px;width:1110px}
 #header-row h1{flex:1}
@@ -859,6 +1013,23 @@ body.light #status{color:#8060b0}
   </div>
   <div id="wform-canvas-wrap">
     <canvas id="wform-canvas"></canvas>
+  </div>
+</div>
+
+<!-- ── Sample library ───────────────────────────────────────────────────── -->
+<div id="sample-lib">
+  <div id="sample-lib-top" onclick="toggleSampleLib()">
+    <div id="sample-lib-title">Sample Library</div>
+    <div id="sample-count"></div>
+    <div id="sample-lib-toggle">▼</div>
+  </div>
+  <div id="sample-lib-body">
+    <div id="sample-lib-toolbar">
+      <input id="sample-search" type="text" placeholder="filter samples…" oninput="renderSampleList()">
+      <button id="sample-upload-btn" onclick="document.getElementById('sample-upload-input').click()">⬆ Upload</button>
+      <input id="sample-upload-input" type="file" accept=".wav" multiple onchange="uploadSamples(this)">
+    </div>
+    <div id="sample-list"></div>
   </div>
 </div>
 
@@ -1411,8 +1582,15 @@ async function post(action){
 let _firstUpdate=true;
 
 function update(s){
+  lastState=s;
   const isSession=s.mode==='SESSION';
   const isSampleInst=s.mode==='INSTRUMENT'&&s.sample_key!=null;
+
+  // Track active sample key for library highlight
+  if(s.sample_key&&s.sample_key!==slCurrentKey){
+    slCurrentKey=s.sample_key;
+    if(document.getElementById('sample-lib-body').classList.contains('open'))renderSampleList();
+  }
 
   // Panel visibility
   document.getElementById('session-panel').classList.toggle('hidden',!isSession);
@@ -1529,6 +1707,81 @@ function update(s){
 const es=new EventSource('/events');
 es.onmessage=e=>{try{update(JSON.parse(e.data));}catch(err){console.error(err);}};
 es.onerror=()=>{document.getElementById('status').textContent='disconnected — reload to reconnect';};
+
+// ── Sample library ───────────────────────────────────────────────────
+let slSamples=[];
+let slCurrentKey=null;
+
+async function loadSampleList(){
+  try{
+    const r=await fetch('/samples');
+    const d=await r.json();
+    slSamples=d.samples||[];
+    document.getElementById('sample-count').textContent=slSamples.length+' samples';
+    renderSampleList();
+  }catch(e){}
+}
+
+function renderSampleList(){
+  const q=(document.getElementById('sample-search').value||'').toLowerCase();
+  const filtered=slSamples.filter(n=>!q||n.toLowerCase().includes(q));
+  const el=document.getElementById('sample-list');
+  el.innerHTML='';
+  const curTrack=lastState?lastState.selected_track:-1;
+  filtered.forEach(name=>{
+    const div=document.createElement('div');
+    div.className='sl-item'+(name===slCurrentKey?' active':'');
+    const nm=document.createElement('span');
+    nm.className='sl-name';nm.textContent=name;nm.title=name;
+    const loadBtn=document.createElement('button');
+    loadBtn.className='sl-load';loadBtn.textContent='Load';
+    loadBtn.onclick=async(e)=>{
+      e.stopPropagation();
+      await post({type:'load_sample',track_idx:curTrack,sample_key:name});
+      slCurrentKey=name;renderSampleList();
+    };
+    const delBtn=document.createElement('button');
+    delBtn.className='sl-del';delBtn.textContent='✕';
+    delBtn.title='Delete from disk';
+    delBtn.onclick=async(e)=>{
+      e.stopPropagation();
+      if(!confirm('Delete sample "'+name+'" from disk?'))return;
+      await post({type:'delete_sample',sample_key:name});
+      slSamples=slSamples.filter(s=>s!==name);
+      document.getElementById('sample-count').textContent=slSamples.length+' samples';
+      renderSampleList();
+    };
+    div.append(nm,loadBtn,delBtn);
+    el.appendChild(div);
+  });
+}
+
+function toggleSampleLib(){
+  const body=document.getElementById('sample-lib-body');
+  const tog=document.getElementById('sample-lib-toggle');
+  const open=body.classList.toggle('open');
+  tog.textContent=open?'▲':'▼';
+  if(open&&slSamples.length===0)loadSampleList();
+}
+
+async function uploadSamples(input){
+  const files=Array.from(input.files);
+  if(!files.length)return;
+  const fd=new FormData();
+  files.forEach(f=>fd.append('file',f,f.name));
+  try{
+    const r=await fetch('/upload_sample',{method:'POST',body:fd});
+    const d=await r.json();
+    if(d.saved&&d.saved.length){
+      slSamples=[...new Set([...slSamples,...d.saved])].sort();
+      document.getElementById('sample-count').textContent=slSamples.length+' samples';
+      renderSampleList();
+    }
+  }catch(e){console.error('upload failed',e);}
+  input.value='';
+}
+
+let lastState=null;
 
 // ── Theme toggle ──────────────────────────────────────────────────────
 const themeBtn=document.getElementById('theme-toggle');

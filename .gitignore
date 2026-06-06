@@ -26,8 +26,7 @@ build/
 *.swp
 *.swo
 
-# Generated samples (synthesized placeholders — swap in real files)
-samples/
+# (samples/ is now tracked — default drum/sample kit included in repo)
 
 # References / vendor source (not part of Eden codebase)
 references/
