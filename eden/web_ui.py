@@ -76,13 +76,27 @@ def _to_json(state, sessions_dir: str = "") -> str:
                 })
             loop_matrix.append(loops)
 
-    # Current SampleTrack chop data
+    # Current SampleTrack data
     sample_key = None
     chops = []
+    trim_start = 0.0
+    trim_end = 1.0
+    play_mode = "oneshot"
+    amp_attack = 0.0
+    amp_release = 0.05
+    pan = 0.0
+    sample_chop_cursor = state.sample_chop_cursor
     sel_track = state.tracks[state.selected_track] if state.selected_track < len(state.tracks) else None
     if isinstance(sel_track, SampleTrack):
         sample_key = sel_track.sample_key
-        chops = [[c.start_offset, c.end_offset, c.name] for c in sel_track.chops]
+        chops = [[c.start_offset, c.end_offset, c.name, c.tune, c.reverse]
+                 for c in sel_track.chops]
+        trim_start = sel_track.trim_start
+        trim_end = sel_track.trim_end
+        play_mode = sel_track.play_mode
+        amp_attack = sel_track.amp_attack
+        amp_release = sel_track.amp_release
+        pan = sel_track.pan
 
     # Which AppState scene slots are occupied
     scenes_saved = [s is not None for s in state.scenes]
@@ -115,19 +129,29 @@ def _to_json(state, sessions_dir: str = "") -> str:
         "finishing":      len(state.finishing_loops) > 0,
         "track_data":     track_data,
         "loop_matrix":    loop_matrix,
-        "sample_key":     sample_key,
-        "chops":          chops,
-        "scenes_saved":   scenes_saved,
-        "disk_slots":     disk_slots,
-        "selected_track": state.selected_track,
-        "selected_loop":  state.selected_loop,
+        "sample_key":          sample_key,
+        "chops":               chops,
+        "trim_start":          trim_start,
+        "trim_end":            trim_end,
+        "play_mode":           play_mode,
+        "amp_attack":          amp_attack,
+        "amp_release":         amp_release,
+        "pan":                 pan,
+        "sample_chop_cursor":  sample_chop_cursor,
+        "scenes_saved":        scenes_saved,
+        "disk_slots":          disk_slots,
+        "selected_track":      state.selected_track,
+        "selected_loop":       state.selected_loop,
     })
 
 
 # ── Action dispatcher ─────────────────────────────────────────────────────────
 
-def _handle_action(action: dict, state_ref, dispatch_fn) -> None:
-    from eden.events import SongSlotPressed, SetChops, WebSelectCell
+def _handle_action(action: dict, state_ref, dispatch_fn, mixer=None) -> None:
+    from eden.events import (
+        SongSlotPressed, SetChops, WebSelectCell,
+        SetTrim, AutoChop, NormalizeAction,
+    )
     from eden.state import ChopPoint
 
     atype = action.get("type")
@@ -147,15 +171,55 @@ def _handle_action(action: dict, state_ref, dispatch_fn) -> None:
                 start_offset=float(c[0]),
                 end_offset=float(c[1]),
                 name=c[2] if len(c) > 2 else "",
+                tune=float(c[3]) if len(c) > 3 else 0.0,
+                reverse=bool(c[4]) if len(c) > 4 else False,
             )
             for c in raw
         )
         dispatch_fn(SetChops(track_idx=int(action["track_idx"]), chops=chops))
 
+    elif atype == "set_trim":
+        dispatch_fn(SetTrim(
+            track_idx=int(action["track_idx"]),
+            trim_start=float(action["trim_start"]),
+            trim_end=float(action["trim_end"]),
+        ))
+
+    elif atype == "normalize":
+        track_idx = int(action["track_idx"])
+        if mixer is not None:
+            state = state_ref.get()
+            track = state.tracks[track_idx] if track_idx < len(state.tracks) else None
+            key = getattr(track, "sample_key", None)
+            if key:
+                mixer.normalize(key)
+        dispatch_fn(NormalizeAction(track_idx=track_idx))
+
+    elif atype == "auto_chop":
+        track_idx = int(action["track_idx"])
+        n_slices = int(action.get("n_slices", 8))
+        boundaries = []
+        if mixer is not None:
+            state = state_ref.get()
+            track = state.tracks[track_idx] if track_idx < len(state.tracks) else None
+            key = getattr(track, "sample_key", None)
+            if key:
+                boundaries = mixer.detect_onsets(key, n_slices)
+        dispatch_fn(AutoChop(
+            track_idx=track_idx,
+            n_slices=n_slices,
+            boundaries=tuple(boundaries),
+        ))
+
+    elif atype == "cycle_play_mode":
+        from eden.events import SoftkeyPressed
+        # SK1 (key=0) in SAMPLE_CHOPS page 1 cycles play_mode
+        dispatch_fn(SoftkeyPressed(key=0))
+
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
-def _make_handler(state_ref: StateRef, dispatch_fn, sessions_dir: str, get_peaks_fn):
+def _make_handler(state_ref: StateRef, dispatch_fn, sessions_dir: str, get_peaks_fn, mixer=None):
     class _Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
@@ -210,7 +274,7 @@ def _make_handler(state_ref: StateRef, dispatch_fn, sessions_dir: str, get_peaks
                 length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(length)
                 try:
-                    _handle_action(json.loads(body), state_ref, dispatch_fn)
+                    _handle_action(json.loads(body), state_ref, dispatch_fn, mixer)
                     self.send_response(204)
                     self.end_headers()
                 except Exception:
@@ -249,6 +313,7 @@ class WebUI:
             self._dispatch_fn,
             self._sessions_dir,
             self._get_peaks,
+            self._mixer,
         )
         server = ThreadingHTTPServer(("127.0.0.1", self._port), handler_cls)
         url = f"http://localhost:{self._port}"
@@ -396,6 +461,25 @@ h1{font-size:10px;color:#333;letter-spacing:3px;text-transform:uppercase}
   position:absolute;bottom:3px;left:3px;
   font-size:7px;color:#c02020;pointer-events:none;
 }
+/* Trim handle (orange, bracket-style) */
+.trim-handle{
+  position:absolute;top:0;bottom:0;width:3px;
+  background:#c07000;cursor:col-resize;z-index:12;
+}
+.trim-handle::before{
+  content:'';position:absolute;top:0;left:50%;transform:translateX(-50%);
+  width:12px;height:12px;
+  background:#e08000;border:1px solid #ffb020;border-radius:2px;
+}
+.trim-handle:hover{background:#e09020}
+.trim-handle.trim-start::after{
+  content:'◀';position:absolute;top:14px;left:2px;
+  font-size:7px;color:#e08000;
+}
+.trim-handle.trim-end::after{
+  content:'▶';position:absolute;top:14px;right:2px;
+  font-size:7px;color:#e08000;
+}
 
 /* ── Controller chassis (unchanged structure) ─────────────────────── */
 #ctrl{
@@ -539,6 +623,10 @@ h1{font-size:10px;color:#333;letter-spacing:3px;text-transform:uppercase}
     <div id="wform-title">Sample</div>
     <div id="wform-sample-name">—</div>
     <div id="wform-chop-count"></div>
+    <div id="wform-play-mode" title="Click to cycle play mode" style="padding:2px 8px;border-radius:3px;border:1px solid #222240;background:#0e0e1e;color:#6070a0;font-size:8px;font-family:inherit;cursor:pointer;text-transform:uppercase;letter-spacing:.5px;transition:all .08s"></div>
+    <div style="width:1px;background:#222240;height:16px;margin:0 2px"></div>
+    <button class="wform-btn" id="btn-normalize">Norm</button>
+    <button class="wform-btn" id="btn-auto-detect">Detect</button>
     <button class="wform-btn" id="btn-auto4">÷4</button>
     <button class="wform-btn" id="btn-auto8">÷8</button>
     <button class="wform-btn" id="btn-auto16">÷16</button>
@@ -778,10 +866,13 @@ const canvasWrap=document.getElementById('wform-canvas-wrap');
 
 let wfPeaks=null;
 let wfDividers=[];      // sorted array of 0..1 positions (interior chop boundaries)
+let wfTrimStart=0.0;    // trim start handle position
+let wfTrimEnd=1.0;      // trim end handle position
 let wfSampleKey=null;
 let wfTrackIdx=-1;
-let wfDragIdx=-1;       // index into wfDividers being dragged, or -1
+let wfDragIdx=-1;       // index into wfDividers (-1 = none, -10 = trim-start, -11 = trim-end)
 let wfDragStartX=0;
+let wfPlayMode='oneshot';
 
 function chopsToDiv(chops){
   // chops = [[start, end, name], ...]  → extract interior dividers
@@ -801,11 +892,18 @@ function drawWaveform(){
   const ctx=canvas.getContext('2d');
   ctx.clearRect(0,0,W,H);
 
-  const allBounds=[0,...wfDividers,1];
+  const tsX=wfTrimStart*W, teX=wfTrimEnd*W;
 
-  // Alternating chop region backgrounds
+  // Trim-out shading (before trim_start, after trim_end)
+  ctx.fillStyle='rgba(0,0,0,0.6)';
+  if(tsX>0) ctx.fillRect(0,0,tsX,H);
+  if(teX<W) ctx.fillRect(teX,0,W-teX,H);
+
+  // Alternating chop region backgrounds (within trim window)
+  const allBounds=[0,...wfDividers,1];
   for(let i=0;i<allBounds.length-1;i++){
-    const x0=allBounds[i]*W, x1=allBounds[i+1]*W;
+    // Map chop bounds into trim window pixel space
+    const x0=tsX+allBounds[i]*(teX-tsX), x1=tsX+allBounds[i+1]*(teX-tsX);
     ctx.fillStyle=i%2===0?'#050510':'#070718';
     ctx.fillRect(x0,0,x1-x0,H);
   }
@@ -813,27 +911,34 @@ function drawWaveform(){
   if(wfPeaks && wfPeaks.length>0){
     const centerY=H/2;
     const barW=Math.max(1,W/wfPeaks.length);
-    // Filled waveform body
-    ctx.fillStyle='#122840';
+    // Waveform body
     for(let i=0;i<wfPeaks.length;i++){
       const x=(i/wfPeaks.length)*W;
+      const inTrim=x>=tsX&&x<=teX;
+      ctx.fillStyle=inTrim?'#122840':'#0a1420';
       const h=wfPeaks[i]*H*0.88;
       ctx.fillRect(x,centerY-h/2,barW,h);
     }
-    // Peak outline (top)
-    ctx.strokeStyle='#3070a0';ctx.lineWidth=1;ctx.beginPath();
+    // Peak outline top
+    ctx.lineWidth=1;ctx.beginPath();
     for(let i=0;i<wfPeaks.length;i++){
       const x=(i/wfPeaks.length)*W+barW/2;
+      const inTrim=x>=tsX&&x<=teX;
+      ctx.strokeStyle=inTrim?'#3070a0':'#1a3050';
       const y=centerY-wfPeaks[i]*H*0.88/2;
-      i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+      if(i===0){ctx.moveTo(x,y);}
+      else{ctx.lineTo(x,y);ctx.stroke();ctx.beginPath();ctx.moveTo(x,y);}
     }
     ctx.stroke();
-    // Peak outline (bottom)
+    // Peak outline bottom
     ctx.beginPath();
     for(let i=0;i<wfPeaks.length;i++){
       const x=(i/wfPeaks.length)*W+barW/2;
+      const inTrim=x>=tsX&&x<=teX;
+      ctx.strokeStyle=inTrim?'#3070a0':'#1a3050';
       const y=centerY+wfPeaks[i]*H*0.88/2;
-      i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+      if(i===0){ctx.moveTo(x,y);}
+      else{ctx.lineTo(x,y);ctx.stroke();ctx.beginPath();ctx.moveTo(x,y);}
     }
     ctx.stroke();
     // Centre line
@@ -841,29 +946,40 @@ function drawWaveform(){
     ctx.beginPath();ctx.moveTo(0,centerY);ctx.lineTo(W,centerY);ctx.stroke();
   }
 
-  // Chop divider lines
+  // Chop dividers (within trim window)
   for(let i=0;i<wfDividers.length;i++){
-    const x=wfDividers[i]*W;
+    const x=tsX+wfDividers[i]*(teX-tsX);
     const hot=i===wfDragIdx;
     ctx.strokeStyle=hot?'#ff5050':'#cc2222';
     ctx.lineWidth=hot?3:2;
     ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();
-    // Handle dot at top
     ctx.fillStyle=hot?'#ff5050':'#cc2222';
     ctx.beginPath();ctx.arc(x,10,5,0,Math.PI*2);ctx.fill();
-    // Chop number label
     ctx.fillStyle='#cc2222';ctx.font='bold 8px monospace';
     ctx.fillText(String(i+1),x+3,H-4);
   }
 
-  // Chop region index labels (small, bottom-right of each region)
+  // Chop region index labels
   ctx.font='9px monospace';
   for(let i=0;i<allBounds.length-1;i++){
-    const x0=allBounds[i]*W, x1=allBounds[i+1]*W;
+    const x0=tsX+allBounds[i]*(teX-tsX), x1=tsX+allBounds[i+1]*(teX-tsX);
     if(x1-x0<16) continue;
     ctx.fillStyle='rgba(80,120,160,.5)';
     ctx.fillText(String(i),x0+3,14);
   }
+
+  // Trim handles (orange, drawn on top)
+  const drawTrimHandle=(x,hot)=>{
+    ctx.strokeStyle=hot?'#ffb020':'#c07000';
+    ctx.lineWidth=hot?4:3;
+    ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();
+    ctx.fillStyle=hot?'#ffb020':'#e08000';
+    ctx.fillRect(x-5,0,11,14);
+    ctx.fillStyle='#050508';ctx.font='bold 8px monospace';
+    ctx.textAlign='center';ctx.fillText('T',x,11);ctx.textAlign='left';
+  };
+  drawTrimHandle(tsX,wfDragIdx===-10);
+  drawTrimHandle(teX,wfDragIdx===-11);
 }
 
 function posToRatio(clientX){
@@ -881,44 +997,76 @@ function nearestDivider(ratio,threshPx=10){
   return best;
 }
 
+// Nearest trim handle index: -10=trim-start, -11=trim-end, or nearest chop index
+function nearestTarget(ratio, threshPx=10){
+  const W=canvas.getBoundingClientRect().width;
+  const thresh=threshPx/W;
+  // Check trim handles first (higher priority)
+  if(Math.abs(ratio-wfTrimStart)<thresh) return -10;
+  if(Math.abs(ratio-wfTrimEnd)<thresh) return -11;
+  return nearestDivider(ratio, threshPx);
+}
+
+// Convert raw canvas ratio → chop-space ratio (0-1 within trim window)
+function rawToChopRatio(ratio){
+  const span=wfTrimEnd-wfTrimStart||0.0001;
+  return (ratio-wfTrimStart)/span;
+}
+function chopToRawRatio(cr){
+  return wfTrimStart+cr*(wfTrimEnd-wfTrimStart);
+}
+
 canvas.addEventListener('mousedown',e=>{
   e.preventDefault();
   const ratio=posToRatio(e.clientX);
-  const near=nearestDivider(ratio);
-  if(near>=0){
-    wfDragIdx=near;
-    wfDragStartX=e.clientX;
-  }
+  const target=nearestTarget(ratio);
+  wfDragIdx=target;
+  wfDragStartX=e.clientX;
 });
 
 canvas.addEventListener('mousemove',e=>{
-  if(wfDragIdx<0) return;
+  if(wfDragIdx===undefined||wfDragIdx===null) return;
   const ratio=posToRatio(e.clientX);
-  wfDividers[wfDragIdx]=Math.max(0.001,Math.min(0.999,ratio));
-  wfDividers.sort((a,b)=>a-b);
-  // re-find the dragged index after sort
-  const nearR=posToRatio(e.clientX);
-  wfDragIdx=nearestDivider(nearR,40);
-  drawWaveform();
-  updateChopCount();
-});
-
-canvas.addEventListener('mouseup',e=>{
-  if(wfDragIdx>=0){
-    wfDragIdx=-1;
-    dispatchChops();
+  if(wfDragIdx===-10){
+    wfTrimStart=Math.max(0,Math.min(wfTrimEnd-0.01,ratio));
+    drawWaveform();
+  } else if(wfDragIdx===-11){
+    wfTrimEnd=Math.min(1,Math.max(wfTrimStart+0.01,ratio));
+    drawWaveform();
+  } else if(wfDragIdx>=0){
+    const cr=rawToChopRatio(ratio);
+    wfDividers[wfDragIdx]=Math.max(0.001,Math.min(0.999,cr));
+    wfDividers.sort((a,b)=>a-b);
+    const nearCr=rawToChopRatio(posToRatio(e.clientX));
+    wfDragIdx=nearestDivider(nearCr,40);
+    drawWaveform();
+    updateChopCount();
   }
 });
 
+canvas.addEventListener('mouseup',e=>{
+  const wasTrim=wfDragIdx===-10||wfDragIdx===-11;
+  wfDragIdx=-1;
+  if(wasTrim) dispatchTrim();
+  else dispatchChops();
+});
+
 canvas.addEventListener('mouseleave',e=>{
-  if(wfDragIdx>=0){ wfDragIdx=-1; dispatchChops(); }
+  if(wfDragIdx!==-1){
+    const wasTrim=wfDragIdx===-10||wfDragIdx===-11;
+    wfDragIdx=-1;
+    if(wasTrim) dispatchTrim(); else dispatchChops();
+  }
 });
 
 canvas.addEventListener('dblclick',e=>{
   const ratio=posToRatio(e.clientX);
-  const near=nearestDivider(ratio,12);
-  if(near<0){
-    wfDividers.push(ratio);
+  const target=nearestTarget(ratio,12);
+  if(target<0) return; // near a handle, skip
+  // Add chop divider in chop space
+  const cr=rawToChopRatio(ratio);
+  if(cr>0.001&&cr<0.999){
+    wfDividers.push(cr);
     wfDividers.sort((a,b)=>a-b);
     drawWaveform();
     updateChopCount();
@@ -929,7 +1077,8 @@ canvas.addEventListener('dblclick',e=>{
 canvas.addEventListener('contextmenu',e=>{
   e.preventDefault();
   const ratio=posToRatio(e.clientX);
-  const near=nearestDivider(ratio,16);
+  const cr=rawToChopRatio(ratio);
+  const near=nearestDivider(cr,16);
   if(near>=0){
     wfDividers.splice(near,1);
     drawWaveform();
@@ -939,13 +1088,18 @@ canvas.addEventListener('contextmenu',e=>{
 });
 
 function updateChopCount(){
-  document.getElementById('wform-chop-count').textContent=
-    wfDividers.length+1+' chop'+(wfDividers.length!==0?'s':'');
+  const n=wfDividers.length+1;
+  document.getElementById('wform-chop-count').textContent=`${n} chop${n!==1?'s':''}`;
 }
 
 function dispatchChops(){
   if(wfTrackIdx<0) return;
   post({type:'set_chops',track_idx:wfTrackIdx,chops:divToChops(wfDividers)});
+}
+
+function dispatchTrim(){
+  if(wfTrackIdx<0) return;
+  post({type:'set_trim',track_idx:wfTrackIdx,trim_start:wfTrimStart,trim_end:wfTrimEnd});
 }
 
 function autoSlice(n){
@@ -962,8 +1116,40 @@ document.getElementById('btn-auto16').addEventListener('click',()=>autoSlice(16)
 document.getElementById('btn-chop-clear').addEventListener('click',()=>{
   wfDividers=[];drawWaveform();updateChopCount();dispatchChops();
 });
+document.getElementById('btn-normalize').addEventListener('click',()=>{
+  if(wfTrackIdx<0) return;
+  post({type:'normalize',track_idx:wfTrackIdx}).then(()=>{
+    // Re-fetch waveform to show normalized peaks
+    if(wfSampleKey) fetchWaveform(wfSampleKey);
+  });
+});
+document.getElementById('btn-auto-detect').addEventListener('click',()=>{
+  if(wfTrackIdx<0) return;
+  const n=wfDividers.length+1||8;
+  post({type:'auto_chop',track_idx:wfTrackIdx,n_slices:Math.max(2,n)});
+});
+document.getElementById('wform-play-mode').addEventListener('click',()=>{
+  // Cycle play mode via softkey 0 equivalent — just update display optimistically
+  const modes=['oneshot','gate','legato'];
+  const next=modes[(modes.indexOf(wfPlayMode)+1)%modes.length];
+  wfPlayMode=next;
+  updatePlayModeDisplay();
+  // Dispatch a softkey that triggers cycle_play_mode in reduce
+  post({type:'cycle_play_mode',track_idx:wfTrackIdx});
+});
 
 let _lastSampleKey=null;
+
+const PM_LABELS={'oneshot':'One-shot','gate':'Gate','legato':'Legato'};
+const PM_COLORS={'oneshot':'#5060a0','gate':'#507060','legato':'#705060'};
+
+function updatePlayModeDisplay(){
+  const el=document.getElementById('wform-play-mode');
+  if(!el) return;
+  el.textContent=PM_LABELS[wfPlayMode]||wfPlayMode;
+  el.style.color=PM_COLORS[wfPlayMode]||'#6070a0';
+  el.style.borderColor=(PM_COLORS[wfPlayMode]||'#5060a0').replace(/[0-9a-f]{2}/gi,h=>Math.min(255,parseInt(h,16)+16).toString(16).padStart(2,'0'));
+}
 
 function resizeCanvas(){
   const w=canvasWrap.getBoundingClientRect().width;
@@ -1033,16 +1219,29 @@ function update(s){
       wfTrackIdx=ti;
       document.getElementById('wform-sample-name').textContent=key||'—';
       wfPeaks=null;
+      // Reset trim to state values when sample changes
+      wfTrimStart=s.trim_start??0;
+      wfTrimEnd=s.trim_end??1;
       fetchWaveform(key);
     }
     wfTrackIdx=ti;
-    // Sync dividers from state (if not currently dragging)
-    if(wfDragIdx<0){
+    // Sync from state while not dragging
+    if(wfDragIdx===-1||wfDragIdx===undefined){
       const newDiv=chopsToDiv(s.chops);
       if(JSON.stringify(newDiv)!==JSON.stringify(wfDividers)){
         wfDividers=newDiv;
         drawWaveform();
       }
+      const ts=s.trim_start??0, te=s.trim_end??1;
+      if(Math.abs(ts-wfTrimStart)>0.001||Math.abs(te-wfTrimEnd)>0.001){
+        wfTrimStart=ts; wfTrimEnd=te;
+        drawWaveform();
+      }
+    }
+    // Sync play mode
+    if(s.play_mode&&s.play_mode!==wfPlayMode){
+      wfPlayMode=s.play_mode;
+      updatePlayModeDisplay();
     }
     updateChopCount();
   } else {

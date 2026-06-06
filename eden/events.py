@@ -127,3 +127,33 @@ class WebSelectCell(Event):
     """Select a track+loop cell from the web session view."""
     track: int  # 0-15
     loop: int   # 0-15
+
+
+@dataclass(frozen=True)
+class SampleRecordStart(Event):
+    track_idx: int   # SampleTrack to record into
+
+
+@dataclass(frozen=True)
+class SampleRecordStop(Event):
+    track_idx: int
+    new_key: str     # key under which the recorded audio was saved
+
+
+@dataclass(frozen=True)
+class AutoChop(Event):
+    track_idx: int
+    n_slices: int    # target slice count (4, 8, 16)
+    boundaries: tuple  # tuple[float, ...] — already-computed onset boundaries
+
+
+@dataclass(frozen=True)
+class SetTrim(Event):
+    track_idx: int
+    trim_start: float
+    trim_end: float
+
+
+@dataclass(frozen=True)
+class NormalizeAction(Event):
+    track_idx: int

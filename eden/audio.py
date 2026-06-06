@@ -82,6 +82,7 @@ class AudioMixer:
         self._samples: dict[str, np.ndarray] = {}
         self._engines: dict[int, TrackEngine] = {}
         self._finishing_engines: dict[int, TrackEngine] = {}
+        self._mute_group_registry: dict[int, int] = {}  # track_idx → mute_group_id
 
         # Pre-allocated mix buffer (float64 for internal precision)
         self._mix_buf = np.zeros((BLOCK_SIZE, 2), dtype=np.float64)
@@ -145,6 +146,70 @@ class AudioMixer:
         peak_max = max(peaks) or 1.0
         return [p / peak_max for p in peaks]
 
+    def normalize(self, name: str) -> bool:
+        """Normalize sample peak to 1.0 in-memory. Returns True if done."""
+        sample = self._samples.get(name)
+        if sample is None:
+            return False
+        peak = np.abs(sample).max()
+        if peak > 0:
+            self._samples[name] = sample / peak
+        return True
+
+    def detect_onsets(self, name: str, n_target: int = 8) -> list[float]:
+        """
+        Simple numpy-only spectral flux onset detection.
+        Returns list of normalized boundary positions (interior only, not 0.0 or 1.0)
+        targeting ~n_target-1 interior boundaries (i.e. n_target segments).
+        Falls back to equal divisions if fewer onsets detected.
+        """
+        sample = self._samples.get(name)
+        if sample is None:
+            return []
+        mono = sample.mean(axis=1)
+        hop = 512
+        win = 1024
+        n_frames = (len(mono) - win) // hop
+        if n_frames < 2:
+            return [i / n_target for i in range(1, n_target)]
+
+        # Spectral flux
+        flux = np.zeros(n_frames)
+        prev = np.zeros(win // 2 + 1)
+        for i in range(n_frames):
+            chunk = mono[i * hop: i * hop + win]
+            spec = np.abs(np.fft.rfft(chunk * np.hanning(win)))
+            diff = spec - prev
+            flux[i] = np.maximum(diff, 0).sum()
+            prev = spec
+
+        # Normalize flux
+        if flux.max() > 0:
+            flux /= flux.max()
+
+        # Peak pick with adaptive threshold
+        threshold = flux.mean() + 0.5 * flux.std()
+        min_dist = max(1, n_frames // (n_target * 4))
+        peaks = []
+        last = -min_dist
+        for i in range(1, len(flux) - 1):
+            if flux[i] > threshold and flux[i] > flux[i - 1] and flux[i] > flux[i + 1]:
+                if i - last >= min_dist:
+                    peaks.append(i)
+                    last = i
+
+        # Pick n_target-1 strongest peaks
+        if len(peaks) > n_target - 1:
+            strengths = [(flux[p], p) for p in peaks]
+            strengths.sort(reverse=True)
+            peaks = sorted(p for _, p in strengths[:n_target - 1])
+
+        if not peaks:
+            return [i / n_target for i in range(1, n_target)]
+
+        total = len(mono)
+        return [p * hop / total for p in peaks]
+
     # ------------------------------------------------------------------
     # Engine management (called from main thread)
     # ------------------------------------------------------------------
@@ -156,14 +221,19 @@ class AudioMixer:
         if isinstance(track, SynthTrack):
             return SynthEngine(self._sr)
         if isinstance(track, SampleTrack):
-            return SampleEngine(track.sample_key, self._samples)
+            return SampleEngine(track.sample_key, self._samples, sample_rate=self._sr)
         raise ValueError(f"No engine for track type {type(track).__name__!r}")
 
-    def assign_engine(self, track_idx: int, engine: TrackEngine) -> None:
+    def assign_engine(self, track_idx: int, engine: TrackEngine, mute_group: int = 0) -> None:
         self._engines[track_idx] = engine
+        if mute_group > 0:
+            self._mute_group_registry[track_idx] = mute_group
+        else:
+            self._mute_group_registry.pop(track_idx, None)
 
     def remove_engine(self, track_idx: int) -> None:
         self._engines.pop(track_idx, None)
+        self._mute_group_registry.pop(track_idx, None)
 
     def get_engine(self, track_idx: int) -> Optional[TrackEngine]:
         return self._engines.get(track_idx)
@@ -176,6 +246,19 @@ class AudioMixer:
 
     def clear_finishing_engines(self) -> None:
         self._finishing_engines.clear()
+
+    def silence_mute_group(self, group_id: int, except_track: int) -> None:
+        """Stop all tracks in group_id except except_track."""
+        if group_id <= 0:
+            return
+        for ti, engine in list(self._engines.items()):
+            if ti == except_track:
+                continue
+            # We need track state to check mute_group; look up via the engines dict
+            # The simplest approach: store mute_group registry updated by assign_engine
+            grp = self._mute_group_registry.get(ti, 0)
+            if grp == group_id:
+                engine.all_notes_off()
 
     def assign_fx_processor(self, track_idx: int, proc) -> None:
         self._fx_processors[track_idx] = proc
@@ -470,6 +553,45 @@ class StepScheduler:
                 )
                 ctx["idx"] = (idx + 1) % len(seq)
                 ctx["ticks_until_next"] = ctx["ticks_per_note"]
+
+
+# ---------------------------------------------------------------------------
+# SampleRecorder — captures audio from default input device
+# ---------------------------------------------------------------------------
+
+
+class SampleRecorder:
+    """Captures audio from the default input device. Thread-safe."""
+
+    def __init__(self, sr: int = 44100):
+        self._sr = sr
+        self._chunks: list = []
+        self._recording = False
+        self._stream = None
+        self._lock = threading.Lock()
+
+    def start(self):
+        self._chunks = []
+        self._recording = True
+        self._stream = sd.InputStream(
+            samplerate=self._sr, channels=2, dtype='float32',
+            callback=self._cb, blocksize=512,
+        )
+        self._stream.start()
+
+    def _cb(self, indata, frames, time_info, status):
+        if self._recording:
+            self._chunks.append(indata.copy())
+
+    def stop(self) -> np.ndarray:
+        self._recording = False
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+        if self._chunks:
+            return np.concatenate(self._chunks, axis=0).astype(np.float64)
+        return np.zeros((0, 2), dtype=np.float64)
 
 
 # ---------------------------------------------------------------------------

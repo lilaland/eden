@@ -238,6 +238,25 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
                             else:
                                 pads[pad_idx] = _dim(PAD_INACTIVE)
 
+                elif isinstance(track, SampleTrack) and state.instrument_submode == InstrumentSubmode.SAMPLE_KEYS:
+                    # ── SampleTrack SAMPLE_KEYS mode: chromatic keyboard ──────────
+                    # Pad 15 = root (0 semitones), 16-31 = +1 to +16, 0-14 = -15 to -1
+                    for pad_idx in range(32):
+                        semitone = pad_idx - 15  # -15 to +16
+                        if semitone == 0:
+                            pads[pad_idx] = (127, 127, 127)  # root = bright white
+                        elif semitone % 12 == 0:
+                            pads[pad_idx] = _brighten(color)  # octave = bright type color
+                        else:
+                            # Distinguish black/white keys for tinting
+                            # Semitones in chromatic scale that are "black keys": 1,3,6,8,10 (mod 12)
+                            s = semitone % 12
+                            is_black = s in (1, 3, 6, 8, 10)
+                            if is_black:
+                                pads[pad_idx] = _dim(color, 4.0)
+                            else:
+                                pads[pad_idx] = _dim(color, 2.0)
+
                 elif isinstance(track, SampleTrack) and state.instrument_submode == InstrumentSubmode.SAMPLE_CHOPS:
                     # ── SampleTrack SAMPLE_CHOPS mode ─────────────────────────
                     loop = track.loops[state.selected_loop]
@@ -650,6 +669,27 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
 
         # ── SampleTrack OLED ──────────────────────────────────────────────────
         if isinstance(first_track, SampleTrack):
+            # SAMPLE_KEYS submode: dedicated OLED layout
+            if state.instrument_submode == InstrumentSubmode.SAMPLE_KEYS:
+                chop_idx = state.sample_chop_cursor
+                n_chops = len(first_track.chops)
+                chop_label = (
+                    (first_track.chops[chop_idx].name or f"C{chop_idx + 1}")
+                    if n_chops > 0 and chop_idx < n_chops else "FULL"
+                )
+                tune_val = (
+                    first_track.chops[chop_idx].tune
+                    if n_chops > 0 and chop_idx < n_chops else 0.0
+                )
+                _set(OLED_MAIN_LINE1, f"{first_track.name}  KEYS")
+                _set(OLED_MAIN_LINE2, f"{chop_label}  tune:{tune_val:+.1f}st")
+                _set(OLED_BTN1_TITLE, "CHOPS", _OLED_DIM)
+                _set(OLED_BTN2_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN3_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN4_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN5_TITLE, "", _OLED_DIM)
+                return out
+
             page = state.instrument_oled_page
             loop = first_track.loops[state.selected_loop]
             sel_step = state.step_cursor % max(1, loop.step_count)
@@ -665,24 +705,33 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
                 _set(OLED_MAIN_LINE2, f"STP{sel_step+1:02d} -> {chop_label}")
                 sub_str = "CHOPS" if state.instrument_submode == InstrumentSubmode.SAMPLE_CHOPS else "STEPS"
                 _set(OLED_BTN1_TITLE, "", _OLED_DIM)
-                _set(OLED_BTN2_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN2_TITLE, "KEYS", _OLED_DIM)
                 _set(OLED_BTN3_TITLE, "", _OLED_DIM)
                 _set(OLED_BTN4_TITLE, "< BACK", _OLED_DIM)
                 _set(OLED_BTN5_TITLE, sub_str, _OLED_DIM)
             elif page == 1:
-                # Settings: one_shot, bars
+                # Settings: play_mode, trim, attack, release, pan
                 bars_color = _OLED_ACTIVE if ctrl == "BARS" else _OLED_DIM
-                os_color = _OLED_ACTIVE if first_track.one_shot else _OLED_DIM
+                pm = first_track.play_mode
+                pm_color = _OLED_ACTIVE if pm != "oneshot" else _OLED_DIM
+                atk = first_track.amp_attack
+                atk_str = f"{round(atk * 1000)}ms" if atk < 1.0 else f"{atk:.1f}s"
+                rel = first_track.amp_release
+                rel_str = f"{round(rel * 1000)}ms" if rel < 1.0 else f"{rel:.1f}s"
+                pan_str = f"{first_track.pan:+.2f}"
                 _set(OLED_MAIN_LINE1, f"{first_track.name}")
                 _set(OLED_MAIN_LINE2, f"key: {first_track.sample_key[:8]}")
-                _set(OLED_BTN1_TITLE, "1-SHOT", os_color)
-                _set(OLED_BTN1_VALUE, "YES" if first_track.one_shot else "NO")
-                _set(OLED_BTN2_TITLE, "", _OLED_DIM)
-                _set(OLED_BTN3_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN1_TITLE, "PLAY", pm_color)
+                _set(OLED_BTN1_VALUE, pm.upper()[:5])
+                _set(OLED_BTN2_TITLE, "ATK", _OLED_DIM)
+                _set(OLED_BTN2_VALUE, atk_str)
+                _set(OLED_BTN3_TITLE, "REL", _OLED_DIM)
+                _set(OLED_BTN3_VALUE, rel_str)
                 _set(OLED_BTN4_TITLE, "BARS", bars_color)
                 loop_bars = first_track.loops[state.selected_loop].bars
                 _set(OLED_BTN4_VALUE, str(loop_bars))
-                _set(OLED_BTN5_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN5_TITLE, "PAN", _OLED_DIM)
+                _set(OLED_BTN5_VALUE, pan_str)
             elif page == 2:
                 # Track management
                 keep = first_track.keep_empty

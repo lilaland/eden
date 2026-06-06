@@ -44,6 +44,7 @@ class InstrumentSubmode(Enum):
     DRUM_FREE = auto()    # free multi-track drum recording (pads 0-15 = tracks 0-15)
     SAMPLE_CHOPS = auto() # chop-to-step assignment grid
     SAMPLE_RECORD = auto() # input → trim → chop-detect (scaffold for now)
+    SAMPLE_KEYS = auto()  # all pads = chromatic keyboard for selected chop
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,8 @@ class ChopPoint:
     start_offset: float   # 0.0–1.0
     end_offset: float     # 0.0–1.0
     name: str = ""
+    tune: float = 0.0     # semitones offset, applied at playback
+    reverse: bool = False
 
 
 @dataclass(frozen=True)
@@ -138,7 +141,13 @@ class SampleTrack:
     sample_key: str              # key into AudioMixer._samples (e.g. "kick_techno")
     loops: tuple[Loop, ...]      # always 16 loops
     chops: tuple[ChopPoint, ...] = ()   # empty = whole-sample (one-shot mode)
-    one_shot: bool = True        # False = loop until gate releases
+    play_mode: str = "oneshot"   # "oneshot" | "gate" | "legato"
+    trim_start: float = 0.0      # normalized 0.0-1.0
+    trim_end: float = 1.0
+    amp_attack: float = 0.0      # seconds (0 = instant)
+    amp_release: float = 0.05    # seconds
+    pan: float = 0.0             # -1.0 to +1.0
+    mute_group: int = 0          # 0 = none; 1-8 = exclusive mute group
     volume: float = 1.0
     keep_empty: bool = False
     fx: FXChain = field(default_factory=FXChain)
@@ -236,6 +245,9 @@ class AppState:
     # Scene management (M5)
     scenes: tuple[Optional[Scene], ...] = field(default_factory=lambda: tuple([None] * 8))
     active_scene: int = 0
+    # SampleTrack ephemeral state
+    sample_chop_cursor: int = 0      # selected chop index in SAMPLE_CHOPS / SAMPLE_KEYS
+    sample_recording: bool = False   # True while audio input is being recorded
 
 
 # ── Factory functions ─────────────────────────────────────────────────────────

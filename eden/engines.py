@@ -122,68 +122,211 @@ class DrumEngine(TrackEngine):
 
 # ── SampleEngine ─────────────────────────────────────────────────────────────
 
+_MAX_SAMPLE_VOICES = 16
+
+
+class _SampleVoice:
+    __slots__ = ('data', 'pos', 'gain', 'pan_l', 'pan_r', 'pitch_rate',
+                 'attack_inc', 'release_dec', 'env', 'attacking',
+                 'gate_remaining', 'releasing', 'release_from',
+                 'play_mode', 'done')
+
+    def __init__(self, data, gain, pan_l, pan_r, pitch_rate,
+                 attack_samples, release_samples, gate_samples, play_mode):
+        self.data = data
+        self.pos = 0.0
+        self.gain = gain
+        self.pan_l = pan_l
+        self.pan_r = pan_r
+        self.pitch_rate = pitch_rate
+        self.attack_inc = 1.0 / max(1, attack_samples)
+        self.release_dec = 1.0 / max(1, release_samples)
+        self.env = 0.0
+        self.attacking = attack_samples > 0
+        self.gate_remaining = gate_samples if play_mode != "oneshot" else 0
+        self.releasing = False
+        self.release_from = 1.0
+        self.play_mode = play_mode
+        self.done = False
+
+    def note_off(self):
+        if not self.releasing:
+            self.releasing = True
+            self.release_from = self.env
+
+    def fill(self, buf, n_frames):
+        """Sample-by-sample: advance pos by pitch_rate, interpolate, apply envelope and pan."""
+        i = 0
+        data = self.data
+        data_len = len(data)
+        while i < n_frames and not self.done:
+            # Gate countdown
+            if self.gate_remaining > 0:
+                self.gate_remaining -= 1
+                if self.gate_remaining == 0 and not self.releasing:
+                    self.releasing = True
+                    self.release_from = self.env
+            # Envelope
+            if self.attacking:
+                self.env += self.attack_inc
+                if self.env >= 1.0:
+                    self.env = 1.0
+                    self.attacking = False
+            elif self.releasing:
+                self.env -= self.release_from * self.release_dec
+                if self.env <= 0.0:
+                    self.env = 0.0
+                    self.done = True
+                    break
+            else:
+                self.env = 1.0
+            # Linear interpolation at float position
+            idx = int(self.pos)
+            if idx >= data_len - 1:
+                self.done = True
+                break
+            frac = self.pos - idx
+            s0 = data[idx]
+            s1 = data[idx + 1]
+            s_l = s0[0] * (1.0 - frac) + s1[0] * frac
+            s_r = s0[1] * (1.0 - frac) + s1[1] * frac
+            env_gain = self.gain * self.env
+            buf[i, 0] += s_l * env_gain * self.pan_l
+            buf[i, 1] += s_r * env_gain * self.pan_r
+            self.pos += self.pitch_rate
+            i += 1
+
+
 class SampleEngine(TrackEngine):
     """
-    Chop-based sample playback engine. One instance per SampleTrack slot.
+    Chop-based sample playback engine with A/R envelope, pan, pitch-rate, and
+    play_mode support (oneshot / gate / legato).
 
-    Each note_on call uses the pitch value as a chop index: if the track has
-    defined chops, the corresponding slice is played; otherwise the full sample
-    is played (one-shot mode).
+    Each note_on call uses pitch as a chop index. In SAMPLE_KEYS mode, the
+    caller (app.py) passes a modified track_state with an adjusted ChopPoint.tune
+    for the desired semitone transposition.
 
     Shares the AudioMixer._samples dict so newly loaded samples are visible
     without engine recreation.
     """
 
-    def __init__(self, sample_key: str, samples: dict) -> None:
+    def __init__(self, sample_key: str, samples: dict, sample_rate: int = 44100) -> None:
         self._sample_key = sample_key
         self._samples = samples
-        self._trigger_queue: collections.deque = collections.deque(maxlen=_MAX_DRUM_VOICES * 4)
-        self._voices: list[_DrumVoice] = []
+        self._sr = sample_rate
+        self._trigger_queue: collections.deque = collections.deque(maxlen=_MAX_SAMPLE_VOICES * 4)
+        self._voices: list[_SampleVoice] = []
+        self._active: dict[int, _SampleVoice] = {}  # chop_idx → voice (for gate/legato)
 
     def note_on(self, pitch: int, velocity: float, gate_samples: int, track_state) -> None:
         sample = self._samples.get(self._sample_key)
         if sample is None:
             return
-        vol = getattr(track_state, "volume", 1.0) if track_state is not None else 1.0
-        gain = float(np.clip(velocity * vol, 0.0, 1.0))
 
-        # Chop slicing: pitch encodes chop index
-        chops = getattr(track_state, "chops", ()) if track_state is not None else ()
+        vol = getattr(track_state, 'volume', 1.0) or 1.0
+        pan = getattr(track_state, 'pan', 0.0)
+        pan_l = min(1.0, 1.0 - pan) * vol
+        pan_r = min(1.0, 1.0 + pan) * vol
+
+        gain = float(np.clip(velocity, 0.0, 1.0))
+        play_mode = getattr(track_state, 'play_mode', 'oneshot')
+        attack = getattr(track_state, 'amp_attack', 0.0)
+        release = getattr(track_state, 'amp_release', 0.05)
+        trim_start = getattr(track_state, 'trim_start', 0.0)
+        trim_end = getattr(track_state, 'trim_end', 1.0)
+
+        chops = getattr(track_state, 'chops', ())
+        n = len(sample)
+        t_start = int(trim_start * n)
+        t_end = int(trim_end * n)
+        effective = sample[t_start:t_end]
+
         if chops and 0 <= pitch < len(chops):
             chop = chops[pitch]
-            start = max(0, int(chop.start_offset * len(sample)))
-            end = min(len(sample), int(chop.end_offset * len(sample)))
-            slice_data = sample[start:end]
+            m = len(effective)
+            c_start = int(chop.start_offset * m)
+            c_end = int(chop.end_offset * m)
+            slice_data = effective[c_start:c_end]
+            tune = getattr(chop, 'tune', 0.0)
+            reverse = getattr(chop, 'reverse', False)
         else:
-            slice_data = sample
+            slice_data = effective
+            tune = 0.0
+            reverse = False
 
+        if reverse:
+            slice_data = slice_data[::-1]
         if len(slice_data) == 0:
             return
-        self._trigger_queue.append((slice_data, gain))
+
+        pitch_rate = 2.0 ** (tune / 12.0)
+        attack_samps = int(attack * self._sr)
+        release_samps = max(1, int(release * self._sr))
+
+        voice = _SampleVoice(
+            slice_data, gain, pan_l, pan_r, pitch_rate,
+            attack_samps, release_samps, gate_samples, play_mode,
+        )
+        self._trigger_queue.append(('on', pitch, voice, play_mode))
+
+    def note_off(self, chop_idx: int) -> None:
+        """Trigger release for the active voice at chop_idx (gate/legato modes)."""
+        self._trigger_queue.append(('off', chop_idx))
 
     def fill_block(self, buf: np.ndarray, n_frames: int) -> None:
+        # Drain trigger queue
         while True:
             try:
                 item = self._trigger_queue.popleft()
             except IndexError:
                 break
             if item is None:
-                self._voices.clear()
-            else:
-                sample_data, gain = item
-                self._voices.append(_DrumVoice(data=sample_data, gain=gain))
-                while len(self._voices) > _MAX_DRUM_VOICES:
-                    self._voices.pop(0)
-
-        still_active: list[_DrumVoice] = []
-        for voice in self._voices:
-            if voice.frames_left <= 0:
+                # all_notes_off sentinel
+                for v in self._voices:
+                    v.note_off()
+                self._active.clear()
                 continue
-            n = min(n_frames, voice.frames_left)
-            buf[:n] += voice.data[voice.position: voice.position + n] * voice.gain
-            voice.position += n
-            if voice.frames_left > 0:
+            if not isinstance(item, tuple):
+                continue
+            kind = item[0]
+            if kind == 'on':
+                _, chop_idx, voice, pm = item
+                if pm == 'legato':
+                    # Mono: release all existing voices
+                    for v in self._voices:
+                        v.note_off()
+                    self._active.clear()
+                    self._voices.append(voice)
+                    self._active[chop_idx] = voice
+                elif pm == 'gate':
+                    self._voices.append(voice)
+                    self._active[chop_idx] = voice
+                else:  # oneshot
+                    self._voices.append(voice)
+                    if len(self._voices) > _MAX_SAMPLE_VOICES:
+                        self._voices.pop(0)
+            elif kind == 'off':
+                chop_idx = item[1]
+                v = self._active.get(chop_idx)
+                if v is not None:
+                    v.note_off()
+                    self._active.pop(chop_idx, None)
+
+        still_active: list[_SampleVoice] = []
+        for voice in self._voices:
+            if voice.done:
+                # Remove from active dict if it's this voice
+                for k, av in list(self._active.items()):
+                    if av is voice:
+                        del self._active[k]
+                continue
+            voice.fill(buf, n_frames)
+            if not voice.done:
                 still_active.append(voice)
+            else:
+                for k, av in list(self._active.items()):
+                    if av is voice:
+                        del self._active[k]
         self._voices = still_active
 
     def all_notes_off(self) -> None:

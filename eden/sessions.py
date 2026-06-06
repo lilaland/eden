@@ -213,12 +213,24 @@ def _track_to_dict(track) -> Optional[dict]:
             "type": "sample",
             "name": track.name,
             "sample_key": track.sample_key,
-            "one_shot": track.one_shot,
+            "play_mode": track.play_mode,
+            "trim_start": track.trim_start,
+            "trim_end": track.trim_end,
+            "amp_attack": track.amp_attack,
+            "amp_release": track.amp_release,
+            "pan": track.pan,
+            "mute_group": track.mute_group,
             "volume": track.volume,
             "keep_empty": track.keep_empty,
             "fx": _fxchain_to_dict(track.fx),
             "chops": [
-                {"start_offset": c.start_offset, "end_offset": c.end_offset, "name": c.name}
+                {
+                    "start_offset": c.start_offset,
+                    "end_offset": c.end_offset,
+                    "name": c.name,
+                    "tune": c.tune,
+                    "reverse": c.reverse,
+                }
                 for c in track.chops
             ],
             "loops": [_loop_to_dict(lp) for lp in track.loops],
@@ -274,17 +286,31 @@ def _dict_to_track(d: Optional[dict]):
                 start_offset=c["start_offset"],
                 end_offset=c["end_offset"],
                 name=c.get("name", ""),
+                tune=float(c.get("tune", 0.0)),
+                reverse=bool(c.get("reverse", False)),
             )
             for c in d.get("chops", [])
         )
+        # Support legacy "one_shot" field: if play_mode not set but one_shot is,
+        # infer play_mode from it.
+        if "play_mode" not in d and "one_shot" in d:
+            play_mode = "oneshot" if d["one_shot"] else "gate"
+        else:
+            play_mode = d.get("play_mode", "oneshot")
         return SampleTrack(
             name=d["name"],
             sample_key=d.get("sample_key", ""),
             loops=loops[:16],
             chops=chops,
-            one_shot=d.get("one_shot", True),
-            volume=d.get("volume", 1.0),
-            keep_empty=d.get("keep_empty", False),
+            play_mode=play_mode,
+            trim_start=float(d.get("trim_start", 0.0)),
+            trim_end=float(d.get("trim_end", 1.0)),
+            amp_attack=float(d.get("amp_attack", 0.0)),
+            amp_release=float(d.get("amp_release", 0.05)),
+            pan=float(d.get("pan", 0.0)),
+            mute_group=int(d.get("mute_group", 0)),
+            volume=float(d.get("volume", 1.0)),
+            keep_empty=bool(d.get("keep_empty", False)),
             fx=_dict_to_fxchain(d.get("fx")),
         )
     return None
