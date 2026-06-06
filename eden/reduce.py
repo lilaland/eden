@@ -329,14 +329,20 @@ def _on_mode_button(state: AppState, event: ModeButtonPressed) -> AppState:
             # Already armed — just switch to INSTRUMENT view.
             return dataclasses.replace(state, mode=Mode.INSTRUMENT)
         # Nothing armed yet — arm selected track and enter INSTRUMENT.
+        sel_track = state.tracks[state.selected_track]
         sub = (InstrumentSubmode.SAMPLE_CHOPS
-               if isinstance(state.tracks[state.selected_track], SampleTrack)
+               if isinstance(sel_track, SampleTrack)
                else InstrumentSubmode.STEPS)
+        new_offset = state.pitch_window_offset
+        if isinstance(sel_track, SynthTrack) and not sel_track.quantized:
+            # FREE piano mode: ensure offset is centred on root, not a stale degree index
+            new_offset = _free_piano_init_offset((sel_track,))
         return dataclasses.replace(
             state,
             armed_tracks=(state.selected_track,),
             mode=Mode.INSTRUMENT,
             instrument_submode=sub,
+            pitch_window_offset=new_offset,
         )
     if event.button == "SONG":
         state = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
@@ -1805,10 +1811,19 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
                         return _adjust_synth_param(
                             new_state, lambda t: dataclasses.replace(t, quantized=True)
                         )
-                    # STEP → FREE: enter free piano mode
-                    return _adjust_synth_param(
+                    # STEP → FREE: enter free piano mode, re-centre on root note
+                    new_state = _adjust_synth_param(
                         state, lambda t: dataclasses.replace(t, quantized=False)
                     )
+                    for idx in new_state.armed_tracks:
+                        track = new_state.tracks[idx]
+                        if isinstance(track, SynthTrack) and not track.quantized:
+                            new_state = dataclasses.replace(
+                                new_state,
+                                pitch_window_offset=_free_piano_init_offset((track,)),
+                            )
+                            break
+                    return new_state
             if event.key == 4:
                 if state.shift_held:
                     new_ctrl = "" if state.instrument_active_ctrl == "RELEASE" else "RELEASE"
