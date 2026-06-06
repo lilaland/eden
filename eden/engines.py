@@ -120,6 +120,80 @@ class DrumEngine(TrackEngine):
         return len(self._voices) == 0 and len(self._trigger_queue) == 0
 
 
+# ── SampleEngine ─────────────────────────────────────────────────────────────
+
+class SampleEngine(TrackEngine):
+    """
+    Chop-based sample playback engine. One instance per SampleTrack slot.
+
+    Each note_on call uses the pitch value as a chop index: if the track has
+    defined chops, the corresponding slice is played; otherwise the full sample
+    is played (one-shot mode).
+
+    Shares the AudioMixer._samples dict so newly loaded samples are visible
+    without engine recreation.
+    """
+
+    def __init__(self, sample_key: str, samples: dict) -> None:
+        self._sample_key = sample_key
+        self._samples = samples
+        self._trigger_queue: collections.deque = collections.deque(maxlen=_MAX_DRUM_VOICES * 4)
+        self._voices: list[_DrumVoice] = []
+
+    def note_on(self, pitch: int, velocity: float, gate_samples: int, track_state) -> None:
+        sample = self._samples.get(self._sample_key)
+        if sample is None:
+            return
+        vol = getattr(track_state, "volume", 1.0) if track_state is not None else 1.0
+        gain = float(np.clip(velocity * vol, 0.0, 1.0))
+
+        # Chop slicing: pitch encodes chop index
+        chops = getattr(track_state, "chops", ()) if track_state is not None else ()
+        if chops and 0 <= pitch < len(chops):
+            chop = chops[pitch]
+            start = max(0, int(chop.start_offset * len(sample)))
+            end = min(len(sample), int(chop.end_offset * len(sample)))
+            slice_data = sample[start:end]
+        else:
+            slice_data = sample
+
+        if len(slice_data) == 0:
+            return
+        self._trigger_queue.append((slice_data, gain))
+
+    def fill_block(self, buf: np.ndarray, n_frames: int) -> None:
+        while True:
+            try:
+                item = self._trigger_queue.popleft()
+            except IndexError:
+                break
+            if item is None:
+                self._voices.clear()
+            else:
+                sample_data, gain = item
+                self._voices.append(_DrumVoice(data=sample_data, gain=gain))
+                while len(self._voices) > _MAX_DRUM_VOICES:
+                    self._voices.pop(0)
+
+        still_active: list[_DrumVoice] = []
+        for voice in self._voices:
+            if voice.frames_left <= 0:
+                continue
+            n = min(n_frames, voice.frames_left)
+            buf[:n] += voice.data[voice.position: voice.position + n] * voice.gain
+            voice.position += n
+            if voice.frames_left > 0:
+                still_active.append(voice)
+        self._voices = still_active
+
+    def all_notes_off(self) -> None:
+        self._trigger_queue.append(None)
+
+    @property
+    def is_silent(self) -> bool:
+        return len(self._voices) == 0 and len(self._trigger_queue) == 0
+
+
 # ── SynthVoice ────────────────────────────────────────────────────────────────
 
 _ENV_ATTACK  = 0

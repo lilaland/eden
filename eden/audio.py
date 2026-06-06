@@ -9,6 +9,7 @@ StateRef is a thread-safe atomic state container shared between main and audio t
 from __future__ import annotations
 
 import os
+import random
 import sys
 import time
 import threading
@@ -18,8 +19,8 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
-from eden.engines import DrumEngine, SynthEngine, TrackEngine
-from eden.state import SynthTrack
+from eden.engines import DrumEngine, SampleEngine, SynthEngine, TrackEngine
+from eden.state import SampleTrack, SynthTrack
 from eden.arp import expand_chord, compute_arp_sequence, arp_ticks_per_note
 
 # ---------------------------------------------------------------------------
@@ -131,11 +132,13 @@ class AudioMixer:
     # ------------------------------------------------------------------
 
     def create_engine_for(self, track) -> TrackEngine:
-        from eden.state import DrumTrack, SynthTrack
+        from eden.state import DrumTrack, SynthTrack, SampleTrack
         if isinstance(track, DrumTrack):
             return DrumEngine(track.sample_name, self._samples)
         if isinstance(track, SynthTrack):
             return SynthEngine(self._sr)
+        if isinstance(track, SampleTrack):
+            return SampleEngine(track.sample_key, self._samples)
         raise ValueError(f"No engine for track type {type(track).__name__!r}")
 
     def assign_engine(self, track_idx: int, engine: TrackEngine) -> None:
@@ -320,6 +323,11 @@ class StepScheduler:
                 if not step.on:
                     continue
 
+                # Per-step probability: skip if random roll exceeds threshold
+                if step.probability < 100:
+                    if random.randint(1, 100) > step.probability:
+                        break
+
                 engine = get_engine(track_idx)
                 if engine is None:
                     continue
@@ -328,6 +336,12 @@ class StepScheduler:
                 gate_samples = max(1, int(step.gate * step_secs * sr))
                 amplitude = (step.velocity / 127.0) * loop.volume
                 pitches = step.pitches
+
+                # SampleTrack: use chop index from pitch; fire single note
+                if isinstance(track, SampleTrack):
+                    chop_idx = pitches[0] if pitches else 0
+                    engine.note_on(chop_idx, amplitude, gate_samples, track)
+                    break
 
                 if apply_effects and isinstance(track, SynthTrack):
                     # Chord expansion: add chord tones to each pitch

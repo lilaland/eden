@@ -8,6 +8,7 @@ from typing import Callable
 import eden.catalog as catalog
 from eden.state import (
     AppState,
+    ChopPoint,
     DrumTrack,
     FXChain,
     InstrumentSubmode,
@@ -15,6 +16,7 @@ from eden.state import (
     Mode,
     NoteEvent,
     SampleTrack,
+    Scene,
     StepNote,
     SynthTrack,
     Track,
@@ -286,22 +288,28 @@ def _on_mode_button(state: AppState, event: ModeButtonPressed) -> AppState:
             # Empty slot — create track from picker and enter INSTRUMENT,
             # saving current arm state to restore when returning to SESSION.
             state = _create_new_slot_track(state)
+            sub = (InstrumentSubmode.SAMPLE_CHOPS
+                   if isinstance(state.tracks[state.selected_track], SampleTrack)
+                   else InstrumentSubmode.STEPS)
             return dataclasses.replace(
                 state,
                 armed_tracks=(state.selected_track,),
                 saved_armed_tracks=state.armed_tracks,
                 mode=Mode.INSTRUMENT,
-                instrument_submode=InstrumentSubmode.STEPS,
+                instrument_submode=sub,
             )
         if state.armed_tracks:
             # Already armed — just switch to INSTRUMENT view.
             return dataclasses.replace(state, mode=Mode.INSTRUMENT)
         # Nothing armed yet — arm selected track and enter INSTRUMENT.
+        sub = (InstrumentSubmode.SAMPLE_CHOPS
+               if isinstance(state.tracks[state.selected_track], SampleTrack)
+               else InstrumentSubmode.STEPS)
         return dataclasses.replace(
             state,
             armed_tracks=(state.selected_track,),
             mode=Mode.INSTRUMENT,
-            instrument_submode=InstrumentSubmode.STEPS,
+            instrument_submode=sub,
         )
     if event.button == "SONG":
         state = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
@@ -414,6 +422,30 @@ def _session_transport(state: AppState, event: TransportPressed) -> AppState:
 
 
 def _session_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
+    # Scene management shortcuts (Shift held, no armed tracks)
+    if state.shift_held and not state.armed_tracks:
+        if event.key == 0:  # Shift+SK1: save current state as active scene
+            scene = Scene(tracks=state.tracks, tempo_bpm=state.tempo_bpm, swing=state.swing)
+            new_scenes = state.scenes[:state.active_scene] + (scene,) + state.scenes[state.active_scene + 1:]
+            return dataclasses.replace(state, scenes=tuple(new_scenes))
+        if event.key == 1:  # Shift+SK2: load next scene
+            for i in range(1, 9):
+                next_idx = (state.active_scene + i) % 8
+                sc = state.scenes[next_idx]
+                if sc is not None:
+                    return dataclasses.replace(
+                        state,
+                        tracks=sc.tracks,
+                        tempo_bpm=sc.tempo_bpm,
+                        swing=sc.swing,
+                        active_scene=next_idx,
+                        armed_tracks=(),
+                        playing_loops=frozenset(),
+                        active_loops=frozenset(),
+                        loop_measure_offsets=(),
+                    )
+            return state
+
     t = state.selected_track
     # New-instrument picker: empty slot selected → repurpose SK1-SK5.
     if state.tracks[t] is None:
@@ -512,6 +544,9 @@ def _create_new_slot_track(state: AppState) -> AppState:
                                root_note=state.last_synth_root,
                                **extras)
         init_offset = _free_piano_init_offset((new_track,))
+    elif type_idx == 2:  # SAMPLE → SampleTrack
+        new_track = SampleTrack(name=name, sample_key=param, loops=default_track_loops())
+        init_offset = state.pitch_window_offset
     else:  # DRUMS → DrumTrack
         new_track = DrumTrack(name=name, sample_name=param, loops=default_track_loops())
         init_offset = state.pitch_window_offset
@@ -1181,6 +1216,35 @@ def _save_undo(state: AppState) -> AppState:
                                undo_cursor=state.step_cursor)
 
 
+def _sample_chops_pad_pressed(state: AppState, event: PadPressed, track_idx: int) -> AppState:
+    """SAMPLE_CHOPS: bottom row = chop select; top row = step select/assign."""
+    pad = event.pad_index
+    loop_idx = state.selected_loop
+    track = state.tracks[track_idx]
+    if track is None:
+        return state
+
+    if pad >= 16:
+        # Top row: select a step
+        step_idx = pad - 16
+        return dataclasses.replace(state, step_cursor=step_idx)
+    else:
+        # Bottom row: assign this chop to the selected step
+        chop_idx = pad
+        loop = track.loops[loop_idx]
+        if loop.step_count == 0:
+            return state
+        step_idx = state.step_cursor % loop.step_count
+        old_step = loop.steps[step_idx]
+        new_step = dataclasses.replace(old_step, on=True, pitches=(chop_idx,))
+        new_steps = loop.steps[:step_idx] + (new_step,) + loop.steps[step_idx + 1:]
+        new_loop = dataclasses.replace(loop, steps=new_steps)
+        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
+        new_track = dataclasses.replace(track, loops=new_loops)
+        new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+        return dataclasses.replace(state, tracks=new_tracks)
+
+
 def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
     pad = event.pad_index
     loop_idx = state.selected_loop
@@ -1192,6 +1256,11 @@ def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
     if len(state.armed_tracks) == 1:
         affected_track = state.armed_tracks[0]
         track = state.tracks[affected_track]
+
+        # Route SampleTrack SAMPLE_CHOPS mode to its own handler
+        if isinstance(track, SampleTrack):
+            if state.instrument_submode == InstrumentSubmode.SAMPLE_CHOPS:
+                return _sample_chops_pad_pressed(state, event, affected_track)
 
         if (isinstance(track, DrumTrack)
                 and state.instrument_submode == InstrumentSubmode.PADS):
@@ -1632,6 +1701,36 @@ def _instrument_mode_button(state: AppState, event: ModeButtonPressed) -> AppSta
 def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
     first_track = state.tracks[state.armed_tracks[0]] if state.armed_tracks else None
     synth = isinstance(first_track, SynthTrack)
+
+    if isinstance(first_track, SampleTrack):
+        page = state.instrument_oled_page
+        if page == 0:
+            # CHOPS page: navigate chop grid
+            if event.key == 3:   # SK4: BACK
+                state_out = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
+                saved = state_out.saved_armed_tracks if state_out.saved_armed_tracks is not None else state.armed_tracks
+                return dataclasses.replace(state_out, mode=Mode.SESSION, armed_tracks=saved,
+                                           saved_armed_tracks=None, instrument_active_ctrl="")
+            if event.key == 4:   # SK5: FREE→CHOP mode toggle
+                new_sub = (InstrumentSubmode.STEPS
+                           if state.instrument_submode == InstrumentSubmode.SAMPLE_CHOPS
+                           else InstrumentSubmode.SAMPLE_CHOPS)
+                return dataclasses.replace(state, instrument_submode=new_sub)
+        elif page == 1:
+            # Sample settings
+            if event.key == 0:   # SK1: toggle one_shot
+                return _toggle_sample_one_shot(state)
+            if event.key == 3:
+                ctrl = "" if state.instrument_active_ctrl == "BARS" else "BARS"
+                return dataclasses.replace(state, instrument_active_ctrl=ctrl)
+        elif page == 2:
+            # Track management
+            if event.key == 0:
+                return _set_keep_empty(state)
+            if event.key == 4:
+                return _delete_armed_track(state)
+        return state
+
     if synth:
         page = state.instrument_oled_page
         if page == 0:
@@ -2098,6 +2197,18 @@ def _drop_fully_empty_tracks(
         mode=new_mode,
         loop_measure_offsets=new_offsets,
     )
+
+
+def _toggle_sample_one_shot(state: AppState) -> AppState:
+    """Toggle one_shot on all armed SampleTrack tracks."""
+    new_state = state
+    for ti in state.armed_tracks:
+        t = new_state.tracks[ti]
+        if isinstance(t, SampleTrack):
+            new_t = dataclasses.replace(t, one_shot=not t.one_shot)
+            new_tracks = new_state.tracks[:ti] + (new_t,) + new_state.tracks[ti + 1:]
+            new_state = dataclasses.replace(new_state, tracks=new_tracks)
+    return new_state
 
 
 def _set_keep_empty(state: AppState) -> AppState:

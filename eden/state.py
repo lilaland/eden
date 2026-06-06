@@ -16,10 +16,12 @@ class Mode(Enum):
 class StepNote:
     """A single step in a loop. Drums use on/velocity; synths use all fields."""
     on: bool
-    pitches: tuple[int, ...] = (60,)  # MIDI notes 0-127; multi-voice chord; ignored by DrumTrack
-    velocity: int = 100               # 0-127; used by both drums and synths
-    gate: float = 0.5                 # fraction of step duration held; ignored by DrumTrack
-    aftertouch: float = 0.0           # channel pressure at time of recording [0,1]; playback-ignored
+    pitches: tuple[int, ...] = (60,)     # MIDI notes 0-127; multi-voice chord; ignored by DrumTrack
+    velocity: int = 100                  # 0-127; used by both drums and synths
+    gate: float = 0.5                    # fraction of step duration held; ignored by DrumTrack
+    aftertouch: float = 0.0             # channel pressure at time of recording [0,1]; playback-ignored
+    probability: int = 100              # 1-100; steps below 100 fire stochastically
+    lock_cutoff: Optional[float] = None # overrides SynthTrack.filter_cutoff for this step only
 
     @classmethod
     def off(cls) -> "StepNote":
@@ -37,9 +39,19 @@ class NoteEvent:
 
 
 class InstrumentSubmode(Enum):
-    STEPS = auto()     # default step-grid editing
-    PADS = auto()      # live pad recording into a loop slot
-    DRUM_FREE = auto() # free multi-track drum recording (pads 0-15 = tracks 0-15)
+    STEPS = auto()        # default step-grid editing
+    PADS = auto()         # live pad recording into a loop slot
+    DRUM_FREE = auto()    # free multi-track drum recording (pads 0-15 = tracks 0-15)
+    SAMPLE_CHOPS = auto() # chop-to-step assignment grid
+    SAMPLE_RECORD = auto() # input → trim → chop-detect (scaffold for now)
+
+
+@dataclass(frozen=True)
+class ChopPoint:
+    """One slice of a sample, expressed as normalized offsets into the file."""
+    start_offset: float   # 0.0–1.0
+    end_offset: float     # 0.0–1.0
+    name: str = ""
 
 
 @dataclass(frozen=True)
@@ -121,13 +133,26 @@ class SynthTrack:
 
 @dataclass(frozen=True)
 class SampleTrack:
-    """M3 scaffold — reducers raise NotImplementedError."""
-
+    """Sample-based track with optional KO II-style chop sequencing."""
     name: str
-    loops: tuple[Loop, ...]
+    sample_key: str              # key into AudioMixer._samples (e.g. "kick_techno")
+    loops: tuple[Loop, ...]      # always 16 loops
+    chops: tuple[ChopPoint, ...] = ()   # empty = whole-sample (one-shot mode)
+    one_shot: bool = True        # False = loop until gate releases
+    volume: float = 1.0
+    keep_empty: bool = False
+    fx: FXChain = field(default_factory=FXChain)
 
 
 Track = Union[DrumTrack, SynthTrack, SampleTrack]
+
+
+@dataclass(frozen=True)
+class Scene:
+    """Snapshot of all 16 track slots for instant recall."""
+    tracks: tuple[Optional[Track], ...]  # length 16
+    tempo_bpm: float = 120.0
+    swing: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -208,6 +233,9 @@ class AppState:
     free_pending_ticks: tuple = ()
     # Current channel pressure [0,1]; captured into NoteEvents on release
     current_aftertouch: float = 0.0
+    # Scene management (M5)
+    scenes: tuple[Optional[Scene], ...] = field(default_factory=lambda: tuple([None] * 8))
+    active_scene: int = 0
 
 
 # ── Factory functions ─────────────────────────────────────────────────────────

@@ -13,7 +13,8 @@ from eden.scales import (
     note_in_scale, white_idx_to_midi, black_key_at,
 )
 from eden.state import (
-    AppState, Mode, InstrumentSubmode, Loop, DrumTrack, SynthTrack, SampleTrack, Track,
+    AppState, Mode, InstrumentSubmode, Loop, DrumTrack, SynthTrack, SampleTrack,
+    ChopPoint, Scene, Track,
 )
 from eden.fx import FX_LABELS, fmt_fx_val
 from eden.theme import (
@@ -236,6 +237,36 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
                                 pads[pad_idx] = _dim(ACCENT_GOLD)
                             else:
                                 pads[pad_idx] = _dim(PAD_INACTIVE)
+
+                elif isinstance(track, SampleTrack) and state.instrument_submode == InstrumentSubmode.SAMPLE_CHOPS:
+                    # ── SampleTrack SAMPLE_CHOPS mode ─────────────────────────
+                    loop = track.loops[state.selected_loop]
+                    selected_step = state.step_cursor % max(1, loop.step_count)
+                    n_chops = len(track.chops) if track.chops else 1
+                    # Bottom row: chop grid (each pad = one chop)
+                    for chop_idx in range(16):
+                        is_active_chop = (
+                            loop.step_count > 0
+                            and loop.steps[selected_step].on
+                            and loop.steps[selected_step].pitches
+                            and loop.steps[selected_step].pitches[0] == chop_idx
+                        )
+                        pads[chop_idx] = (PAD_ACTIVE if is_active_chop
+                                          else (PAD_SAMPLE if chop_idx < n_chops else PAD_INACTIVE))
+                    # Top row: step grid
+                    for step_i in range(16):
+                        pad_idx = step_i + 16
+                        if step_i >= loop.step_count:
+                            pads[pad_idx] = PAD_INACTIVE
+                            continue
+                        step = loop.steps[step_i]
+                        is_sel = step_i == selected_step
+                        if is_sel:
+                            pads[pad_idx] = PAD_PINK
+                        elif step.on:
+                            pads[pad_idx] = PAD_ACTIVE
+                        else:
+                            pads[pad_idx] = PAD_INACTIVE
 
                 else:
                     # ── DrumTrack / drum-style step grid ─────────────────────
@@ -464,15 +495,24 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
         else:
             _set(OLED_MAIN_LINE2, f"LOOP {loop_count_str}")
 
-        # SK1: MUTE — bar lit coral when track is muted
+        # SK1: MUTE / scene save (when shift held and no armed tracks)
         is_muted = state.selected_track in state.muted_tracks
-        _set(OLED_BTN1_TITLE, "UNMUTE" if is_muted else "MUTE",
-             _OLED_MUTED if is_muted else _OLED_DIM)
+        if state.shift_held and not state.armed_tracks:
+            sc_color = _OLED_ACTIVE if state.scenes[state.active_scene] is not None else _OLED_DIM
+            _set(OLED_BTN1_TITLE, "SAV SCN", sc_color)
+            _set(OLED_BTN1_VALUE, f"S{state.active_scene + 1}")
+        else:
+            _set(OLED_BTN1_TITLE, "UNMUTE" if is_muted else "MUTE",
+                 _OLED_MUTED if is_muted else _OLED_DIM)
 
-        # SK2: SOLO — bar lit amber when track is soloed
+        # SK2: SOLO / scene load (when shift held and no armed tracks)
         is_soloed = state.selected_track in state.soloed_tracks
-        _set(OLED_BTN2_TITLE, "UNSOLO" if is_soloed else "SOLO",
-             _OLED_SOLOED if is_soloed else _OLED_DIM)
+        if state.shift_held and not state.armed_tracks:
+            has_next = any(state.scenes[(state.active_scene + i) % 8] is not None for i in range(1, 9))
+            _set(OLED_BTN2_TITLE, "LD SCN", _OLED_ACTIVE if has_next else _OLED_DIM)
+        else:
+            _set(OLED_BTN2_TITLE, "UNSOLO" if is_soloed else "SOLO",
+                 _OLED_SOLOED if is_soloed else _OLED_DIM)
 
         # SK3: VOL (normal) | LOOPxN (shift)
         if state.shift_held:
@@ -607,6 +647,56 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
 
         # SK controls depend on primary armed track type
         first_track = state.tracks[armed[0]] if armed else None
+
+        # ── SampleTrack OLED ──────────────────────────────────────────────────
+        if isinstance(first_track, SampleTrack):
+            page = state.instrument_oled_page
+            loop = first_track.loops[state.selected_loop]
+            sel_step = state.step_cursor % max(1, loop.step_count)
+            n_chops = len(first_track.chops)
+            if page == 0:
+                # Main: chop info + step info
+                chop_idx = (loop.steps[sel_step].pitches[0]
+                            if loop.step_count > 0 and loop.steps[sel_step].on and loop.steps[sel_step].pitches
+                            else 0)
+                chop_label = ((first_track.chops[chop_idx].name or f"C{chop_idx+1}")
+                              if n_chops > 0 else "FULL")
+                _set(OLED_MAIN_LINE1, f"{first_track.name}  {n_chops} chops")
+                _set(OLED_MAIN_LINE2, f"STP{sel_step+1:02d} -> {chop_label}")
+                sub_str = "CHOPS" if state.instrument_submode == InstrumentSubmode.SAMPLE_CHOPS else "STEPS"
+                _set(OLED_BTN1_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN2_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN3_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN4_TITLE, "< BACK", _OLED_DIM)
+                _set(OLED_BTN5_TITLE, sub_str, _OLED_DIM)
+            elif page == 1:
+                # Settings: one_shot, bars
+                bars_color = _OLED_ACTIVE if ctrl == "BARS" else _OLED_DIM
+                os_color = _OLED_ACTIVE if first_track.one_shot else _OLED_DIM
+                _set(OLED_MAIN_LINE1, f"{first_track.name}")
+                _set(OLED_MAIN_LINE2, f"key: {first_track.sample_key[:8]}")
+                _set(OLED_BTN1_TITLE, "1-SHOT", os_color)
+                _set(OLED_BTN1_VALUE, "YES" if first_track.one_shot else "NO")
+                _set(OLED_BTN2_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN3_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN4_TITLE, "BARS", bars_color)
+                loop_bars = first_track.loops[state.selected_loop].bars
+                _set(OLED_BTN4_VALUE, str(loop_bars))
+                _set(OLED_BTN5_TITLE, "", _OLED_DIM)
+            elif page == 2:
+                # Track management
+                keep = first_track.keep_empty
+                keep_color = _OLED_ACTIVE if keep else _OLED_DIM
+                _set(OLED_MAIN_LINE1, f"{first_track.name}")
+                _set(OLED_MAIN_LINE2, "Track management")
+                _set(OLED_BTN1_TITLE, "KEEP", keep_color)
+                _set(OLED_BTN1_VALUE, "YES" if keep else "NO")
+                _set(OLED_BTN2_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN3_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN4_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN5_TITLE, "DELETE", _OLED_DISABLED)
+            return out
+
         if isinstance(first_track, SynthTrack):
             shift = state.shift_held
             scale_short = SCALE_SHORT.get(first_track.scale, first_track.scale[:5].upper())

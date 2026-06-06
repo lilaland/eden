@@ -7,7 +7,8 @@ import os
 from typing import Optional
 
 from eden.state import (
-    AppState, DrumTrack, SynthTrack, Loop, StepNote, NoteEvent, Mode, InstrumentSubmode,
+    AppState, DrumTrack, SynthTrack, SampleTrack, ChopPoint, Scene, Loop, StepNote,
+    NoteEvent, Mode, InstrumentSubmode,
     FXChain, default_loop, default_track_loops,
 )
 
@@ -43,6 +44,8 @@ def _str_to_steps(
     pitches: list | None = None,
     velocities: list | None = None,
     gates: list | None = None,
+    probabilities: list | None = None,
+    lock_cutoffs: list | None = None,
 ) -> tuple[StepNote, ...]:
     result = []
     for i, c in enumerate(s):
@@ -50,11 +53,19 @@ def _str_to_steps(
             step_pitches = _parse_pitches_entry(pitches[i])
         else:
             step_pitches = (60,)
+        probability = 100
+        if probabilities and i < len(probabilities) and probabilities[i] is not None:
+            probability = int(probabilities[i])
+        lock_cutoff = None
+        if lock_cutoffs and i < len(lock_cutoffs) and lock_cutoffs[i] is not None:
+            lock_cutoff = float(lock_cutoffs[i])
         result.append(StepNote(
             on=c == "1",
             pitches=step_pitches,
             velocity=velocities[i] if velocities and i < len(velocities) else 100,
             gate=gates[i] if gates and i < len(gates) else 0.5,
+            probability=probability,
+            lock_cutoff=lock_cutoff,
         ))
     return tuple(result)
 
@@ -96,6 +107,14 @@ def _loop_to_dict(loop: Loop) -> Optional[dict]:
         d["velocities"] = velocities
     if any(g != 0.5 for g in gates):
         d["gates"] = gates
+    # Persist per-step probability if non-default
+    probs = [s.probability for s in loop.steps]
+    if any(p != 100 for p in probs):
+        d["probabilities"] = probs
+    # Persist per-step lock_cutoff if set
+    locks = [s.lock_cutoff for s in loop.steps]
+    if any(lk is not None for lk in locks):
+        d["lock_cutoffs"] = locks
     # Arp/chord — only emit when non-default
     if loop.arp_on:
         d["arp_on"] = loop.arp_on
@@ -124,6 +143,8 @@ def _dict_to_loop(d: Optional[dict], track_arp: Optional[dict] = None) -> Loop:
         pitches=d.get("pitches"),
         velocities=d.get("velocities"),
         gates=d.get("gates"),
+        probabilities=d.get("probabilities"),
+        lock_cutoffs=d.get("lock_cutoffs"),
     )
     # Migrate legacy track-level arp/chord to loop if this loop has no override
     arp_src = d if "arp_on" in d else (track_arp or {})
@@ -187,6 +208,21 @@ def _track_to_dict(track) -> Optional[dict]:
             "fx": _fxchain_to_dict(track.fx),
             "loops": [_loop_to_dict(lp) for lp in track.loops],
         }
+    if isinstance(track, SampleTrack):
+        return {
+            "type": "sample",
+            "name": track.name,
+            "sample_key": track.sample_key,
+            "one_shot": track.one_shot,
+            "volume": track.volume,
+            "keep_empty": track.keep_empty,
+            "fx": _fxchain_to_dict(track.fx),
+            "chops": [
+                {"start_offset": c.start_offset, "end_offset": c.end_offset, "name": c.name}
+                for c in track.chops
+            ],
+            "loops": [_loop_to_dict(lp) for lp in track.loops],
+        }
     return None
 
 
@@ -228,7 +264,52 @@ def _dict_to_track(d: Optional[dict]):
             aftertouch=d.get("aftertouch", True),
             fx=_dict_to_fxchain(d.get("fx")),
         )
+    if t == "sample":
+        raw_loops = d.get("loops", [])
+        loops = tuple(_dict_to_loop(l) for l in raw_loops)
+        while len(loops) < 16:
+            loops += (default_loop(),)
+        chops = tuple(
+            ChopPoint(
+                start_offset=c["start_offset"],
+                end_offset=c["end_offset"],
+                name=c.get("name", ""),
+            )
+            for c in d.get("chops", [])
+        )
+        return SampleTrack(
+            name=d["name"],
+            sample_key=d.get("sample_key", ""),
+            loops=loops[:16],
+            chops=chops,
+            one_shot=d.get("one_shot", True),
+            volume=d.get("volume", 1.0),
+            keep_empty=d.get("keep_empty", False),
+            fx=_dict_to_fxchain(d.get("fx")),
+        )
     return None
+
+
+# ── Scene ─────────────────────────────────────────────────────────────────────
+
+def _load_scenes(raw: list) -> tuple:
+    scenes = []
+    for s in raw:
+        if s is None:
+            scenes.append(None)
+        else:
+            raw_tracks = s.get("tracks", [])
+            tracks = tuple(_dict_to_track(t) for t in raw_tracks)
+            while len(tracks) < 16:
+                tracks += (None,)
+            scenes.append(Scene(
+                tracks=tracks[:16],
+                tempo_bpm=float(s.get("tempo_bpm", 120.0)),
+                swing=float(s.get("swing", 0.0)),
+            ))
+    while len(scenes) < 8:
+        scenes.append(None)
+    return tuple(scenes[:8])
 
 
 # ── Session ───────────────────────────────────────────────────────────────────
@@ -245,6 +326,16 @@ def state_to_session(state: AppState, name: str) -> dict:
         "muted_tracks": sorted(state.muted_tracks),
         "soloed_tracks": sorted(state.soloed_tracks),
         "global_fx": _fxchain_to_dict(state.global_fx),
+        "scenes": [
+            {
+                "tracks": [_track_to_dict(t) for t in sc.tracks],
+                "tempo_bpm": sc.tempo_bpm,
+                "swing": sc.swing,
+            }
+            if sc is not None else None
+            for sc in state.scenes
+        ],
+        "active_scene": state.active_scene,
     }
 
 
@@ -282,6 +373,8 @@ def session_to_state_patch(data: dict, slot: int) -> dict:
         "saved_armed_tracks": None,
         "is_playing": True,
         "global_fx": _dict_to_fxchain(data.get("global_fx")),
+        "scenes": _load_scenes(data.get("scenes", [])),
+        "active_scene": int(data.get("active_scene", 0)),
     }
 
 

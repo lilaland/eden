@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-# ── Type list ─────────────────────────────────────────────────────────────────
+# ── Type list (M1: DRUMS only; M3: KEYS; M5: SAMPLER) ─────────────────────────
 
-INSTRUMENT_TYPES: tuple[str, ...] = ("DRUMS", "KEYS")
+INSTRUMENT_TYPES: tuple[str, ...] = ("DRUMS", "KEYS", "SAMPLE")
 
 # ── Drum catalog ───────────────────────────────────────────────────────────────
 
@@ -134,6 +134,32 @@ _KEYS_PRESETS: dict[str, tuple] = {
 
 KEYS_FOLDERS: tuple[str, ...] = tuple(_KEYS_PRESETS.keys())
 
+# ── Sample catalog ─────────────────────────────────────────────────────────────
+
+SAMPLE_CATEGORIES: tuple[str, ...] = ("Breaks", "Hits", "FX", "Loops")
+
+# (display_name, track_name, sample_key)
+_SAMPLE_CATALOG: dict[str, tuple] = {
+    "Breaks": (
+        ("Amen",    "AMEN",  "amen_break"),
+        ("Think",   "THINK", "think_break"),
+        ("Apache",  "APACH", "apache_break"),
+    ),
+    "Hits": (
+        ("808 Kick",  "808K",  "kick_808"),
+        ("Clap",      "CLAP",  "clap_hit"),
+        ("Hi-Hat",    "HHAT",  "hihat_open"),
+    ),
+    "FX": (
+        ("Riser",   "RISR",  "riser_fx"),
+        ("Impact",  "IMPCT", "impact_fx"),
+    ),
+    "Loops": (
+        ("Beat 1",  "BEAT1", "beat_loop_1"),
+        ("Beat 2",  "BEAT2", "beat_loop_2"),
+    ),
+}
+
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
@@ -144,6 +170,8 @@ def get_categories(type_idx: int) -> tuple[str, ...]:
         return DRUM_CATEGORIES
     if type_idx == 1:  # KEYS — folders
         return KEYS_FOLDERS
+    if type_idx == 2:  # SAMPLE
+        return SAMPLE_CATEGORIES
     return ()
 
 
@@ -154,6 +182,9 @@ def get_variations(type_idx: int, cat_idx: int) -> tuple[str, ...]:
     if type_idx == 1:  # KEYS — presets within selected folder
         folder = KEYS_FOLDERS[cat_idx % len(KEYS_FOLDERS)]
         return tuple(p[0] for p in _KEYS_PRESETS[folder])
+    if type_idx == 2:  # SAMPLE
+        cat = SAMPLE_CATEGORIES[cat_idx % len(SAMPLE_CATEGORIES)]
+        return tuple(p[0] for p in _SAMPLE_CATALOG.get(cat, ()))
     return ()
 
 
@@ -162,6 +193,7 @@ def get_track_params(type_idx: int, cat_idx: int, var_idx: int) -> tuple[str, st
 
     For DRUMS: type_param is the sample file stem, e.g. ``kick_techno``.
     For KEYS:  type_param is the osc_type engine key, e.g. ``saw``.
+    For SAMPLE: type_param is the sample_key, e.g. ``amen_break``.
     """
     if type_idx == 0:  # DRUMS
         cats = DRUM_CATEGORIES
@@ -176,6 +208,13 @@ def get_track_params(type_idx: int, cat_idx: int, var_idx: int) -> tuple[str, st
         presets = _KEYS_PRESETS[folder]
         _, track_name, osc_type, _ = presets[var_idx % len(presets)]
         return track_name, osc_type
+    if type_idx == 2:  # SAMPLE
+        cat = SAMPLE_CATEGORIES[cat_idx % len(SAMPLE_CATEGORIES)]
+        presets = _SAMPLE_CATALOG.get(cat, ())
+        if not presets:
+            return "SMPL", ""
+        _, track_name, sample_key = presets[var_idx % len(presets)]
+        return track_name, sample_key
     return "EMPTY", ""
 
 
