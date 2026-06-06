@@ -455,9 +455,9 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
             types = catalog.INSTRUMENT_TYPES
             type_name = types[state.new_slot_type_idx] if state.new_slot_type_idx < len(types) else "?"
             cats = catalog.get_categories(state.new_slot_type_idx)
-            cat_name = cats[state.new_slot_cat_idx] if cats else "-"
+            cat_name = cats[state.new_slot_cat_idx] if cats and state.new_slot_cat_idx < len(cats) else "-"
             vars_ = catalog.get_variations(state.new_slot_type_idx, state.new_slot_cat_idx)
-            var_name = vars_[state.new_slot_var_idx] if vars_ else "-"
+            var_name = vars_[state.new_slot_var_idx] if vars_ and state.new_slot_var_idx < len(vars_) else "-"
             trk_name, _ = catalog.get_track_params(
                 state.new_slot_type_idx, state.new_slot_cat_idx, state.new_slot_var_idx
             )

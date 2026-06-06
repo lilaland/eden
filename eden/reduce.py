@@ -539,6 +539,7 @@ def _new_slot_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
         if cats:
             new_idx = (state.new_slot_cat_idx + 1) % len(cats)
             return dataclasses.replace(state, new_slot_cat_idx=new_idx,
+                                       new_slot_var_idx=0,
                                        new_slot_active_ctrl="CAT")
     if event.key == 2:  # SK3: cycle VAR + activate
         vars_ = catalog.get_variations(state.new_slot_type_idx, state.new_slot_cat_idx)
@@ -709,7 +710,7 @@ def _new_slot_encoder(state: AppState, event: EncoderTurned) -> AppState:
         cats = catalog.get_categories(state.new_slot_type_idx)
         if cats:
             new_idx = (state.new_slot_cat_idx + delta) % len(cats)
-            return dataclasses.replace(state, new_slot_cat_idx=new_idx)
+            return dataclasses.replace(state, new_slot_cat_idx=new_idx, new_slot_var_idx=0)
     if ctrl == "VAR":
         vars_ = catalog.get_variations(state.new_slot_type_idx, state.new_slot_cat_idx)
         if vars_:
