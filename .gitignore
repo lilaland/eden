@@ -31,3 +31,8 @@ samples/
 
 # References / vendor source (not part of Eden codebase)
 references/
+
+# Claude Code worktrees and scratch files
+.claude/
+full.json
+*.HEIC
