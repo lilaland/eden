@@ -34,6 +34,7 @@ _SLOT_LETTERS = "ABCDEFGH"
 
 def _to_json(state, sessions_dir: str = "") -> str:
     from eden.state import DrumTrack, SynthTrack, SampleTrack, Mode
+    from eden.fx import FX_LABELS, fmt_fx_val
 
     pads = render_pads(state)
     oled = render_oled(state)
@@ -108,6 +109,37 @@ def _to_json(state, sessions_dir: str = "") -> str:
             path = os.path.join(sessions_dir, f"session_{letter.lower()}.json")
             disk_slots[i] = os.path.isfile(path)
 
+    # FX knob labels + values for selected track (page 0 = enc1-8)
+    fx_knobs = []
+    sel_track_obj = state.tracks[state.selected_track] if state.selected_track < len(state.tracks) else None
+    _fx_chain = getattr(sel_track_obj, "fx", state.global_fx) if sel_track_obj is not None else state.global_fx
+    _fx_page = state.fx_edit_page if state.edit_mode else 0
+    _fx_vals = _fx_chain.page1 if _fx_page == 0 else _fx_chain.page2
+    _fx_labels_page = FX_LABELS[_fx_page]
+    fx_knobs_raw = list(_fx_vals[:8])
+    for _i in range(8):
+        _lbl = _fx_labels_page[_i]
+        _abbr = _lbl.split()[0][:4]  # "LOW EQ" → "LOW", "CHORUS" → "CHOR", etc.
+        fx_knobs.append({"label": _abbr, "value": fmt_fx_val(_fx_page, _i, _fx_vals[_i])})
+
+    # Step data for selected track + loop (for timeline view)
+    step_data = None
+    if sel_track_obj is not None and not isinstance(sel_track_obj, SampleTrack):
+        sel_loop = sel_track_obj.loops[state.selected_loop] if state.selected_loop < len(sel_track_obj.loops) else None
+        if sel_loop is not None:
+            steps_out = []
+            for st in sel_loop.steps:
+                steps_out.append({
+                    "on": st.on,
+                    "pitches": list(st.pitches),
+                    "velocity": st.velocity,
+                })
+            step_data = {
+                "steps": steps_out,
+                "bars": sel_loop.bars,
+                "step_count": sel_loop.step_count,
+            }
+
     return json.dumps({
         "pads":           pad_data,
         "oled":           oled_data,
@@ -142,6 +174,11 @@ def _to_json(state, sessions_dir: str = "") -> str:
         "disk_slots":          disk_slots,
         "selected_track":      state.selected_track,
         "selected_loop":       state.selected_loop,
+        "fx_knobs":            fx_knobs,
+        "fx_knobs_raw":        fx_knobs_raw,
+        "step_data":           step_data,
+        "fx_edit_page":        state.fx_edit_page,
+        "edit_mode":           state.edit_mode,
     })
 
 
@@ -577,6 +614,54 @@ h1{font-size:10px;color:#5a3878;letter-spacing:3px;text-transform:uppercase}
   font-size:7px;color:#00e5ff;text-shadow:0 0 4px rgba(0,229,255,.8);
 }
 
+/* ── Instrument timeline ────────────────────────────────────────────── */
+#inst-timeline{
+  width:1110px;
+  background:linear-gradient(160deg,#100620 0%,#080312 100%);
+  border-radius:10px;
+  box-shadow:0 0 0 1px rgba(0,229,255,.1),0 8px 32px rgba(0,0,0,.8);
+  overflow:hidden;
+  padding:10px 12px 12px;
+}
+#inst-timeline.hidden{display:none}
+#tl-header{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+#tl-title{font-size:9px;color:#4090b0;letter-spacing:2px;text-transform:uppercase;flex:1}
+#tl-info{font-size:9px;color:#306080;letter-spacing:.5px}
+#tl-canvas-wrap{position:relative;height:60px;background:#060112;border-radius:4px;overflow:hidden}
+#tl-canvas{display:block;width:100%;height:60px}
+/* FX meters strip */
+#fx-strip{
+  display:flex;gap:6px;margin-top:8px;
+  padding-top:8px;border-top:1px solid rgba(0,229,255,.1);
+}
+.fx-meter{
+  flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;
+}
+.fx-meter-label{font-size:7px;color:#4090a0;text-transform:uppercase;letter-spacing:.4px}
+.fx-meter-bar-wrap{
+  width:100%;height:40px;background:#060112;border-radius:3px;
+  border:1px solid rgba(0,229,255,.12);position:relative;overflow:hidden;
+}
+.fx-meter-bar{
+  position:absolute;bottom:0;left:0;right:0;
+  background:linear-gradient(0deg,#ff3ea0,#00e5ff);
+  transition:height .1s;
+}
+.fx-meter-val{font-size:7px;color:#80c0d0;letter-spacing:.3px}
+
+/* Light mode */
+body.light #inst-timeline{
+  background:#fff;
+  box-shadow:0 0 0 1px rgba(0,160,200,.15),0 4px 20px rgba(0,100,160,.1);
+}
+body.light #tl-title{color:#0070a0}
+body.light #tl-info{color:#0060a0}
+body.light #tl-canvas-wrap{background:#f0f8ff}
+body.light #fx-strip{border-top-color:rgba(0,160,200,.15)}
+body.light .fx-meter-label{color:#0070a0}
+body.light .fx-meter-bar-wrap{background:#e8f4ff;border-color:rgba(0,160,200,.2)}
+body.light .fx-meter-val{color:#006090}
+
 /* ── Controller chassis ─────────────────────────────────────────────── */
 #ctrl{
   background:linear-gradient(175deg,#1e0a35 0%,#160828 60%,#0f0520 100%);
@@ -601,13 +686,15 @@ h1{font-size:10px;color:#5a3878;letter-spacing:3px;text-transform:uppercase}
 .enc-row{display:flex;gap:14px;align-items:center}
 .enc-spacer{width:63px;flex-shrink:0}
 .enc{
-  width:40px;height:40px;border-radius:50%;
+  width:44px;height:44px;border-radius:50%;
   background:radial-gradient(circle at 38% 32%,#2a1045,#0e0520);
   border:1px solid #3a1860;
-  display:flex;align-items:center;justify-content:center;
-  font-size:8px;color:#6040a0;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:1px;
   box-shadow:0 3px 7px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,62,160,.08);
 }
+.enc-label{font-size:6px;color:#6040a0;text-transform:uppercase;letter-spacing:.3px;line-height:1.1}
+.enc-val{font-size:7px;color:#a070d0;font-weight:bold;line-height:1.1}
 .pm-pair{display:flex;gap:3px;flex-shrink:0}
 .pm-btn{
   width:30px;height:28px;border-radius:3px;
@@ -664,7 +751,8 @@ h1{font-size:10px;color:#5a3878;letter-spacing:3px;text-transform:uppercase}
   background:#180830;border:1px solid #2e1050;
   color:#6040a0;font-size:10px;text-align:center;line-height:22px;cursor:default;
 }
-.slots{display:flex;gap:3px;margin-bottom:3px}
+#mid-left{display:flex;flex-direction:column;gap:0}
+.slots{display:flex;gap:3px;margin-bottom:3px;flex-wrap:wrap}
 .slot-btn{
   width:32px;height:28px;border-radius:3px;
   background:#180830;border:1px solid #2e1050;
@@ -932,9 +1020,11 @@ body.light #pads{background:#f0e8ff;box-shadow:inset 0 0 12px rgba(180,140,240,.
 body.light #logo{color:#7050a0}
 body.light .enc{
   background:radial-gradient(circle at 38% 32%,#e4d4f8,#c8b4e8);
-  border-color:#b090d8;color:#7050a0;
+  border-color:#b090d8;
   box-shadow:0 2px 5px rgba(100,60,180,.25),inset 0 1px 0 rgba(255,255,255,.5);
 }
+body.light .enc-label{color:#7050a0}
+body.light .enc-val{color:#4030a0}
 body.light .pm-btn{background:#ece4ff;border-color:#c0a8e0;color:#7050a0}
 body.light .mode-btn{background:#e8e0f8;border-color:#c0a8e0;color:#6040a0}
 body.light .sk-btn{background:#f4f0fc;border-color:#d0c0ec;border-top-color:#d0c0ec}
@@ -1016,6 +1106,23 @@ body.light #status{color:#8060b0}
   </div>
 </div>
 
+<!-- ── Instrument timeline ──────────────────────────────────────────────── -->
+<div id="inst-timeline" class="hidden">
+  <div id="tl-header">
+    <div id="tl-title">Timeline</div>
+    <div id="tl-info"></div>
+  </div>
+  <div id="tl-canvas-wrap">
+    <canvas id="tl-canvas"></canvas>
+  </div>
+  <div id="fx-strip">
+    <div class="fx-meter" id="fxm0"><div class="fx-meter-label" id="fxm0l">—</div><div class="fx-meter-bar-wrap"><div class="fx-meter-bar" id="fxm0b" style="height:0%"></div></div><div class="fx-meter-val" id="fxm0v">—</div></div>
+    <div class="fx-meter" id="fxm1"><div class="fx-meter-label" id="fxm1l">—</div><div class="fx-meter-bar-wrap"><div class="fx-meter-bar" id="fxm1b" style="height:0%"></div></div><div class="fx-meter-val" id="fxm1v">—</div></div>
+    <div class="fx-meter" id="fxm2"><div class="fx-meter-label" id="fxm2l">—</div><div class="fx-meter-bar-wrap"><div class="fx-meter-bar" id="fxm2b" style="height:0%"></div></div><div class="fx-meter-val" id="fxm2v">—</div></div>
+    <div class="fx-meter" id="fxm3"><div class="fx-meter-label" id="fxm3l">—</div><div class="fx-meter-bar-wrap"><div class="fx-meter-bar" id="fxm3b" style="height:0%"></div></div><div class="fx-meter-val" id="fxm3v">—</div></div>
+  </div>
+</div>
+
 <!-- ── Sample library ───────────────────────────────────────────────────── -->
 <div id="sample-lib">
   <div id="sample-lib-top" onclick="toggleSampleLib()">
@@ -1040,16 +1147,20 @@ body.light #status{color:#8060b0}
     <div id="encs">
       <div class="enc-row">
         <div class="enc-spacer"></div>
-        <div class="enc">1</div><div class="enc">2</div>
-        <div class="enc">3</div><div class="enc">4</div>
+        <div class="enc" id="enc1"><span class="enc-label" id="enc1l">ENC</span><span class="enc-val" id="enc1v">1</span></div>
+        <div class="enc" id="enc2"><span class="enc-label" id="enc2l">ENC</span><span class="enc-val" id="enc2v">2</span></div>
+        <div class="enc" id="enc3"><span class="enc-label" id="enc3l">ENC</span><span class="enc-val" id="enc3v">3</span></div>
+        <div class="enc" id="enc4"><span class="enc-label" id="enc4l">ENC</span><span class="enc-val" id="enc4v">4</span></div>
       </div>
       <div class="enc-row">
         <div class="pm-pair">
           <div class="pm-btn">+</div>
           <div class="pm-btn">&#8722;</div>
         </div>
-        <div class="enc">5</div><div class="enc">6</div>
-        <div class="enc">7</div><div class="enc">8</div>
+        <div class="enc" id="enc5"><span class="enc-label" id="enc5l">ENC</span><span class="enc-val" id="enc5v">5</span></div>
+        <div class="enc" id="enc6"><span class="enc-label" id="enc6l">ENC</span><span class="enc-val" id="enc6v">6</span></div>
+        <div class="enc" id="enc7"><span class="enc-label" id="enc7l">ENC</span><span class="enc-val" id="enc7v">7</span></div>
+        <div class="enc" id="enc8"><span class="enc-label" id="enc8l">ENC</span><span class="enc-val" id="enc8v">8</span></div>
       </div>
     </div>
     <div id="rpanel">
@@ -1086,14 +1197,12 @@ body.light #status{color:#8060b0}
   </div>
 
   <div id="mid">
-    <div>
+    <div id="mid-left">
       <div class="slots">
         <div class="slot-btn" id="slot-0">A</div>
         <div class="slot-btn" id="slot-1">B</div>
         <div class="slot-btn" id="slot-2">C</div>
         <div class="slot-btn" id="slot-3">D</div>
-      </div>
-      <div class="slots">
         <div class="slot-btn" id="slot-4">E</div>
         <div class="slot-btn" id="slot-5">F</div>
         <div class="slot-btn" id="slot-6">G</div>
@@ -1578,6 +1687,104 @@ async function post(action){
   }catch(e){}
 }
 
+// ── Timeline canvas ──────────────────────────────────────────────────────────
+const tlCanvas=document.getElementById('tl-canvas');
+const tlWrap=document.getElementById('tl-canvas-wrap');
+
+function resizeTlCanvas(){
+  const w=tlWrap.getBoundingClientRect().width;
+  tlCanvas.width=Math.floor(w)||1086;
+  tlCanvas.height=60;
+}
+window.addEventListener('resize',resizeTlCanvas);
+resizeTlCanvas();
+
+function drawTimeline(stepData, trackType, playhead){
+  const W=tlCanvas.width, H=tlCanvas.height;
+  const ctx=tlCanvas.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+  if(!stepData||!stepData.steps||stepData.steps.length===0) return;
+
+  const steps=stepData.steps;
+  const n=steps.length;
+  const sw=W/n;
+
+  if(trackType==='drum'){
+    // Drum: colored tick marks per step
+    for(let i=0;i<n;i++){
+      const x=i*sw;
+      const st=steps[i];
+      // Beat grid
+      const beatInterval=Math.max(1,Math.round(n/(stepData.bars*4)));
+      if(i%beatInterval===0){
+        ctx.fillStyle='rgba(255,255,255,.04)';
+        ctx.fillRect(x,0,sw,H);
+      }
+      if(st.on){
+        const alpha=0.4+0.6*(st.velocity/127);
+        ctx.fillStyle=`rgba(255,62,160,${alpha})`;
+        ctx.fillRect(x+1,H*0.25,sw-2,H*0.5);
+        // Pink dot at top
+        ctx.beginPath();
+        ctx.arc(x+sw/2,H*0.2,Math.min(sw*0.35,5),0,Math.PI*2);
+        ctx.fillStyle=`rgba(255,120,200,${alpha})`;
+        ctx.fill();
+      }
+    }
+  } else {
+    // Synth: pitch-colored note blocks
+    // Find min/max pitch for color mapping
+    let minP=127,maxP=0;
+    for(const st of steps) if(st.on&&st.pitches&&st.pitches.length) {
+      for(const p of st.pitches){if(p<minP)minP=p;if(p>maxP)maxP=p;}
+    }
+    if(minP>=maxP){minP=Math.max(0,minP-12);maxP=Math.min(127,maxP+12);}
+    const pRange=maxP-minP||1;
+
+    for(let i=0;i<n;i++){
+      const x=i*sw;
+      const st=steps[i];
+      const beatInterval=Math.max(1,Math.round(n/(stepData.bars*4)));
+      if(i%beatInterval===0){
+        ctx.fillStyle='rgba(255,255,255,.04)';
+        ctx.fillRect(x,0,sw,H);
+      }
+      if(st.on&&st.pitches&&st.pitches.length){
+        const p=st.pitches[0];
+        const t=(p-minP)/pRange; // 0=low, 1=high
+        // Interpolate deep purple → cyan
+        const r=Math.round(80*(1-t));
+        const g=Math.round(100*t+20*(1-t));
+        const b=Math.round(255*t+80*(1-t));
+        const alpha=0.4+0.6*(st.velocity/127);
+        ctx.fillStyle=`rgba(${r},${g},${b},${alpha})`;
+        const noteH=Math.max(4,H*0.6);
+        const noteY=H*0.2+(1-t)*(H*0.5-noteH*0.5)-(noteH*0.5);
+        ctx.fillRect(x+1,Math.max(0,noteY),sw-2,noteH);
+      }
+    }
+  }
+
+  // Playhead cursor
+  if(playhead>=0&&playhead<n){
+    const px=playhead*sw+sw/2;
+    ctx.strokeStyle='rgba(255,255,100,.85)';
+    ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(px,0);ctx.lineTo(px,H);ctx.stroke();
+    // Arrowhead
+    ctx.fillStyle='rgba(255,255,100,.85)';
+    ctx.beginPath();ctx.moveTo(px-4,0);ctx.lineTo(px+4,0);ctx.lineTo(px,6);ctx.fill();
+  }
+
+  // Step grid lines (subtle)
+  ctx.strokeStyle='rgba(100,60,160,.3)';
+  ctx.lineWidth=1;
+  for(let i=1;i<n;i++){
+    const x=i*sw;
+    ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();
+  }
+}
+
 // ── Main update ─────────────────────────────────────────────────────────────
 let _firstUpdate=true;
 
@@ -1585,6 +1792,7 @@ function update(s){
   lastState=s;
   const isSession=s.mode==='SESSION';
   const isSampleInst=s.mode==='INSTRUMENT'&&s.sample_key!=null;
+  const isDrumSynthInst=s.mode==='INSTRUMENT'&&s.sample_key==null&&s.step_data!=null;
 
   // Track active sample key for library highlight
   if(s.sample_key&&s.sample_key!==slCurrentKey){
@@ -1595,6 +1803,7 @@ function update(s){
   // Panel visibility
   document.getElementById('session-panel').classList.toggle('hidden',!isSession);
   document.getElementById('waveform-panel').classList.toggle('hidden',!isSampleInst);
+  document.getElementById('inst-timeline').classList.toggle('hidden',!isDrumSynthInst);
 
   // Session view
   if(isSession){
@@ -1652,6 +1861,50 @@ function update(s){
   } else {
     _lastSampleKey=null;
     wfTrackIdx=-1;
+  }
+
+  // FX encoder knobs
+  if(s.fx_knobs){
+    for(let i=0;i<8;i++){
+      const knob=s.fx_knobs[i];
+      if(!knob) continue;
+      const lEl=document.getElementById('enc'+(i+1)+'l');
+      const vEl=document.getElementById('enc'+(i+1)+'v');
+      if(lEl) lEl.textContent=knob.label;
+      if(vEl) vEl.textContent=knob.value;
+    }
+  }
+
+  // Instrument timeline (drum/synth)
+  if(isDrumSynthInst&&s.step_data){
+    const td=s.track_data[s.selected_track];
+    const ttype=td?td.type:'drum';
+    document.getElementById('tl-info').textContent=
+      (td?td.name:'—')+' · L'+(s.selected_loop+1)+
+      ' · '+s.step_data.step_count+' steps / '+s.step_data.bars+' bar'+(s.step_data.bars!==1?'s':'');
+    drawTimeline(s.step_data, ttype, s.playhead);
+  }
+
+  // FX meters (first 4 knobs of page 0, always shown in inst-timeline)
+  if(isDrumSynthInst&&s.fx_knobs){
+    for(let i=0;i<4;i++){
+      const knob=s.fx_knobs[i];
+      if(!knob) continue;
+      const lEl=document.getElementById('fxm'+i+'l');
+      const bEl=document.getElementById('fxm'+i+'b');
+      const vEl=document.getElementById('fxm'+i+'v');
+      if(lEl) lEl.textContent=knob.label;
+      if(vEl) vEl.textContent=knob.value;
+      // Map value string back to a rough percentage for bar height
+      // We store normalized 0-1 in fx_knobs_raw if available, else estimate from display
+    }
+    // Use raw fx values for bar heights
+    if(s.fx_knobs_raw){
+      for(let i=0;i<4;i++){
+        const bEl=document.getElementById('fxm'+i+'b');
+        if(bEl) bEl.style.height=Math.round(s.fx_knobs_raw[i]*100)+'%';
+      }
+    }
   }
 
   // Pads
