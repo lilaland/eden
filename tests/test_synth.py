@@ -619,11 +619,14 @@ def test_synth_free_sk2_opens_root():
     assert s2.instrument_active_ctrl == "ROOT"
 
 
-def test_synth_free_sk3_opens_bars():
-    # SK3 normal = LEN (opens BARS ctrl)
+def test_synth_free_sk3_extends_loop():
+    # In FREE mode SK3 extends the loop by one bar instead of opening BARS encoder
     s = _free_synth_state()
+    track = s.tracks[s.armed_tracks[0]]
+    original_bars = track.loops[s.selected_loop].bars
     s2 = reduce(s, SoftkeyPressed(key=2))
-    assert s2.instrument_active_ctrl == "BARS"
+    new_track = s2.tracks[s2.armed_tracks[0]]
+    assert new_track.loops[s2.selected_loop].bars == original_bars + 1
 
 
 def test_synth_sk3_opens_bars():
@@ -642,35 +645,30 @@ def test_synth_free_sk5_opens_octave():
 def test_synth_free_pad_white_key_records_pitch():
     s = _free_synth_state()
     # offset=28: pad 7 = white_idx 35 = C4=60
+    # Press → note lands in free_pending_ticks (committed to free_events on release)
     s2 = reduce(s, PadPressed(pad_index=7, velocity=100))
-    loop = s2.tracks[0].loops[0]
-    assert loop.steps[0].on
-    assert loop.steps[0].pitches == (60,)  # C4
+    assert any(p[2] == 60 for p in s2.free_pending_ticks)  # C4 in pending
 
 
 def test_synth_free_pad_black_key_records_pitch():
     s = _free_synth_state()
     # offset=28: top-row pad 23 (16+7) = black_key_at(35) = C#4=61
     s2 = reduce(s, PadPressed(pad_index=23, velocity=100))
-    loop = s2.tracks[0].loops[0]
-    assert loop.steps[0].on
-    assert loop.steps[0].pitches == (61,)  # C#4
+    assert any(p[2] == 61 for p in s2.free_pending_ticks)  # C#4 in pending
 
 
 def test_synth_free_dead_key_no_note():
     s = _free_synth_state()
-    # offset=28: top-row pad 23+2=25 would be E# dead; pad 16+9=25 → black_key_at(37)=None
+    # offset=28: top-row pad 16+9=25 → black_key_at(37)=None (dead key)
     s2 = reduce(s, PadPressed(pad_index=25, velocity=100))
-    loop = s2.tracks[0].loops[0]
-    assert not loop.steps[0].on  # dead key, unchanged
+    assert s2.free_pending_ticks == s.free_pending_ticks  # nothing added
 
 
 def test_synth_free_octave_offset_shifts_pitch():
     # offset=28: pad 7 = white_idx 35 = C4; octave_offset=1 → C5=72
     s = dataclasses.replace(_free_synth_state(), octave_offset=1)
     s2 = reduce(s, PadPressed(pad_index=7, velocity=100))
-    loop = s2.tracks[0].loops[0]
-    assert loop.steps[0].pitches == (72,)  # C5 (one octave up from C4)
+    assert any(p[2] == 72 for p in s2.free_pending_ticks)  # C5 in pending
 
 
 def test_synth_quantized_field_persisted():
@@ -759,10 +757,10 @@ def test_synth_sk3_bars_encoder_contracts_loop():
 
 
 def test_free_pad_press_writes_note_no_cursor_advance():
-    """PadPressed in FREE mode writes note but does NOT advance cursor yet."""
+    """PadPressed in FREE mode adds to pending ticks but does NOT advance cursor yet."""
     s = dataclasses.replace(_free_synth_state(), step_cursor=0)
     s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
-    assert s2.tracks[0].loops[0].steps[0].on
+    assert len(s2.free_pending_ticks) == 1  # note pending, not yet committed
     assert s2.step_cursor == 0  # cursor stays until release
 
 
@@ -786,21 +784,25 @@ def test_free_clock_wrap_starts_loop_and_recording():
 
 
 def test_free_pad_press_placeholder_gate():
-    """PadPressed writes a placeholder gate of 1.0 before release."""
+    """PadPressed adds note to pending ticks with placeholder velocity."""
     s = _free_synth_state()
     s2 = reduce(s, PadPressed(pad_index=0, velocity=100))
-    assert s2.tracks[0].loops[0].steps[0].gate == 1.0
+    # Note is pending (not yet committed to free_events until release)
+    assert len(s2.free_pending_ticks) == 1
+    assert s2.free_pending_ticks[0][3] == 100  # velocity preserved
 
 
 def test_free_pad_release_commits_gate():
-    """PadReleased updates gate from hold_seconds and tempo."""
+    """PadReleased commits NoteEvent with gate computed from hold_seconds and tempo."""
     from eden.events import PadReleased
     # At 120 BPM, step_size=16: step_dur = 60/120 / (16/4) = 0.125s
     # hold 0.5s → gate = 0.5/0.125 = 4.0 → quarter note
     s = dataclasses.replace(_free_synth_state(), step_cursor=0)
     s = reduce(s, PadPressed(pad_index=0, velocity=100))
     s2 = reduce(s, PadReleased(pad_index=0, hold_seconds=0.5))
-    assert abs(s2.tracks[0].loops[0].steps[0].gate - 4.0) < 0.01
+    free_events = s2.tracks[0].loops[0].free_events
+    assert len(free_events) == 1
+    assert abs(free_events[0].gate - 4.0) < 0.01
 
 
 def test_free_pad_release_does_not_advance_cursor():
@@ -813,38 +815,31 @@ def test_free_pad_release_does_not_advance_cursor():
 
 
 def test_free_pad_press_writes_at_playhead_position():
-    """With playhead at step 16, note lands at step 8 not step 0."""
-    s = dataclasses.replace(_free_synth_state(), playhead=16)  # playhead=16 → step_in_bar=8 (spb=16, 16*16//32=8)
-    # Pre-allocate the loop (simulating _start_free_recording having run)
-    from eden.state import StepNote
-    loop = s.tracks[0].loops[0]
-    alloc_steps = tuple(StepNote.off() for _ in range(16))
-    new_loop = dataclasses.replace(loop, steps=alloc_steps)
-    new_loops = s.tracks[0].loops[:0] + (new_loop,) + s.tracks[0].loops[1:]
-    new_track = dataclasses.replace(s.tracks[0], loops=new_loops)
-    s = dataclasses.replace(s, tracks=s.tracks[:0] + (new_track,) + s.tracks[1:])
+    """With playhead=16, raw_tick=16; note is in pending at tick 16."""
+    s = dataclasses.replace(_free_synth_state(), playhead=16)
     s2 = reduce(s, PadPressed(pad_index=7, velocity=100))  # C4
-    loop2 = s2.tracks[0].loops[0]
-    assert loop2.steps[8].on
-    assert not loop2.steps[0].on
+    # raw_tick = bar_offset(0) * 32 + playhead(16) = 16
+    assert any(p[1] == 16 for p in s2.free_pending_ticks)
 
 
 def test_free_pad_release_short_tap_minimum_gate():
-    """Very short tap gets minimum gate of 0.1."""
+    """Very short tap gets minimum gate of 0.1 in committed NoteEvent."""
     from eden.events import PadReleased
     s = dataclasses.replace(_free_synth_state(), step_cursor=0)
     s = reduce(s, PadPressed(pad_index=0, velocity=100))
     s2 = reduce(s, PadReleased(pad_index=0, hold_seconds=0.001))
-    assert s2.tracks[0].loops[0].steps[0].gate == pytest.approx(0.1)
+    free_events = s2.tracks[0].loops[0].free_events
+    assert len(free_events) == 1
+    assert free_events[0].gate == pytest.approx(0.1)
     assert s2.step_cursor == 0  # cursor does NOT advance
 
 
-def test_oled_free_sk3_shows_len():
-    """FREE mode SK3 shows LEN (loop bars control)."""
+def test_oled_free_sk3_shows_len_extend():
+    """FREE mode SK3 shows LEN+ (extend loop) instead of LEN encoder."""
     s = _free_synth_state()
     out = render_oled(s)
     from controller_map import OLED_BTN3_TITLE
-    assert out[OLED_BTN3_TITLE][0] == "LEN"
+    assert out[OLED_BTN3_TITLE][0] == "LEN+"
 
 
 # ── RANGE encoder (granular ±1) ───────────────────────────────────────────────

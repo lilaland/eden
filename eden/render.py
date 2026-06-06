@@ -785,7 +785,8 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
                     _set(OLED_BTN1_VALUE, scale_short)
                     _set(OLED_BTN2_TITLE, "ROOT", root_color)
                     _set(OLED_BTN2_VALUE, pitch_name(first_track.root_note))
-                    _set(OLED_BTN3_TITLE, "LEN", len_color)
+                    _len_label = "LEN+" if not first_track.quantized else "LEN"
+                    _set(OLED_BTN3_TITLE, _len_label, len_color)
                     _set(OLED_BTN3_VALUE, f"{first_bars}bar" + ("s" if first_bars != 1 else ""))
                     aftrch_color = _OLED_ACTIVE if first_track.aftertouch else _OLED_DIM
                     if shift:
@@ -854,8 +855,8 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
             _set(OLED_BTN1_TITLE, "QUANT", _OLED_DIM)
             _set(OLED_BTN2_TITLE, "Q.GRID", grid_color)
             _set(OLED_BTN2_VALUE, f"1/{state.quantize_grid}")
-            _set(OLED_BTN3_TITLE, "Q.AMT", str_color)
-            _set(OLED_BTN3_VALUE, f"{int(state.quantize_strength * 100)}%")
+            _set(OLED_BTN3_TITLE, "EXTEND", _OLED_DIM)
+            _set(OLED_BTN3_VALUE, f"{first_bars}bar" + ("s" if first_bars != 1 else ""))
             _set(OLED_BTN4_TITLE, "< BACK", _OLED_DIM)
             _set(OLED_BTN5_TITLE, "VEL" if state.vel_sensitive else "MONO", vel_color)
         else:

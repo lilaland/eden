@@ -406,9 +406,7 @@ class EdenApp:
 
         loop_offsets = dict(state.loop_measure_offsets)
         bar_offset = loop_offsets.get((track_idx, loop_idx), 0)
-        spb = loop.steps_per_bar
-        step_in_bar = state.playhead * spb // 32
-        tick = (bar_offset * spb + step_in_bar) % max(1, loop.step_count)
+        tick = bar_offset * 32 + state.playhead
 
         note_event = NoteEvent(tick=tick, pitch=pitch, velocity=velocity, gate=gate, aftertouch=0.0)
         new_free = loop.free_events + (note_event,)

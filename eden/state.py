@@ -31,7 +31,7 @@ class StepNote:
 @dataclass(frozen=True)
 class NoteEvent:
     """A single note event captured during free recording, before quantize."""
-    tick: int           # step-cursor position at press time
+    tick: int           # absolute playhead tick within loop (bar * 32 + playhead, 0-based)
     pitch: int          # MIDI note 0-127
     velocity: int       # 0-127
     gate: float         # duration as fraction of one step (same units as StepNote.gate)

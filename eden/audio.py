@@ -448,79 +448,71 @@ class StepScheduler:
                 if key not in loops:
                     continue
 
+                offset = offsets.get(key, 0)
                 spb = loop.steps_per_bar
+                step_secs = (4.0 / loop.step_size) * (60.0 / bpm)
+
+                # ── Path A: step-grid playback (quantized notes) ─────────────
                 if spb > 32:
                     step_in_bar = playhead
+                    on_boundary = True
                     stride = 32
                 else:
                     step_in_bar = playhead * spb // 32
-                    if step_in_bar == (playhead - 1) * spb // 32:
-                        continue
+                    on_boundary = step_in_bar != (playhead - 1) * spb // 32
                     stride = spb
 
-                offset = offsets.get(key, 0)
-                effective_step = step_in_bar + offset * stride
-                if effective_step >= loop.step_count:
-                    continue
+                if on_boundary:
+                    effective_step = step_in_bar + offset * stride
+                    if effective_step < loop.step_count:
+                        step = loop.steps[effective_step]
+                        if step.on:
+                            if step.probability < 100 and random.randint(1, 100) > step.probability:
+                                break
+                            engine = get_engine(track_idx)
+                            if engine is not None:
+                                gate_samples = max(1, int(step.gate * step_secs * sr))
+                                amplitude = (step.velocity / 127.0) * loop.volume
+                                pitches = step.pitches
+                                if isinstance(track, SampleTrack):
+                                    engine.note_on(pitches[0] if pitches else 0, amplitude, gate_samples, track)
+                                    break
+                                if apply_effects and isinstance(track, SynthTrack):
+                                    if loop.chord_on:
+                                        pitches = expand_chord(pitches, loop.chord_type)
+                                    if loop.arp_on and loop.arp_mode != "chord":
+                                        seq = compute_arp_sequence(pitches, loop.arp_mode, loop.arp_octaves)
+                                        if seq:
+                                            tpn = arp_ticks_per_note(loop.arp_rate)
+                                            arp_gate = max(1, int(0.8 * tpn * 60.0 / bpm / 8.0 * sr))
+                                            engine.note_on(seq[0], amplitude, arp_gate, track)
+                                            if len(seq) > 1:
+                                                self._arp_tracks[track_idx] = {
+                                                    "sequence": seq, "idx": 1,
+                                                    "ticks_until_next": tpn, "ticks_per_note": tpn,
+                                                    "amplitude": amplitude, "gate_samples": arp_gate,
+                                                    "engine": engine, "track": track,
+                                                }
+                                            else:
+                                                self._arp_tracks.pop(track_idx, None)
+                                        break
+                                    elif loop.arp_on and loop.arp_mode == "chord":
+                                        pitches = compute_arp_sequence(pitches, "chord", loop.arp_octaves)
+                                for p in pitches:
+                                    engine.note_on(p, amplitude, gate_samples, track)
+                                break  # step fired; don't check further loops for this track
 
-                step = loop.steps[effective_step]
-                if not step.on:
-                    continue
-
-                # Per-step probability: skip if random roll exceeds threshold
-                if step.probability < 100:
-                    if random.randint(1, 100) > step.probability:
-                        break
-
-                engine = get_engine(track_idx)
-                if engine is None:
-                    continue
-
-                step_secs = (4.0 / loop.step_size) * (60.0 / bpm)
-                gate_samples = max(1, int(step.gate * step_secs * sr))
-                amplitude = (step.velocity / 127.0) * loop.volume
-                pitches = step.pitches
-
-                # SampleTrack: use chop index from pitch; fire single note
-                if isinstance(track, SampleTrack):
-                    chop_idx = pitches[0] if pitches else 0
-                    engine.note_on(chop_idx, amplitude, gate_samples, track)
-                    break
-
-                if apply_effects and isinstance(track, SynthTrack):
-                    # Chord expansion: add chord tones to each pitch
-                    if loop.chord_on:
-                        pitches = expand_chord(pitches, loop.chord_type)
-
-                    # Arp: sequence pitches over time instead of playing all at once
-                    if loop.arp_on and loop.arp_mode != "chord":
-                        seq = compute_arp_sequence(pitches, loop.arp_mode, loop.arp_octaves)
-                        if seq:
-                            tpn = arp_ticks_per_note(loop.arp_rate)
-                            arp_gate = max(1, int(0.8 * tpn * 60.0 / bpm / 8.0 * sr))
-                            # Fire first note immediately; register context for subsequent
-                            engine.note_on(seq[0], amplitude, arp_gate, track)
-                            if len(seq) > 1:
-                                self._arp_tracks[track_idx] = {
-                                    "sequence": seq,
-                                    "idx": 1,
-                                    "ticks_until_next": tpn,
-                                    "ticks_per_note": tpn,
-                                    "amplitude": amplitude,
-                                    "gate_samples": arp_gate,
-                                    "engine": engine,
-                                    "track": track,
-                                }
-                            else:
-                                self._arp_tracks.pop(track_idx, None)
-                        break
-                    elif loop.arp_on and loop.arp_mode == "chord":
-                        # Chord arp mode = all notes at once (same as chord_on)
-                        pitches = compute_arp_sequence(pitches, "chord", loop.arp_octaves)
-
-                for p in pitches:
-                    engine.note_on(p, amplitude, gate_samples, track)
-                break
+                # ── Path B: free-events playback (unquantized timing) ────────
+                # Fires on every tick — each NoteEvent carries its exact raw tick position
+                if loop.free_events:
+                    abs_tick = offset * 32 + playhead
+                    engine = get_engine(track_idx)
+                    if engine is not None:
+                        for ne in loop.free_events:
+                            if ne.tick == abs_tick:
+                                gate_samples = max(1, int(ne.gate * step_secs * sr))
+                                amplitude = (ne.velocity / 127.0) * loop.volume
+                                engine.note_on(ne.pitch, amplitude, gate_samples, track)
 
     def start_live_arp(
         self,

@@ -835,21 +835,9 @@ def _drum_free_pad_pressed(state: AppState, event: PadPressed) -> AppState:
         loop = track.loops[loop_idx]
     loop_offsets = dict(state.loop_measure_offsets)
     bar_offset = loop_offsets.get((track_idx, loop_idx), 0)
-    spb = loop.steps_per_bar
-    step_in_bar = state.playhead * spb // 32
-    step_idx = (bar_offset * spb + step_in_bar) % max(1, loop.step_count)
+    raw_tick = bar_offset * 32 + state.playhead
     pitch = 60
-    if step_idx < loop.step_count:
-        old_step = loop.steps[step_idx]
-        new_step = (StepNote(on=True, pitches=(pitch,), velocity=event.velocity, gate=1.0)
-                    if not old_step.on else dataclasses.replace(old_step, velocity=event.velocity))
-        new_steps = loop.steps[:step_idx] + (new_step,) + loop.steps[step_idx + 1:]
-        new_loop = dataclasses.replace(loop, steps=new_steps)
-        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
-        new_track = dataclasses.replace(track, loops=new_loops)
-        new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
-        state = dataclasses.replace(state, tracks=new_tracks)
-    pending = state.free_pending_ticks + ((pad, step_idx, pitch, event.velocity),)
+    pending = state.free_pending_ticks + ((pad, raw_tick, pitch, event.velocity),)
     return dataclasses.replace(state, free_pending_ticks=pending)
 
 
@@ -872,17 +860,6 @@ def _drum_free_pad_released(state: AppState, event: PadReleased) -> AppState:
     loop = track.loops[loop_idx]
     step_dur_secs = 60.0 / max(1.0, state.tempo_bpm) / (loop.step_size / 4.0)
     gate = max(0.1, event.hold_seconds / step_dur_secs)
-    if tick < loop.step_count:
-        old_step = loop.steps[tick]
-        if old_step.on:
-            new_step = dataclasses.replace(old_step, gate=gate)
-            new_steps = loop.steps[:tick] + (new_step,) + loop.steps[tick + 1:]
-            new_loop = dataclasses.replace(loop, steps=new_steps)
-            new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
-            new_track = dataclasses.replace(track, loops=new_loops)
-            new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
-            state = dataclasses.replace(state, tracks=new_tracks)
-    loop = state.tracks[track_idx].loops[loop_idx]
     note_event = NoteEvent(tick=tick, pitch=pitch, velocity=velocity, gate=gate, aftertouch=0.0)
     new_loop = dataclasses.replace(loop, free_events=loop.free_events + (note_event,))
     new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
@@ -913,29 +890,13 @@ def _drum_pads_pad_pressed(state: AppState, event: PadPressed, track_idx: int) -
         track = state.tracks[track_idx]
         loop = track.loops[loop_idx]
 
-    # Clock-driven position
     loop_offsets = dict(state.loop_measure_offsets)
     bar_offset = loop_offsets.get((track_idx, loop_idx), 0)
-    spb = loop.steps_per_bar
-    step_in_bar = state.playhead * spb // 32
-    step_idx = (bar_offset * spb + step_in_bar) % max(1, loop.step_count)
+    raw_tick = bar_offset * 32 + state.playhead
     pitch = 60
 
-    if step_idx < loop.step_count:
-        old_step = loop.steps[step_idx]
-        if not old_step.on:
-            new_step = StepNote(on=True, pitches=(pitch,), velocity=event.velocity, gate=1.0)
-        else:
-            new_step = dataclasses.replace(old_step, velocity=event.velocity)
-        new_steps = loop.steps[:step_idx] + (new_step,) + loop.steps[step_idx + 1:]
-        new_loop = dataclasses.replace(loop, steps=new_steps)
-        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
-        new_track = dataclasses.replace(track, loops=new_loops)
-        new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
-        state = dataclasses.replace(state, tracks=new_tracks)
-
     loop = state.tracks[track_idx].loops[loop_idx]
-    note_event = NoteEvent(tick=step_idx, pitch=pitch, velocity=event.velocity, gate=1.0)
+    note_event = NoteEvent(tick=raw_tick, pitch=pitch, velocity=event.velocity, gate=1.0)
     new_free = loop.free_events + (note_event,)
     new_loop = dataclasses.replace(loop, free_events=new_free)
     new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
@@ -964,10 +925,11 @@ def _run_quantize(state: AppState) -> AppState:
         from collections import defaultdict as _dd
         tick_map = _dd(list)
         for evt in loop.free_events:
-            # Pull toward nearest grid point
+            # Convert raw playhead tick (bar*32+playhead) to step index, then snap to grid
+            step_pos = evt.tick * spb // 32
             steps_per_grid = max(1, loop.step_size // grid)
-            grid_pos = round(evt.tick / steps_per_grid) * steps_per_grid
-            new_tick = round(evt.tick + strength * (grid_pos - evt.tick))
+            grid_pos = round(step_pos / steps_per_grid) * steps_per_grid
+            new_tick = round(step_pos + strength * (grid_pos - step_pos))
             new_tick = max(0, new_tick)
             tick_map[new_tick].append(evt)
         max_tick = max(tick_map.keys()) if tick_map else 0
@@ -1548,39 +1510,13 @@ def _piano_pad_pressed(
         track = state.tracks[track_idx]
         loop = track.loops[loop_idx]
 
-    # Clock-driven position
+    # Raw playhead tick — not snapped to step grid; quantize happens explicitly later
     loop_offsets = dict(state.loop_measure_offsets)
     bar_offset = loop_offsets.get((track_idx, loop_idx), 0)
-    spb = loop.steps_per_bar
-    step_in_bar = state.playhead * spb // 32
-    step_idx = (bar_offset * spb + step_in_bar) % max(1, loop.step_count)
-
-    # Expand chord if active so recorded steps contain all sounding pitches
-    record_pitches: tuple[int, ...] = (pitch,)
-    if loop.chord_on:
-        record_pitches = expand_chord(record_pitches, loop.chord_type)
-
-    # Write to step (additive — handles simultaneous multi-pad polyphony)
-    if step_idx < loop.step_count:
-        old_step = loop.steps[step_idx]
-        if not old_step.on:
-            new_step = StepNote(on=True, pitches=record_pitches, velocity=event.velocity, gate=1.0)
-        else:
-            new_pitches = old_step.pitches
-            for p in record_pitches:
-                if p not in new_pitches:
-                    new_pitches = new_pitches + (p,)
-            new_step = dataclasses.replace(old_step, pitches=new_pitches)
-        new_steps = loop.steps[:step_idx] + (new_step,) + loop.steps[step_idx + 1:]
-        new_loop = dataclasses.replace(loop, steps=new_steps)
-        new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
-        new_track = dataclasses.replace(track, loops=new_loops)
-        new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
-        state = dataclasses.replace(state, tracks=new_tracks)
+    raw_tick = bar_offset * 32 + state.playhead
 
     # Register pending tick so release can finalize gate + commit NoteEvent
-    # Use the base pitch (not expanded) as the canonical pitch for the pending entry
-    pending = state.free_pending_ticks + ((pad, step_idx, pitch, event.velocity),)
+    pending = state.free_pending_ticks + ((pad, raw_tick, pitch, event.velocity),)
     return dataclasses.replace(state, free_pending_ticks=pending)
 
 
@@ -1613,20 +1549,7 @@ def _piano_pad_released(
     gate = max(0.1, event.hold_seconds / step_dur_secs)
     aftertouch = state.current_aftertouch
 
-    # Update gate on the step that was written during press
-    if tick < loop.step_count:
-        old_step = loop.steps[tick]
-        if old_step.on:
-            new_step = dataclasses.replace(old_step, gate=gate)
-            new_steps = loop.steps[:tick] + (new_step,) + loop.steps[tick + 1:]
-            new_loop = dataclasses.replace(loop, steps=new_steps)
-            new_loops = track.loops[:loop_idx] + (new_loop,) + track.loops[loop_idx + 1:]
-            new_track = dataclasses.replace(track, loops=new_loops)
-            new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
-            state = dataclasses.replace(state, tracks=new_tracks)
-
-    # Commit NoteEvent (for quantize and aftertouch storage)
-    loop = state.tracks[track_idx].loops[loop_idx]  # re-read after step update
+    # Commit NoteEvent — tick is a raw playhead tick, snapping happens on explicit quantize
     note_event = NoteEvent(tick=tick, pitch=pitch, velocity=velocity,
                            gate=gate, aftertouch=aftertouch)
     new_free = loop.free_events + (note_event,)
@@ -1796,8 +1719,12 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
                 new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
                 return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
             if event.key == 2:
-                ctrl = "ATTACK" if state.shift_held else "BARS"
-                new_ctrl = "" if state.instrument_active_ctrl == ctrl else ctrl
+                if state.shift_held:
+                    new_ctrl = "" if state.instrument_active_ctrl == "ATTACK" else "ATTACK"
+                    return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+                if first_track and not first_track.quantized:
+                    return _adjust_bars(state, +1)
+                new_ctrl = "" if state.instrument_active_ctrl == "BARS" else "BARS"
                 return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
             if event.key == 3:
                 if state.shift_held:
@@ -1888,8 +1815,7 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
                 new_ctrl = "" if state.instrument_active_ctrl == "Q_GRID" else "Q_GRID"
                 return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
             if event.key == 2:
-                new_ctrl = "" if state.instrument_active_ctrl == "Q_STR" else "Q_STR"
-                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+                return _adjust_bars(state, +1)
             if event.key == 3:  # BACK → SESSION
                 state_out = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
                 saved = state_out.saved_armed_tracks if state_out.saved_armed_tracks is not None else ()
@@ -1900,7 +1826,7 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
             if event.key == 4:
                 return dataclasses.replace(state, vel_sensitive=not state.vel_sensitive)
         elif state.instrument_submode == InstrumentSubmode.PADS:
-            # Free drum recording submode: QUANT / Q.GRID / Q.AMT / BACK / VEL
+            # Free drum recording submode: QUANT / Q.GRID / EXTEND / BACK / VEL
             if event.key == 0:
                 new_state = _run_quantize(state)
                 return dataclasses.replace(new_state, instrument_submode=InstrumentSubmode.STEPS,
@@ -1909,8 +1835,7 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
                 new_ctrl = "" if state.instrument_active_ctrl == "Q_GRID" else "Q_GRID"
                 return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
             if event.key == 2:
-                new_ctrl = "" if state.instrument_active_ctrl == "Q_STR" else "Q_STR"
-                return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+                return _adjust_bars(state, +1)
             if event.key == 3:
                 return dataclasses.replace(state, instrument_submode=InstrumentSubmode.STEPS,
                                            instrument_active_ctrl="")
