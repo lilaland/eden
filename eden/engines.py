@@ -52,15 +52,17 @@ class TrackEngine:
 # ── DrumEngine ────────────────────────────────────────────────────────────────
 
 _MAX_DRUM_VOICES = 8
+_ONSET_FADE = 8  # linear ramp-up over first 8 frames (~0.18 ms) — click protection only
 
 
 class _DrumVoice:
-    __slots__ = ("data", "position", "gain")
+    __slots__ = ("data", "position", "gain", "fade_remaining")
 
     def __init__(self, data: np.ndarray, gain: float) -> None:
         self.data = data
         self.position = 0
         self.gain = gain
+        self.fade_remaining = _ONSET_FADE
 
     @property
     def frames_left(self) -> int:
@@ -106,7 +108,15 @@ class DrumEngine(TrackEngine):
             if voice.frames_left <= 0:
                 continue
             n = min(n_frames, voice.frames_left)
-            buf[:n] += voice.data[voice.position: voice.position + n] * voice.gain
+            chunk = voice.data[voice.position: voice.position + n] * voice.gain
+            if voice.fade_remaining > 0:
+                fade_n = min(n, voice.fade_remaining)
+                start = _ONSET_FADE - voice.fade_remaining
+                ramp = np.linspace(start / _ONSET_FADE, (start + fade_n) / _ONSET_FADE, fade_n)
+                chunk = chunk.copy()
+                chunk[:fade_n] *= ramp[:, np.newaxis] if chunk.ndim == 2 else ramp
+                voice.fade_remaining -= fade_n
+            buf[:n] += chunk
             voice.position += n
             if voice.frames_left > 0:
                 still_active.append(voice)

@@ -85,11 +85,16 @@ class AudioMixer:
         self._finishing_engines: dict[int, TrackEngine] = {}
         self._mute_group_registry: dict[int, int] = {}  # track_idx → mute_group_id
 
-        # Pre-allocated mix buffer (float64 for internal precision)
-        self._mix_buf = np.zeros((BLOCK_SIZE, 2), dtype=np.float64)
-        self._track_buf = np.zeros((BLOCK_SIZE, 2), dtype=np.float64)
+        # Pre-allocated mix buffers (float32 — avoids astype copies in callback)
+        self._mix_buf = np.zeros((BLOCK_SIZE, 2), dtype=np.float32)
+        self._track_buf = np.zeros((BLOCK_SIZE, 2), dtype=np.float32)
         self._fx_processors: dict[int, object] = {}
         self._master_fx = None
+        self._lim_gain: float = 1.0  # peak-following limiter state
+        # Pre-built snapshots updated by assign/remove — no allocation in callback
+        self._engine_snapshot: list = []
+        self._finishing_snapshot: list = []
+        self._cb_status: collections.deque = collections.deque(maxlen=32)
 
         if os.path.isdir(sample_dir):
             for fname in os.listdir(sample_dir):
@@ -105,6 +110,7 @@ class AudioMixer:
             channels=2,
             dtype="float32",
             blocksize=BLOCK_SIZE,
+            latency="high",  # larger device buffer → more headroom against underruns
             callback=self._audio_callback,
         )
         self._stream.start()
@@ -126,8 +132,7 @@ class AudioMixer:
             data = np.hstack([data, data])
         elif data.shape[1] > 2:
             data = data[:, :2]
-        # Convert to float64 so DrumEngine mixes into float64 buf without casting
-        self._samples[name] = data.astype(np.float64)
+        self._samples[name] = data  # float32, matches mix buffer dtype
 
     @property
     def sample_dir(self) -> str:
@@ -243,22 +248,26 @@ class AudioMixer:
             self._mute_group_registry[track_idx] = mute_group
         else:
             self._mute_group_registry.pop(track_idx, None)
+        self._engine_snapshot = list(self._engines.items())
 
     def remove_engine(self, track_idx: int) -> None:
         self._engines.pop(track_idx, None)
         self._mute_group_registry.pop(track_idx, None)
+        self._engine_snapshot = list(self._engines.items())
 
     def get_engine(self, track_idx: int) -> Optional[TrackEngine]:
         return self._engines.get(track_idx)
 
     def assign_finishing_engine(self, track_idx: int, engine: TrackEngine) -> None:
         self._finishing_engines[track_idx] = engine
+        self._finishing_snapshot = list(self._finishing_engines.values())
 
     def get_finishing_engine(self, track_idx: int) -> Optional[TrackEngine]:
         return self._finishing_engines.get(track_idx)
 
     def clear_finishing_engines(self) -> None:
         self._finishing_engines.clear()
+        self._finishing_snapshot = []
 
     def silence_mute_group(self, group_id: int, except_track: int) -> None:
         """Stop all tracks in group_id except except_track."""
@@ -297,6 +306,12 @@ class AudioMixer:
         self._stream.stop()
         self._stream.close()
 
+    def drain_status_log(self) -> list[str]:
+        """Return and clear any stream status messages posted by the callback."""
+        msgs = list(self._cb_status)
+        self._cb_status.clear()
+        return msgs
+
     # ------------------------------------------------------------------
     # Audio callback (sounddevice audio thread)
     # ------------------------------------------------------------------
@@ -309,33 +324,47 @@ class AudioMixer:
         status: sd.CallbackFlags,
     ) -> None:
         if status:
-            print(f"[audio] stream status: {status}", file=sys.stderr)
+            self._cb_status.append(str(status))  # never print() inside callback
 
         mix = self._mix_buf
         mix[:frames] = 0.0
         track_buf = self._track_buf
 
-        for track_idx, engine in list(self._engines.items()):
+        for track_idx, engine in self._engine_snapshot:
             track_buf[:frames] = 0.0
             engine.fill_block(track_buf[:frames], frames)
             fx = self._fx_processors.get(track_idx)
             if fx is not None:
-                processed = fx.process(track_buf[:frames].astype(np.float32))
-                mix[:frames] += processed.astype(np.float64)
+                processed = fx.process(track_buf[:frames])
+                mix[:frames] += processed if processed.shape[0] == frames else track_buf[:frames]
             else:
                 mix[:frames] += track_buf[:frames]
 
-        for engine in list(self._finishing_engines.values()):
+        for engine in self._finishing_snapshot:
             engine.fill_block(mix[:frames], frames)
 
-        np.clip(mix[:frames], -1.0, 1.0, out=mix[:frames])
+        # Gain-ramp limiter: fast attack, 150ms release, linear ramp per block
+        # Ramp (not snap) eliminates the inter-block gain discontinuity that causes clicking
+        block = mix[:frames]
+        peak = float(np.abs(block).max())
+        THRESHOLD = 0.9
+        release_step = frames / (0.150 * self._sr)
+        if peak > THRESHOLD:
+            new_gain = min(self._lim_gain, THRESHOLD / peak)  # instant attack
+        else:
+            new_gain = min(1.0, self._lim_gain + release_step)  # slow release
+        gains = np.linspace(self._lim_gain, new_gain, frames, dtype=np.float32)
+        block *= gains[:, np.newaxis]
+        self._lim_gain = new_gain
 
         if self._master_fx is not None:
-            out_f32 = mix[:frames].astype(np.float32)
-            processed = self._master_fx.process(out_f32)
-            outdata[:] = np.clip(processed if processed.shape[0] == frames else out_f32, -1.0, 1.0)
+            processed = self._master_fx.process(block)
+            out = processed if processed.shape[0] == frames else block
+            np.clip(out, -1.0, 1.0, out=out)
+            outdata[:] = out
         else:
-            outdata[:] = mix[:frames].astype(np.float32)
+            np.clip(block, -1.0, 1.0, out=block)
+            outdata[:] = block
 
 
 # ---------------------------------------------------------------------------
