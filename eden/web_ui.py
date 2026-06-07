@@ -86,6 +86,8 @@ def _to_json(state, sessions_dir: str = "") -> str:
     amp_attack = 0.0
     amp_release = 0.05
     pan = 0.0
+    stretch_mode = "off"
+    stretch_bars = 1
     sample_chop_cursor = state.sample_chop_cursor
     sel_track = state.tracks[state.selected_track] if state.selected_track < len(state.tracks) else None
     if isinstance(sel_track, SampleTrack):
@@ -98,6 +100,8 @@ def _to_json(state, sessions_dir: str = "") -> str:
         amp_attack = sel_track.amp_attack
         amp_release = sel_track.amp_release
         pan = sel_track.pan
+        stretch_mode = sel_track.stretch_mode
+        stretch_bars = sel_track.stretch_bars
 
     # Which AppState scene slots are occupied
     scenes_saved = [s is not None for s in state.scenes]
@@ -179,6 +183,9 @@ def _to_json(state, sessions_dir: str = "") -> str:
         "step_data":           step_data,
         "fx_edit_page":        state.fx_edit_page,
         "edit_mode":           state.edit_mode,
+        "stretch_mode":        stretch_mode,
+        "stretch_bars":        stretch_bars,
+        "available_samples":   list(state.available_samples),
     })
 
 
@@ -324,6 +331,37 @@ def _make_handler(state_ref: StateRef, dispatch_fn, sessions_dir: str, get_peaks
             elif parsed.path == "/samples":
                 names = mixer.loaded_names() if mixer else []
                 body = json.dumps({"samples": names}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", len(body))
+                self.end_headers()
+                self.wfile.write(body)
+
+            elif parsed.path == "/catalog":
+                from eden.catalog import (
+                    DRUM_CATEGORIES, DRUM_VARIATIONS,
+                    _DRUM_SAMPLE_KEYS, _VARIATION_KEYS,
+                    SAMPLE_CATEGORIES, _SAMPLE_CATALOG,
+                )
+                drum_sets = []
+                for cat in DRUM_CATEGORIES:
+                    cat_key = _DRUM_SAMPLE_KEYS[cat]
+                    variations = [
+                        {"var": var, "key": f"{cat_key}_{_VARIATION_KEYS[var]}"}
+                        for var in DRUM_VARIATIONS
+                    ]
+                    drum_sets.append({"cat": cat, "variations": variations})
+                sample_catalog = []
+                for cat in SAMPLE_CATEGORIES:
+                    entries = [
+                        {"name": e[0], "key": e[2]}
+                        for e in _SAMPLE_CATALOG.get(cat, ())
+                    ]
+                    sample_catalog.append({"cat": cat, "entries": entries})
+                body = json.dumps({
+                    "drum_sets": drum_sets,
+                    "sample_catalog": sample_catalog,
+                }).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", len(body))
@@ -845,59 +883,114 @@ body.light .fx-meter-val{color:#006090}
 }
 #sample-lib-title{font-size:9px;color:#7040a0;letter-spacing:2px;text-transform:uppercase;flex:1}
 #sample-lib-toggle{font-size:9px;color:#5030a0;transition:transform .15s}
+#sample-count{font-size:8px;color:#5030a0}
 #sample-lib-body{padding:0 12px 12px;display:none}
 #sample-lib-body.open{display:block}
-#sample-lib-toolbar{
-  display:flex;align-items:center;gap:8px;margin-bottom:8px;
-  border-top:1px solid rgba(176,64,255,.12);padding-top:8px;
+/* Tab bar */
+#sl-tabs{
+  display:flex;align-items:center;gap:6px;
+  border-top:1px solid rgba(176,64,255,.12);padding-top:8px;margin-bottom:8px;
 }
-#sample-search{
-  flex:1;background:#0e0424;border:1px solid #3a1860;border-radius:4px;
-  color:#d8c8f8;font-size:9px;font-family:inherit;padding:3px 8px;
-  outline:none;
+.sl-tab{
+  padding:2px 12px;border-radius:3px;font-size:8px;font-family:inherit;
+  border:1px solid rgba(176,64,255,.25);background:transparent;
+  color:#6040a0;cursor:pointer;text-transform:uppercase;letter-spacing:.5px;transition:all .08s;
 }
-#sample-search::placeholder{color:#4a2870}
-#sample-search:focus{border-color:#ff3ea0}
+.sl-tab.active{
+  background:#3a1860;border-color:#9060d0;color:#d0a0ff;
+  box-shadow:0 0 6px rgba(176,64,255,.25);
+}
+.sl-tab:hover:not(.active){border-color:#6030a0;color:#a070c0}
 #sample-upload-btn{
+  margin-left:auto;
   padding:3px 10px;border-radius:3px;font-size:8px;font-family:inherit;
   border:1px solid rgba(0,229,255,.35);background:rgba(0,80,100,.4);
   color:#00e5ff;cursor:pointer;text-transform:uppercase;letter-spacing:.5px;transition:all .1s;
 }
 #sample-upload-btn:hover{border-color:#00e5ff;box-shadow:0 0 8px rgba(0,229,255,.3)}
 #sample-upload-input{display:none}
-#sample-count{font-size:8px;color:#5030a0}
-#sample-list{
-  display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:3px;
-  max-height:280px;overflow-y:auto;
+/* Panes */
+.sl-pane{display:none}
+.sl-pane.active{display:block}
+/* ── Drums tab ── */
+#drum-filter-row{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+#drum-search{
+  flex:1;background:#0e0424;border:1px solid #3a1860;border-radius:4px;
+  color:#d8c8f8;font-size:9px;font-family:inherit;padding:3px 8px;outline:none;
 }
-#sample-list::-webkit-scrollbar{width:4px}
-#sample-list::-webkit-scrollbar-track{background:#0a0318}
-#sample-list::-webkit-scrollbar-thumb{background:#3a1860;border-radius:2px}
-.sl-item{
-  display:flex;align-items:center;gap:4px;padding:3px 6px;border-radius:3px;
-  background:#150628;border:1px solid #2a0e50;
-  transition:border-color .06s;
+#drum-search::placeholder{color:#4a2870}
+#drum-search:focus{border-color:#ff3ea0}
+#drum-list{max-height:280px;overflow-y:auto}
+#drum-list::-webkit-scrollbar{width:4px}
+#drum-list::-webkit-scrollbar-track{background:#0a0318}
+#drum-list::-webkit-scrollbar-thumb{background:#3a1860;border-radius:2px}
+.drum-cat-section{margin-bottom:5px}
+.drum-cat-label{font-size:7px;color:#5030a0;text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px}
+.drum-var-row{display:flex;flex-wrap:wrap;gap:2px}
+.drum-var-btn{
+  padding:2px 8px;border-radius:2px;font-size:7px;font-family:inherit;
+  border:1px solid #2a0e50;background:#0e0424;color:#6040a0;
+  cursor:pointer;text-transform:uppercase;letter-spacing:.2px;transition:all .07s;
 }
-.sl-item:hover{border-color:#6030a0}
-.sl-item.active{border-color:#ff3ea0;background:#1e0838}
-.sl-name{
-  flex:1;font-size:8px;color:#b090d8;white-space:nowrap;
-  overflow:hidden;text-overflow:ellipsis;
+.drum-var-btn:hover{border-color:#6030a0;color:#c080ff;background:#1a0838}
+.drum-var-btn.loaded{border-color:#ff3ea0;color:#ff90c0;background:#1e0838}
+/* ── Samples tab ── */
+#samples-filter-row{margin-bottom:6px}
+#samples-search{
+  width:100%;background:#0e0424;border:1px solid #3a1860;border-radius:4px;
+  color:#d8c8f8;font-size:9px;font-family:inherit;padding:3px 8px;outline:none;
+  box-sizing:border-box;
 }
-.sl-item.active .sl-name{color:#ff3ea0}
-.sl-load{
+#samples-search::placeholder{color:#4a2870}
+#samples-search:focus{border-color:#ff3ea0}
+#sample-catalog-list{max-height:200px;overflow-y:auto;margin-bottom:8px}
+#sample-catalog-list::-webkit-scrollbar{width:4px}
+#sample-catalog-list::-webkit-scrollbar-track{background:#0a0318}
+#sample-catalog-list::-webkit-scrollbar-thumb{background:#3a1860;border-radius:2px}
+.scat-section{margin-bottom:3px;border:1px solid #2a0e50;border-radius:4px;overflow:hidden}
+.scat-header{
+  display:flex;align-items:center;gap:6px;padding:4px 8px;
+  background:#150628;cursor:pointer;user-select:none;
+}
+.scat-header:hover{background:#1e0838}
+.scat-name{flex:1;font-size:8px;color:#9060c0;text-transform:uppercase;letter-spacing:.5px}
+.scat-toggle{font-size:9px;color:#5030a0}
+.scat-body{display:none;padding:4px 6px}
+.scat-body.open{display:block}
+.sc-item{
+  display:flex;align-items:center;gap:4px;padding:2px 4px;border-radius:2px;
+  transition:background .06s;
+}
+.sc-item:hover{background:#1e0838}
+.sc-item.sc-active{background:#180830}
+.sc-name{
+  flex:1;font-size:8px;color:#a080c0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.sc-item.sc-active .sc-name{color:#ff3ea0}
+.sc-item.sc-unavail .sc-name{color:#3a2050;font-style:italic}
+.sc-load{
   padding:1px 6px;border-radius:2px;font-size:7px;font-family:inherit;
   border:1px solid rgba(255,62,160,.3);background:transparent;
   color:#c060a0;cursor:pointer;text-transform:uppercase;letter-spacing:.3px;transition:all .08s;
   flex-shrink:0;
 }
-.sl-load:hover{background:rgba(255,62,160,.15);border-color:#ff3ea0;color:#ff3ea0}
-.sl-del{
-  padding:1px 5px;border-radius:2px;font-size:7px;font-family:inherit;
-  border:1px solid rgba(255,50,80,.25);background:transparent;
-  color:#804050;cursor:pointer;transition:all .08s;flex-shrink:0;
+.sc-load:hover{background:rgba(255,62,160,.15);border-color:#ff3ea0;color:#ff3ea0}
+/* Settings panel */
+#sl-settings{
+  padding:8px 10px;border-radius:4px;
+  border:1px solid rgba(176,64,255,.18);background:#0e0424;
 }
-.sl-del:hover{background:rgba(255,50,80,.15);border-color:#ff3050;color:#ff3050}
+#sl-settings.hidden{display:none}
+.sl-settings-hdr{
+  font-size:8px;color:#7040a0;text-transform:uppercase;letter-spacing:.5px;
+  margin-bottom:6px;
+}
+.sl-settings-key{color:#d080ff;letter-spacing:.3px;text-transform:none}
+.sl-settings-grid{
+  display:grid;grid-template-columns:60px 1fr 60px 1fr;gap:3px 12px;
+}
+.sl-sg-label{font-size:7px;color:#5030a0;text-transform:uppercase;letter-spacing:.3px;line-height:16px}
+.sl-sg-value{font-size:8px;color:#c090e0;line-height:16px}
 
 /* Light mode overrides for sample lib */
 body.light #sample-lib{
@@ -907,22 +1000,40 @@ body.light #sample-lib{
 body.light #sample-lib-title{color:#8040b0}
 body.light #sample-lib-top{cursor:pointer}
 body.light #sample-lib-toggle{color:#8040b0}
-body.light #sample-lib-toolbar{border-top-color:rgba(176,64,255,.15)}
-body.light #sample-search{background:#f4f0fc;border-color:#c0a8e0;color:#2a1050}
-body.light #sample-search::placeholder{color:#a090c0}
+body.light #sl-tabs{border-top-color:rgba(176,64,255,.15)}
+body.light .sl-tab{border-color:rgba(130,60,200,.25);color:#7050a0}
+body.light .sl-tab.active{background:#e0d0f8;border-color:#9060d0;color:#5030a0}
 body.light #sample-upload-btn{background:rgba(200,240,255,.6);border-color:#0090c0;color:#0060a0}
 body.light #sample-count{color:#8060b0}
-body.light #sample-list::-webkit-scrollbar-track{background:#f5f0ff}
-body.light #sample-list::-webkit-scrollbar-thumb{background:#c0a8e0}
-body.light .sl-item{background:#f5f0ff;border-color:#d0c0ec}
-body.light .sl-item:hover{border-color:#9060c0}
-body.light .sl-item.active{border-color:#ff3ea0;background:#fff0f8}
-body.light .sl-name{color:#6040a0}
-body.light .sl-item.active .sl-name{color:#d0005a}
-body.light .sl-load{border-color:rgba(200,50,120,.3);color:#a02080}
-body.light .sl-load:hover{background:rgba(255,62,160,.1);border-color:#ff3ea0;color:#d0005a}
-body.light .sl-del{border-color:rgba(200,40,60,.25);color:#a06070}
-body.light .sl-del:hover{background:rgba(220,40,60,.1);border-color:#e03050;color:#c02040}
+body.light #drum-search,body.light #samples-search{
+  background:#f4f0fc;border-color:#c0a8e0;color:#2a1050;
+}
+body.light #drum-search::placeholder,body.light #samples-search::placeholder{color:#a090c0}
+body.light #drum-list::-webkit-scrollbar-track,
+body.light #sample-catalog-list::-webkit-scrollbar-track{background:#f5f0ff}
+body.light #drum-list::-webkit-scrollbar-thumb,
+body.light #sample-catalog-list::-webkit-scrollbar-thumb{background:#c0a8e0}
+body.light .drum-cat-label{color:#8050b0}
+body.light .drum-var-btn{background:#f0e8ff;border-color:#c0a8e0;color:#7050a0}
+body.light .drum-var-btn:hover{background:#e4d4ff;border-color:#9060c0;color:#4020a0}
+body.light .drum-var-btn.loaded{background:#fff0f8;border-color:#ff3ea0;color:#d0005a}
+body.light .scat-header{background:#f5f0ff}
+body.light .scat-header:hover{background:#ede4ff}
+body.light .scat-name{color:#7040b0}
+body.light .scat-toggle{color:#9060c0}
+body.light .scat-section{border-color:#d0c0ec}
+body.light .sc-item:hover{background:#ece4ff}
+body.light .sc-item.sc-active{background:#f8f0ff}
+body.light .sc-name{color:#6040a0}
+body.light .sc-item.sc-active .sc-name{color:#d0005a}
+body.light .sc-item.sc-unavail .sc-name{color:#c0b0d8}
+body.light .sc-load{border-color:rgba(200,50,120,.3);color:#a02080}
+body.light .sc-load:hover{background:rgba(255,62,160,.1);border-color:#ff3ea0;color:#d0005a}
+body.light #sl-settings{background:#f5f0ff;border-color:rgba(130,60,200,.2)}
+body.light .sl-settings-hdr{color:#8040b0}
+body.light .sl-settings-key{color:#6020a0}
+body.light .sl-sg-label{color:#8050b0}
+body.light .sl-sg-value{color:#4030a0}
 
 /* ── Theme toggle button ────────────────────────────────────────────── */
 #header-row{display:flex;align-items:center;gap:10px;width:1110px}
@@ -1131,12 +1242,37 @@ body.light #status{color:#8060b0}
     <div id="sample-lib-toggle">▼</div>
   </div>
   <div id="sample-lib-body">
-    <div id="sample-lib-toolbar">
-      <input id="sample-search" type="text" placeholder="filter samples…" oninput="renderSampleList()">
-      <button id="sample-upload-btn" onclick="document.getElementById('sample-upload-input').click()">⬆ Upload</button>
+    <div id="sl-tabs">
+      <button id="sl-tab-drums" class="sl-tab active" onclick="switchTab('drums')">Drums</button>
+      <button id="sl-tab-samples" class="sl-tab" onclick="switchTab('samples')">Samples</button>
+      <button id="sample-upload-btn" onclick="document.getElementById('sample-upload-input').click()">⬆ Upload .wav</button>
       <input id="sample-upload-input" type="file" accept=".wav" multiple onchange="uploadSamples(this)">
     </div>
-    <div id="sample-list"></div>
+    <!-- Drums pane -->
+    <div id="sl-drums-pane" class="sl-pane active">
+      <div id="drum-filter-row">
+        <input id="drum-search" type="text" placeholder="filter drum categories…" oninput="renderDrumList()">
+      </div>
+      <div id="drum-list"></div>
+    </div>
+    <!-- Samples pane -->
+    <div id="sl-samples-pane" class="sl-pane">
+      <div id="samples-filter-row">
+        <input id="samples-search" type="text" placeholder="filter samples…" oninput="renderSampleCatalog()">
+      </div>
+      <div id="sample-catalog-list"></div>
+      <div id="sl-settings" class="hidden">
+        <div class="sl-settings-hdr">Settings — <span class="sl-settings-key" id="sl-settings-key">—</span></div>
+        <div class="sl-settings-grid">
+          <span class="sl-sg-label">Mode</span><span class="sl-sg-value" id="sl-s-mode">—</span>
+          <span class="sl-sg-label">Pan</span><span class="sl-sg-value" id="sl-s-pan">C</span>
+          <span class="sl-sg-label">Attack</span><span class="sl-sg-value" id="sl-s-attack">0ms</span>
+          <span class="sl-sg-label">Release</span><span class="sl-sg-value" id="sl-s-release">50ms</span>
+          <span class="sl-sg-label">Stretch</span><span class="sl-sg-value" id="sl-s-stretch">off</span>
+          <span class="sl-sg-label">Bars</span><span class="sl-sg-value" id="sl-s-bars">1</span>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1794,10 +1930,17 @@ function update(s){
   const isSampleInst=s.mode==='INSTRUMENT'&&s.sample_key!=null;
   const isDrumSynthInst=s.mode==='INSTRUMENT'&&s.sample_key==null&&s.step_data!=null;
 
-  // Track active sample key for library highlight
+  // Track active sample key and available samples for library
+  if(s.available_samples) slAvailableSamples=s.available_samples;
   if(s.sample_key&&s.sample_key!==slCurrentKey){
     slCurrentKey=s.sample_key;
-    if(document.getElementById('sample-lib-body').classList.contains('open'))renderSampleList();
+    if(document.getElementById('sample-lib-body').classList.contains('open')){
+      if(slActiveTab==='drums') renderDrumList();
+      else{renderSampleCatalog();renderSampleSettings();}
+    }
+  }
+  if(document.getElementById('sample-lib-body').classList.contains('open')&&slActiveTab==='samples'){
+    renderSampleSettings();
   }
 
   // Panel visibility
@@ -1962,51 +2105,130 @@ es.onmessage=e=>{try{update(JSON.parse(e.data));}catch(err){console.error(err);}
 es.onerror=()=>{document.getElementById('status').textContent='disconnected — reload to reconnect';};
 
 // ── Sample library ───────────────────────────────────────────────────
-let slSamples=[];
+let slCatalog=null;
+let slLoadedNames=[];
 let slCurrentKey=null;
+let slActiveTab='drums';
+let slAvailableSamples=[];
+
+async function loadCatalog(){
+  try{
+    const r=await fetch('/catalog');
+    slCatalog=await r.json();
+  }catch(e){}
+}
 
 async function loadSampleList(){
   try{
     const r=await fetch('/samples');
     const d=await r.json();
-    slSamples=d.samples||[];
-    document.getElementById('sample-count').textContent=slSamples.length+' samples';
-    renderSampleList();
+    slLoadedNames=d.samples||[];
+    document.getElementById('sample-count').textContent=slLoadedNames.length+' loaded';
   }catch(e){}
 }
 
-function renderSampleList(){
-  const q=(document.getElementById('sample-search').value||'').toLowerCase();
-  const filtered=slSamples.filter(n=>!q||n.toLowerCase().includes(q));
-  const el=document.getElementById('sample-list');
+function switchTab(tab){
+  slActiveTab=tab;
+  document.getElementById('sl-tab-drums').classList.toggle('active',tab==='drums');
+  document.getElementById('sl-tab-samples').classList.toggle('active',tab==='samples');
+  document.getElementById('sl-drums-pane').classList.toggle('active',tab==='drums');
+  document.getElementById('sl-samples-pane').classList.toggle('active',tab==='samples');
+  if(tab==='drums') renderDrumList();
+  else{renderSampleCatalog();renderSampleSettings();}
+}
+
+function renderDrumList(){
+  if(!slCatalog) return;
+  const q=(document.getElementById('drum-search').value||'').toLowerCase();
+  const el=document.getElementById('drum-list');
   el.innerHTML='';
-  const curTrack=lastState?lastState.selected_track:-1;
-  filtered.forEach(name=>{
-    const div=document.createElement('div');
-    div.className='sl-item'+(name===slCurrentKey?' active':'');
-    const nm=document.createElement('span');
-    nm.className='sl-name';nm.textContent=name;nm.title=name;
-    const loadBtn=document.createElement('button');
-    loadBtn.className='sl-load';loadBtn.textContent='Load';
-    loadBtn.onclick=async(e)=>{
-      e.stopPropagation();
-      await post({type:'load_sample',track_idx:curTrack,sample_key:name});
-      slCurrentKey=name;renderSampleList();
+  for(const catSet of slCatalog.drum_sets){
+    const catLow=catSet.cat.toLowerCase();
+    const vars=catSet.variations.filter(v=>
+      !q||catLow.includes(q)||v.var.toLowerCase().includes(q)||v.key.includes(q)
+    );
+    if(!vars.length) continue;
+    const sec=document.createElement('div');
+    sec.className='drum-cat-section';
+    const lbl=document.createElement('div');
+    lbl.className='drum-cat-label';lbl.textContent=catSet.cat;
+    const row=document.createElement('div');
+    row.className='drum-var-row';
+    for(const v of vars){
+      const btn=document.createElement('button');
+      const isLoaded=slLoadedNames.includes(v.key);
+      btn.className='drum-var-btn'+(isLoaded?' loaded':'');
+      btn.textContent=v.var;btn.title=v.key;
+      btn.onclick=()=>{
+        const curTrack=lastState?lastState.selected_track:-1;
+        post({type:'load_sample',track_idx:curTrack,sample_key:v.key});
+        setTimeout(()=>loadSampleList().then(renderDrumList),300);
+      };
+      row.appendChild(btn);
+    }
+    sec.append(lbl,row);el.appendChild(sec);
+  }
+}
+
+function renderSampleCatalog(){
+  if(!slCatalog) return;
+  const q=(document.getElementById('samples-search').value||'').toLowerCase();
+  const el=document.getElementById('sample-catalog-list');
+  el.innerHTML='';
+  for(const catGroup of slCatalog.sample_catalog){
+    const entries=catGroup.entries.filter(e=>
+      !q||e.name.toLowerCase().includes(q)||e.key.includes(q)
+    );
+    if(!entries.length) continue;
+    const sec=document.createElement('div');sec.className='scat-section';
+    const hdr=document.createElement('div');hdr.className='scat-header';
+    const tog=document.createElement('span');tog.className='scat-toggle';
+    const body=document.createElement('div');body.className='scat-body';
+    const hasActive=entries.some(e=>e.key===slCurrentKey);
+    const autoOpen=!!q||hasActive;
+    if(autoOpen){body.classList.add('open');tog.textContent='▼';}
+    else tog.textContent='▶';
+    hdr.innerHTML=`<span class="scat-name">${catGroup.cat}</span>`;
+    hdr.appendChild(tog);
+    hdr.onclick=()=>{
+      body.classList.toggle('open');
+      tog.textContent=body.classList.contains('open')?'▼':'▶';
     };
-    const delBtn=document.createElement('button');
-    delBtn.className='sl-del';delBtn.textContent='✕';
-    delBtn.title='Delete from disk';
-    delBtn.onclick=async(e)=>{
-      e.stopPropagation();
-      if(!confirm('Delete sample "'+name+'" from disk?'))return;
-      await post({type:'delete_sample',sample_key:name});
-      slSamples=slSamples.filter(s=>s!==name);
-      document.getElementById('sample-count').textContent=slSamples.length+' samples';
-      renderSampleList();
-    };
-    div.append(nm,loadBtn,delBtn);
-    el.appendChild(div);
-  });
+    for(const entry of entries){
+      const isActive=entry.key===slCurrentKey;
+      const isAvail=slAvailableSamples.includes(entry.key)||slLoadedNames.includes(entry.key);
+      const item=document.createElement('div');
+      item.className='sc-item'+(isActive?' sc-active':'')+(isAvail?'':' sc-unavail');
+      const nm=document.createElement('span');nm.className='sc-name';
+      nm.textContent=entry.name;nm.title=entry.key;
+      const loadBtn=document.createElement('button');loadBtn.className='sc-load';
+      loadBtn.textContent='Load';
+      loadBtn.onclick=async()=>{
+        const curTrack=lastState?lastState.selected_track:-1;
+        await post({type:'load_sample',track_idx:curTrack,sample_key:entry.key});
+        slCurrentKey=entry.key;
+        renderSampleCatalog();renderSampleSettings();
+      };
+      item.append(nm,loadBtn);body.appendChild(item);
+    }
+    sec.append(hdr,body);el.appendChild(sec);
+  }
+}
+
+function renderSampleSettings(){
+  const el=document.getElementById('sl-settings');
+  if(!lastState||!lastState.sample_key){el.classList.add('hidden');return;}
+  el.classList.remove('hidden');
+  document.getElementById('sl-settings-key').textContent=lastState.sample_key;
+  const PM={'oneshot':'One-shot','gate':'Gate','legato':'Legato'};
+  document.getElementById('sl-s-mode').textContent=PM[lastState.play_mode]||lastState.play_mode||'—';
+  const p=lastState.pan??0;
+  document.getElementById('sl-s-pan').textContent=
+    Math.abs(p)<0.01?'C':(p>0?'R'+Math.round(p*100):'L'+Math.round(-p*100));
+  document.getElementById('sl-s-attack').textContent=Math.round((lastState.amp_attack||0)*1000)+'ms';
+  document.getElementById('sl-s-release').textContent=Math.round((lastState.amp_release||0.05)*1000)+'ms';
+  document.getElementById('sl-s-stretch').textContent=lastState.stretch_mode||'off';
+  document.getElementById('sl-s-bars').textContent=lastState.stretch_bars??1;
 }
 
 function toggleSampleLib(){
@@ -2014,7 +2236,10 @@ function toggleSampleLib(){
   const tog=document.getElementById('sample-lib-toggle');
   const open=body.classList.toggle('open');
   tog.textContent=open?'▲':'▼';
-  if(open&&slSamples.length===0)loadSampleList();
+  if(open){
+    if(!slCatalog) loadCatalog().then(()=>{renderDrumList();renderSampleCatalog();});
+    if(!slLoadedNames.length) loadSampleList().then(renderDrumList);
+  }
 }
 
 async function uploadSamples(input){
