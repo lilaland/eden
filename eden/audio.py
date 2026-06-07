@@ -8,6 +8,7 @@ StateRef is a thread-safe atomic state container shared between main and audio t
 
 from __future__ import annotations
 
+import collections
 import os
 import random
 import sys
