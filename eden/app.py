@@ -41,10 +41,11 @@ from eden.reduce import reduce
 from eden.render import render_pads, render_oled, render_button_leds
 from eden.scales import degree_to_pitch, white_idx_to_midi, black_key_at
 from eden.arp import expand_chord, compute_arp_sequence, arp_ticks_per_note
-from eden.state import default_state, AppState, DrumTrack, SynthTrack, InstrumentSubmode, Mode, NoteEvent
+from eden.state import default_state, AppState, DrumTrack, SynthTrack, SampleTrack, InstrumentSubmode, Mode, NoteEvent, default_track_loops
 from eden.fx import FXProcessor
 from eden.events import AftertouchChanged, ClockTicked, InstrumentReset, InstrumentUndo, PadPressed, PadReleased, PlusMinusPressed, SessionLoaded, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
 from eden.state import Mode
+import eden.catalog as catalog
 import eden.sessions as sessions
 
 # UNVERIFIED: pad LED addressing — pad_index → note offset confirmed in v0 probe.py
@@ -70,6 +71,11 @@ class EdenApp:
         # Load initial state: slot 0 if it has a file, otherwise default.
         self._state = default_state()
         self._state = dataclasses.replace(self._state, tempo_bpm=bpm)
+        # Populate available_samples from the sample directory on startup.
+        self._state = dataclasses.replace(
+            self._state,
+            available_samples=self._scan_available_samples(sample_dir),
+        )
         self._try_load_slot(0, initial=True)
 
         self._state_ref = StateRef(self._state)
@@ -99,6 +105,9 @@ class EdenApp:
         self._held_arp_pitches: dict[int, dict[int, int]] = {}  # track_idx → {pad_idx → pitch}
         self._fx_processors: dict[int, FXProcessor] = {}
         self._master_fx: FXProcessor = FXProcessor(sample_rate=44100)
+        # DEMO preview state (new-slot picker SK4 hold-to-audition)
+        self._demo_timer: threading.Timer | None = None
+        self._demo_track_idx: int | None = None
         self._mixer.set_master_fx(self._master_fx)
         self._init_fx(self._state)
 
@@ -147,6 +156,13 @@ class EdenApp:
             # SK4 while metronome held → tap tempo (needs wall-clock timestamp).
             if isinstance(event, SoftkeyPressed) and event.key == 3 and self._state.metronome_held:
                 event = TapTempoPressed(timestamp=time.time())
+
+            # SK4 on new-slot picker → DEMO preview (one-shot audition, no state change).
+            if (isinstance(event, SoftkeyPressed) and event.key == 3
+                    and self._state.mode == Mode.SESSION
+                    and self._state.tracks[self._state.selected_track] is None):
+                self._trigger_demo_preview(self._state)
+                continue
 
             # FREE piano mode: record pad-down timestamp; enrich PadReleased with hold time.
             if isinstance(event, PadPressed) and self._is_free_piano_mode():
@@ -201,6 +217,8 @@ class EdenApp:
             # Immediate note-on for synth PADS/STEPS pitch entry (audio feedback).
             if isinstance(event, PadPressed) and self._state.mode == Mode.INSTRUMENT:
                 self._maybe_trigger_synth_preview(event)
+                self._maybe_trigger_sample_scrub(event)
+                self._maybe_trigger_sample_chop_preview(event)
 
             # Aftertouch note-off: release held preview note when pad is lifted.
             if isinstance(event, PadReleased) and self._state.mode == Mode.INSTRUMENT:
@@ -209,6 +227,100 @@ class EdenApp:
             # Channel pressure → update gain on active synth voices.
             if isinstance(event, AftertouchChanged):
                 self._apply_aftertouch(event.value)
+
+    def _trigger_demo_preview(self, state: AppState) -> None:
+        """Fire a one-shot preview for the current new-slot picker selection (SK4 = DEMO)."""
+        pad = state.selected_track
+        # Cancel any running preview first.
+        if self._demo_timer is not None:
+            self._demo_timer.cancel()
+            self._demo_timer = None
+        if self._demo_track_idx is not None:
+            self._mixer.remove_engine(self._demo_track_idx)
+            self._demo_track_idx = None
+
+        type_idx = state.new_slot_type_idx
+        name, param = catalog.get_track_params(
+            type_idx, state.new_slot_cat_idx, state.new_slot_var_idx
+        )
+        sr = self._mixer._sr
+        gate = int(1.2 * sr)
+
+        if type_idx == 0:  # DRUMS
+            preview_track = DrumTrack(name=name, sample_name=param, loops=default_track_loops())
+        elif type_idx == 1:  # KEYS
+            extras = catalog.get_synth_preset_extras(state.new_slot_cat_idx, state.new_slot_var_idx)
+            preview_track = SynthTrack(name=name, loops=default_track_loops(), osc_type=param, **extras)
+        else:  # SAMPLE
+            preview_track = SampleTrack(name=name, sample_key=param, loops=default_track_loops())
+
+        engine = self._mixer.create_engine_for(preview_track)
+        self._mixer.assign_engine(pad, engine)
+        self._demo_track_idx = pad
+        engine.note_on(60, 0.8, gate, preview_track)
+
+        def _cleanup() -> None:
+            if self._demo_track_idx == pad:
+                self._mixer.remove_engine(pad)
+                self._demo_track_idx = None
+            self._demo_timer = None
+
+        self._demo_timer = threading.Timer(2.0, _cleanup)
+        self._demo_timer.daemon = True
+        self._demo_timer.start()
+
+    def _maybe_trigger_sample_scrub(self, event: PadPressed) -> None:
+        """Play sample from pad position in SAMPLE_EDIT bottom row (pads 0-15)."""
+        if not self._state.armed_tracks or event.pad_index >= 16:
+            return
+        if self._state.instrument_submode != InstrumentSubmode.SAMPLE_EDIT:
+            return
+        track_idx = self._state.armed_tracks[0]
+        track = self._state.tracks[track_idx]
+        if not isinstance(track, SampleTrack):
+            return
+        engine = self._mixer.get_engine(track_idx)
+        if engine is None:
+            return
+        chop_idx = self._state.sample_chop_cursor
+        n_chops = len(track.chops)
+        pos = event.pad_index / 15.0  # 0.0–1.0 within full sample
+        sr = self._mixer._sr
+        gate = int(0.4 * sr)
+        # Build a modified track_state where the selected chop starts at scrub pos.
+        if n_chops > 0 and chop_idx < n_chops:
+            chop = track.chops[chop_idx]
+            # Map pos into the chop's range
+            scrub_start = chop.start_offset + pos * (chop.end_offset - chop.start_offset)
+            scrub_start = min(scrub_start, max(chop.start_offset, chop.end_offset - 0.01))
+            modified_chop = dataclasses.replace(chop, start_offset=scrub_start)
+            modified_chops = track.chops[:chop_idx] + (modified_chop,) + track.chops[chop_idx + 1:]
+            modified_track = dataclasses.replace(track, chops=modified_chops)
+            engine.note_on(chop_idx, 0.8, gate, modified_track)
+        else:
+            # No chops: play from trim-mapped position
+            trim_range = track.trim_end - track.trim_start
+            play_start = track.trim_start + pos * trim_range
+            modified_track = dataclasses.replace(track, trim_start=play_start)
+            engine.note_on(0, 0.8, gate, modified_track)
+
+    def _maybe_trigger_sample_chop_preview(self, event: PadPressed) -> None:
+        """In SAMPLE_EDIT top row: tap selects AND fires the chop for preview."""
+        if not self._state.armed_tracks or event.pad_index < 16:
+            return
+        if self._state.instrument_submode != InstrumentSubmode.SAMPLE_EDIT:
+            return
+        chop_idx = event.pad_index - 16
+        track_idx = self._state.armed_tracks[0]
+        track = self._state.tracks[track_idx]
+        if not isinstance(track, SampleTrack) or chop_idx >= len(track.chops):
+            return
+        engine = self._mixer.get_engine(track_idx)
+        if engine is None:
+            return
+        sr = self._mixer._sr
+        gate = int(2.0 * sr)
+        engine.note_on(chop_idx, event.velocity / 127.0, gate, track)
 
     def _is_free_piano_mode(self) -> bool:
         """True when INSTRUMENT mode is active with an unquantized SynthTrack armed."""
@@ -504,6 +616,20 @@ class EdenApp:
         # Release finishing engines once all finishing loops have played out
         if old_state.finishing_loops and not new_state.finishing_loops:
             self._mixer.clear_finishing_engines()
+
+    @staticmethod
+    def _scan_available_samples(sample_dir: str) -> tuple[str, ...]:
+        """Return stem names for all WAV files found in sample_dir."""
+        try:
+            return tuple(
+                sorted(
+                    os.path.splitext(f)[0]
+                    for f in os.listdir(sample_dir)
+                    if f.lower().endswith(".wav")
+                )
+            )
+        except OSError:
+            return ()
 
     # ─── Session I/O ─────────────────────────────────────────────────────────
 

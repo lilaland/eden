@@ -397,3 +397,190 @@ def test_sample_recording_default():
     """AppState.sample_recording defaults to False."""
     s = default_state()
     assert s.sample_recording is False
+
+
+# ── Feature 3: DEMO soft key ───────────────────────────────────────────────────
+
+def test_demo_key_does_not_create_track():
+    """SK4 on new-slot picker does NOT create a track (app.py intercepts it)."""
+    s = _state_with_empty_slot_sample()
+    s2 = reduce(s, SoftkeyPressed(key=3))  # SK4 = DEMO (intercepted before reducer in app.py)
+    # The reducer sees key=3 as BACK (clears active ctrl), but app.py intercepts first.
+    # In the reducer path (sans app.py), key=3 just clears new_slot_active_ctrl.
+    assert s2.tracks[0] is None  # no track created
+
+
+def test_demo_render_shows_demo_label():
+    """New-slot picker OLED shows DEMO on SK4."""
+    from eden.render import render_oled
+    from controller_map import OLED_BTN4_TITLE
+    s = _state_with_empty_slot_sample()
+    oled = render_oled(s)
+    assert oled.get(OLED_BTN4_TITLE, ("",))[0] == "DEMO"
+
+
+# ── Feature 1: SAMPLE_EDIT submode ────────────────────────────────────────────
+
+def _armed_sample_state_with_chops():
+    s = default_state()
+    t = SampleTrack(
+        name="AMEN", sample_key="amen_break",
+        loops=default_track_loops(),
+        chops=(
+            ChopPoint(0.0, 0.25),
+            ChopPoint(0.25, 0.5),
+            ChopPoint(0.5, 0.75),
+            ChopPoint(0.75, 1.0),
+        ),
+    )
+    tracks = (t,) + s.tracks[1:]
+    return dataclasses.replace(s, tracks=tracks, selected_track=0, armed_tracks=(0,),
+                               mode=Mode.INSTRUMENT,
+                               instrument_submode=InstrumentSubmode.SAMPLE_EDIT,
+                               sample_chop_cursor=0)
+
+
+def test_sample_edit_top_row_selects_chop():
+    """Top row pad in SAMPLE_EDIT selects chop."""
+    s = _armed_sample_state_with_chops()
+    s2 = reduce(s, PadPressed(pad_index=18, velocity=100))  # pad 18 = chop 2
+    assert s2.sample_chop_cursor == 2
+
+
+def test_sample_edit_top_row_out_of_range_noop():
+    """Top row pad beyond available chops is a no-op."""
+    s = _armed_sample_state_with_chops()
+    s2 = reduce(s, PadPressed(pad_index=20, velocity=100))  # chop 4 doesn't exist
+    assert s2.sample_chop_cursor == 0  # unchanged
+
+
+def test_sample_edit_shift_bottom_left_sets_start():
+    """Shift + bottom pad < 8 sets chop start_offset."""
+    s = _armed_sample_state_with_chops()
+    s2 = dataclasses.replace(s, shift_held=True)
+    s3 = reduce(s2, PadPressed(pad_index=3, velocity=100))  # pos = 3/15 = 0.2
+    chop = s3.tracks[0].chops[0]
+    assert abs(chop.start_offset - 3 / 15.0) < 0.01
+
+
+def test_sample_edit_shift_bottom_right_sets_end():
+    """Shift + bottom pad >= 8 sets chop end_offset."""
+    s = _armed_sample_state_with_chops()
+    s2 = dataclasses.replace(s, shift_held=True, sample_chop_cursor=1)
+    s3 = reduce(s2, PadPressed(pad_index=12, velocity=100))  # pos = 12/15 = 0.8
+    chop = s3.tracks[0].chops[1]
+    assert abs(chop.end_offset - 12 / 15.0) < 0.01
+
+
+def test_sample_edit_normal_bottom_noop_in_reducer():
+    """Normal (no-shift) bottom pad press in SAMPLE_EDIT is a no-op in reducer."""
+    s = _armed_sample_state_with_chops()
+    s2 = reduce(s, PadPressed(pad_index=5, velocity=100))
+    assert s2 is s  # state unchanged (scrub is audio side-effect only)
+
+
+def test_sample_edit_sk1_back_to_chops():
+    """SK1 in SAMPLE_EDIT returns to SAMPLE_CHOPS submode."""
+    s = _armed_sample_state_with_chops()
+    s2 = reduce(s, SoftkeyPressed(key=0))
+    assert s2.instrument_submode == InstrumentSubmode.SAMPLE_CHOPS
+
+
+def test_sample_chops_sk1_enters_edit():
+    """SK1 on page 0 in SAMPLE_CHOPS enters SAMPLE_EDIT."""
+    s = _armed_sample_state_with_chops()
+    s = dataclasses.replace(s, instrument_submode=InstrumentSubmode.SAMPLE_CHOPS,
+                            instrument_oled_page=0)
+    s2 = reduce(s, SoftkeyPressed(key=0))
+    assert s2.instrument_submode == InstrumentSubmode.SAMPLE_EDIT
+
+
+# ── Feature 2: SampleTrack stretch fields ─────────────────────────────────────
+
+def test_sample_track_stretch_defaults():
+    """SampleTrack stretch_mode defaults to 'off', stretch_bars to 1."""
+    t = SampleTrack(name="T", sample_key="k", loops=default_track_loops())
+    assert t.stretch_mode == "off"
+    assert t.stretch_bars == 1
+
+
+def test_sample_track_stretch_roundtrip():
+    """stretch_mode and stretch_bars survive session serialization."""
+    t = SampleTrack(name="AMEN", sample_key="amen_break",
+                    loops=default_track_loops(),
+                    stretch_mode="stretch", stretch_bars=4)
+    d = sessions._track_to_dict(t)
+    assert d["stretch_mode"] == "stretch"
+    assert d["stretch_bars"] == 4
+    t2 = sessions._dict_to_track(d)
+    assert t2.stretch_mode == "stretch"
+    assert t2.stretch_bars == 4
+
+
+def test_sample_per_chop_tune_via_encoder():
+    """CHOP_TUNE encoder changes selected chop's tune."""
+    from eden.events import EncoderTurned
+    s = _armed_sample_state_with_chops()
+    # Per-chop page (page 2) is reachable from SAMPLE_CHOPS submode
+    s = dataclasses.replace(s, instrument_submode=InstrumentSubmode.SAMPLE_CHOPS,
+                            instrument_oled_page=2,
+                            instrument_active_ctrl="CHOP_TUNE",
+                            sample_chop_cursor=0)
+    s2 = reduce(s, EncoderTurned(encoder=9, delta=1))
+    assert s2.tracks[0].chops[0].tune == 0.5  # +0.5 semitone
+
+
+def test_sample_per_chop_reverse_toggle():
+    """SK2 on page 2 (per-chop) toggles chop reverse."""
+    s = _armed_sample_state_with_chops()
+    s = dataclasses.replace(s, instrument_submode=InstrumentSubmode.SAMPLE_CHOPS,
+                            instrument_oled_page=2, sample_chop_cursor=0)
+    s2 = reduce(s, SoftkeyPressed(key=1))
+    assert s2.tracks[0].chops[0].reverse is True
+    s3 = reduce(s2, SoftkeyPressed(key=1))
+    assert s3.tracks[0].chops[0].reverse is False
+
+
+# ── Feature 4: available_samples + new taxonomy ───────────────────────────────
+
+def test_available_samples_default_empty():
+    """AppState.available_samples defaults to empty tuple."""
+    s = default_state()
+    assert s.available_samples == ()
+
+
+def test_set_available_samples_event():
+    """SetAvailableSamples event updates available_samples."""
+    from eden.events import SetAvailableSamples
+    s = default_state()
+    s2 = reduce(s, SetAvailableSamples(keys=("amen_break", "think_break")))
+    assert "amen_break" in s2.available_samples
+    assert "think_break" in s2.available_samples
+
+
+def test_catalog_new_taxonomy():
+    """Sample catalog uses new taxonomy: Breaks/Vocals/Instr/Texture/FX."""
+    import eden.catalog as cat
+    cats = cat.get_categories(2)
+    assert "Breaks" in cats
+    assert "FX" in cats
+    assert "Hits" not in cats  # old taxonomy dropped
+
+
+def test_catalog_filters_by_available():
+    """get_variations filters by available_samples pool when non-empty."""
+    import eden.catalog as cat
+    # Only amen_break available
+    vars_all = cat.get_variations(2, 0)  # Breaks, no filter
+    vars_filtered = cat.get_variations(2, 0, ("amen_break",))
+    assert len(vars_filtered) < len(vars_all)
+    assert "Amen" in vars_filtered   # amen_break is in pool
+    assert "Think" not in vars_filtered  # think_break not in pool
+
+
+def test_catalog_empty_pool_returns_all():
+    """Empty available_samples tuple returns full catalog (no filter)."""
+    import eden.catalog as cat
+    vars_no_filter = cat.get_variations(2, 0, ())
+    vars_full = cat.get_variations(2, 0)
+    assert vars_no_filter == vars_full

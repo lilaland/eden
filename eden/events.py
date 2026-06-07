@@ -164,3 +164,9 @@ class LoadSample(Event):
     """Assign a sample (by key) to a track's sample slot."""
     track_idx: int
     sample_key: str
+
+
+@dataclass(frozen=True)
+class SetAvailableSamples(Event):
+    """Update the available sample pool (from web Sample Manager)."""
+    keys: tuple  # tuple[str, ...]

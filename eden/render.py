@@ -287,6 +287,36 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
                         else:
                             pads[pad_idx] = PAD_INACTIVE
 
+                elif isinstance(track, SampleTrack) and state.instrument_submode == InstrumentSubmode.SAMPLE_EDIT:
+                    # ── SampleTrack SAMPLE_EDIT mode ──────────────────────────
+                    # Top row (16-31): chop selector — selected chop is bright
+                    n_chops = len(track.chops)
+                    sel_chop = state.sample_chop_cursor
+                    for chop_i in range(16):
+                        pad_idx = chop_i + 16
+                        if chop_i >= n_chops:
+                            pads[pad_idx] = PAD_INACTIVE
+                        elif chop_i == sel_chop:
+                            pads[pad_idx] = _brighten(color)
+                        else:
+                            pads[pad_idx] = _dim(color)
+                    # Bottom row (0-15): waveform scrub positions
+                    # Show current chop boundaries as brighter pads
+                    if n_chops > 0 and sel_chop < n_chops:
+                        chop = track.chops[sel_chop]
+                        start_pad = round(chop.start_offset * 15)
+                        end_pad = round(chop.end_offset * 15)
+                        for p in range(16):
+                            if p == start_pad or p == end_pad:
+                                pads[p] = ACCENT_GOLD   # trim boundary
+                            elif start_pad <= p <= end_pad:
+                                pads[p] = _dim(color, 1.5)  # within chop
+                            else:
+                                pads[p] = _dim(PAD_INACTIVE)
+                    else:
+                        for p in range(16):
+                            pads[p] = _dim(PAD_INACTIVE)
+
                 else:
                     # ── DrumTrack / drum-style step grid ─────────────────────
                     loop = track.loops[state.selected_loop]
@@ -456,7 +486,7 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
             type_name = types[state.new_slot_type_idx] if state.new_slot_type_idx < len(types) else "?"
             cats = catalog.get_categories(state.new_slot_type_idx)
             cat_name = cats[state.new_slot_cat_idx] if cats and state.new_slot_cat_idx < len(cats) else "-"
-            vars_ = catalog.get_variations(state.new_slot_type_idx, state.new_slot_cat_idx)
+            vars_ = catalog.get_variations(state.new_slot_type_idx, state.new_slot_cat_idx, state.available_samples)
             var_name = vars_[state.new_slot_var_idx] if vars_ and state.new_slot_var_idx < len(vars_) else "-"
             trk_name, _ = catalog.get_track_params(
                 state.new_slot_type_idx, state.new_slot_cat_idx, state.new_slot_var_idx
@@ -480,7 +510,7 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
                 _set(OLED_BTN2_VALUE, cat_name)
                 _set(OLED_BTN3_TITLE, "STYLE", var_color)
                 _set(OLED_BTN3_VALUE, var_name)
-            _set(OLED_BTN4_TITLE, "BACK", _OLED_DIM)
+            _set(OLED_BTN4_TITLE, "DEMO", _OLED_DIM)
             _set(OLED_BTN5_TITLE, "CREATE", _OLED_DIM)
             return out
 
@@ -669,6 +699,30 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
 
         # ── SampleTrack OLED ──────────────────────────────────────────────────
         if isinstance(first_track, SampleTrack):
+            # SAMPLE_EDIT submode: chop waveform editor
+            if state.instrument_submode == InstrumentSubmode.SAMPLE_EDIT:
+                n_chops = len(first_track.chops)
+                sel_chop = state.sample_chop_cursor
+                if n_chops > 0 and sel_chop < n_chops:
+                    chop = first_track.chops[sel_chop]
+                    chop_label = chop.name or f"C{sel_chop + 1}"
+                    start_pct = f"{chop.start_offset * 100:.0f}%"
+                    end_pct = f"{chop.end_offset * 100:.0f}%"
+                    _set(OLED_MAIN_LINE1, f"{first_track.name}  EDIT C{sel_chop + 1}/{n_chops}")
+                    _set(OLED_MAIN_LINE2, f"{chop_label}  {start_pct}-{end_pct}")
+                else:
+                    _set(OLED_MAIN_LINE1, f"{first_track.name}  EDIT")
+                    _set(OLED_MAIN_LINE2, "no chops")
+                _set(OLED_BTN1_TITLE, "< BACK", _OLED_DIM)
+                _set(OLED_BTN2_TITLE, "START", _OLED_DIM)
+                _set(OLED_BTN2_VALUE, "SHFT+<")
+                _set(OLED_BTN3_TITLE, "END", _OLED_DIM)
+                _set(OLED_BTN3_VALUE, "SHFT+>")
+                _set(OLED_BTN4_TITLE, "SCRUB", _OLED_DIM)
+                _set(OLED_BTN4_VALUE, "PRESS")
+                _set(OLED_BTN5_TITLE, "", _OLED_DIM)
+                return out
+
             # SAMPLE_KEYS submode: dedicated OLED layout
             if state.instrument_submode == InstrumentSubmode.SAMPLE_KEYS:
                 chop_idx = state.sample_chop_cursor
@@ -704,7 +758,7 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
                 _set(OLED_MAIN_LINE1, f"{first_track.name}  {n_chops} chops")
                 _set(OLED_MAIN_LINE2, f"STP{sel_step+1:02d} -> {chop_label}")
                 sub_str = "CHOPS" if state.instrument_submode == InstrumentSubmode.SAMPLE_CHOPS else "STEPS"
-                _set(OLED_BTN1_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN1_TITLE, "EDIT", _OLED_DIM)
                 _set(OLED_BTN2_TITLE, "KEYS", _OLED_DIM)
                 _set(OLED_BTN3_TITLE, "", _OLED_DIM)
                 _set(OLED_BTN4_TITLE, "< BACK", _OLED_DIM)
@@ -733,6 +787,42 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
                 _set(OLED_BTN5_TITLE, "PAN", _OLED_DIM)
                 _set(OLED_BTN5_VALUE, pan_str)
             elif page == 2:
+                # Per-chop: tune + reverse for selected chop
+                sel_chop = state.sample_chop_cursor
+                tune_color = _OLED_ACTIVE if ctrl == "CHOP_TUNE" else _OLED_DIM
+                rev_color = _OLED_ACTIVE if ctrl == "CHOP_REV" else _OLED_DIM
+                if n_chops > 0 and sel_chop < n_chops:
+                    chop = first_track.chops[sel_chop]
+                    chop_lbl = chop.name or f"C{sel_chop + 1}"
+                    tune_str = f"{chop.tune:+.1f}st"
+                    rev_str = "ON" if chop.reverse else "OFF"
+                else:
+                    chop_lbl, tune_str, rev_str = "none", "n/a", "n/a"
+                _set(OLED_MAIN_LINE1, f"{first_track.name}  chop:{chop_lbl}")
+                _set(OLED_MAIN_LINE2, f"C{sel_chop + 1}/{max(1, n_chops)}")
+                _set(OLED_BTN1_TITLE, "TUNE", tune_color)
+                _set(OLED_BTN1_VALUE, tune_str)
+                _set(OLED_BTN2_TITLE, "REV", rev_color)
+                _set(OLED_BTN2_VALUE, rev_str)
+                _set(OLED_BTN3_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN4_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN5_TITLE, "", _OLED_DIM)
+            elif page == 3:
+                # Stretch: mode + target bars
+                sm_color = _OLED_ACTIVE if ctrl == "STRETCH_MODE" else _OLED_DIM
+                sb_color = _OLED_ACTIVE if ctrl == "STRETCH_BARS" else _OLED_DIM
+                sm = first_track.stretch_mode
+                sb = first_track.stretch_bars
+                _set(OLED_MAIN_LINE1, f"{first_track.name}  STRETCH")
+                _set(OLED_MAIN_LINE2, f"{sm.upper()}  {sb}bar{'s' if sb != 1 else ''}")
+                _set(OLED_BTN1_TITLE, "MODE", sm_color)
+                _set(OLED_BTN1_VALUE, sm.upper()[:6])
+                _set(OLED_BTN2_TITLE, "BARS", sb_color)
+                _set(OLED_BTN2_VALUE, str(sb))
+                _set(OLED_BTN3_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN4_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN5_TITLE, "", _OLED_DIM)
+            elif page == 4:
                 # Track management
                 keep = first_track.keep_empty
                 keep_color = _OLED_ACTIVE if keep else _OLED_DIM

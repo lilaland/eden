@@ -136,27 +136,35 @@ KEYS_FOLDERS: tuple[str, ...] = tuple(_KEYS_PRESETS.keys())
 
 # ── Sample catalog ─────────────────────────────────────────────────────────────
 
-SAMPLE_CATEGORIES: tuple[str, ...] = ("Breaks", "Hits", "FX", "Loops")
+SAMPLE_CATEGORIES: tuple[str, ...] = ("Breaks", "Vocals", "Instr", "Texture", "FX")
 
 # (display_name, track_name, sample_key)
+# sample_key must appear in available_samples (AppState) to be selectable at runtime.
 _SAMPLE_CATALOG: dict[str, tuple] = {
     "Breaks": (
-        ("Amen",    "AMEN",  "amen_break"),
-        ("Think",   "THINK", "think_break"),
-        ("Apache",  "APACH", "apache_break"),
+        ("Amen",     "AMEN",  "amen_break"),
+        ("Think",    "THINK", "think_break"),
+        ("Apache",   "APACH", "apache_break"),
+        ("Funky D",  "FUNKD", "funky_drummer"),
     ),
-    "Hits": (
-        ("808 Kick",  "808K",  "kick_808"),
-        ("Clap",      "CLAP",  "clap_hit"),
-        ("Hi-Hat",    "HHAT",  "hihat_open"),
+    "Vocals": (
+        ("Vox 1",    "VOX1",  "vocal_chop_1"),
+        ("Vox 2",    "VOX2",  "vocal_chop_2"),
+    ),
+    "Instr": (
+        ("Rhodes",   "RHDS",  "rhodes_loop"),
+        ("Bass Riff","BSRIF", "bass_riff"),
+        ("Guitar",   "GTR",   "guitar_loop"),
+    ),
+    "Texture": (
+        ("Vinyl",    "VINL",  "vinyl_texture"),
+        ("Rain",     "RAIN",  "rain_foley"),
+        ("Crowd",    "CRWD",  "crowd_foley"),
     ),
     "FX": (
-        ("Riser",   "RISR",  "riser_fx"),
-        ("Impact",  "IMPCT", "impact_fx"),
-    ),
-    "Loops": (
-        ("Beat 1",  "BEAT1", "beat_loop_1"),
-        ("Beat 2",  "BEAT2", "beat_loop_2"),
+        ("Riser",    "RISR",  "riser_fx"),
+        ("Impact",   "IMPCT", "impact_fx"),
+        ("Downlift", "DNLFT", "downlift_fx"),
     ),
 }
 
@@ -175,8 +183,16 @@ def get_categories(type_idx: int) -> tuple[str, ...]:
     return ()
 
 
-def get_variations(type_idx: int, cat_idx: int) -> tuple[str, ...]:
-    """Return variation list for the given type/category indices."""
+def get_variations(
+    type_idx: int,
+    cat_idx: int,
+    available: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """Return variation list for the given type/category indices.
+
+    For SAMPLE type: if ``available`` is non-empty, only include entries whose
+    sample_key appears in the pool. Falls back to full catalog when pool is empty.
+    """
     if type_idx == 0:  # DRUMS
         return DRUM_VARIATIONS
     if type_idx == 1:  # KEYS — presets within selected folder
@@ -184,7 +200,10 @@ def get_variations(type_idx: int, cat_idx: int) -> tuple[str, ...]:
         return tuple(p[0] for p in _KEYS_PRESETS[folder])
     if type_idx == 2:  # SAMPLE
         cat = SAMPLE_CATEGORIES[cat_idx % len(SAMPLE_CATEGORIES)]
-        return tuple(p[0] for p in _SAMPLE_CATALOG.get(cat, ()))
+        all_entries = _SAMPLE_CATALOG.get(cat, ())
+        if available:
+            return tuple(p[0] for p in all_entries if p[2] in available)
+        return tuple(p[0] for p in all_entries)
     return ()
 
 

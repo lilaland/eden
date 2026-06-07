@@ -222,6 +222,8 @@ def _track_to_dict(track) -> Optional[dict]:
             "mute_group": track.mute_group,
             "volume": track.volume,
             "keep_empty": track.keep_empty,
+            "stretch_mode": track.stretch_mode,
+            "stretch_bars": track.stretch_bars,
             "fx": _fxchain_to_dict(track.fx),
             "chops": [
                 {
@@ -311,6 +313,8 @@ def _dict_to_track(d: Optional[dict]):
             mute_group=int(d.get("mute_group", 0)),
             volume=float(d.get("volume", 1.0)),
             keep_empty=bool(d.get("keep_empty", False)),
+            stretch_mode=d.get("stretch_mode", "off"),
+            stretch_bars=int(d.get("stretch_bars", 1)),
             fx=_dict_to_fxchain(d.get("fx")),
         )
     return None

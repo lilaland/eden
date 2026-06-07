@@ -45,6 +45,7 @@ class InstrumentSubmode(Enum):
     SAMPLE_CHOPS = auto() # chop-to-step assignment grid
     SAMPLE_RECORD = auto() # input → trim → chop-detect (scaffold for now)
     SAMPLE_KEYS = auto()  # all pads = chromatic keyboard for selected chop
+    SAMPLE_EDIT = auto()  # top row = chop selector, bottom row = waveform scrub/trim
 
 
 @dataclass(frozen=True)
@@ -150,6 +151,8 @@ class SampleTrack:
     mute_group: int = 0          # 0 = none; 1-8 = exclusive mute group
     volume: float = 1.0
     keep_empty: bool = False
+    stretch_mode: str = "off"    # "off" | "repitch" | "stretch"
+    stretch_bars: int = 1        # target loop length in bars (used when stretch_mode != "off")
     fx: FXChain = field(default_factory=FXChain)
 
 
@@ -248,6 +251,8 @@ class AppState:
     # SampleTrack ephemeral state
     sample_chop_cursor: int = 0      # selected chop index in SAMPLE_CHOPS / SAMPLE_KEYS
     sample_recording: bool = False   # True while audio input is being recorded
+    # Available sample pool (populated from web Sample Manager or default set on startup)
+    available_samples: tuple[str, ...] = ()
 
 
 # ── Factory functions ─────────────────────────────────────────────────────────
