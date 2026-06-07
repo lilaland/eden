@@ -720,10 +720,29 @@ body.light .fx-meter-val{color:#006090}
   letter-spacing:2px;text-transform:uppercase;color:#7040a0;line-height:1.6}
 #logo .o{color:#ff3ea0;text-shadow:0 0 8px rgba(255,62,160,.7)}
 #logo small{display:block;font-size:7px;letter-spacing:1px;color:#4a2870;margin-top:1px}
-#encs{display:flex;flex-direction:column;gap:6px;padding-top:2px}
+#encs{display:flex;flex-direction:column;gap:8px;align-items:center;flex:1}
 .enc-row{display:flex;gap:14px;align-items:center}
-.enc-spacer{width:63px;flex-shrink:0}
+.enc-row:first-child{transform:translateX(29px)}
+/* Circular gauge wrapper — speedometer arc 270° from 7:30 to 4:30 */
+.enc-gauge{
+  position:relative;width:54px;height:54px;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+}
+.enc-gauge::before{
+  content:'';position:absolute;inset:0;border-radius:50%;
+  background:conic-gradient(
+    from -135deg,
+    #ff3ea0 calc(var(--val,0) * 270deg),
+    rgba(255,62,160,.18) calc(var(--val,0) * 270deg) 270deg,
+    transparent 270deg 360deg
+  );
+}
+.enc-gauge::after{
+  content:'';position:absolute;inset:5px;border-radius:50%;
+  background:#070010;
+}
 .enc{
+  position:relative;z-index:1;
   width:44px;height:44px;border-radius:50%;
   background:radial-gradient(circle at 38% 32%,#2a1045,#0e0520);
   border:1px solid #3a1860;
@@ -733,7 +752,7 @@ body.light .fx-meter-val{color:#006090}
 }
 .enc-label{font-size:6px;color:#6040a0;text-transform:uppercase;letter-spacing:.3px;line-height:1.1}
 .enc-val{font-size:7px;color:#a070d0;font-weight:bold;line-height:1.1}
-.pm-pair{display:flex;gap:3px;flex-shrink:0}
+.pm-pair{display:flex;flex-direction:column;gap:3px;flex-shrink:0;align-items:center}
 .pm-btn{
   width:30px;height:28px;border-radius:3px;
   background:#180830;border:1px solid #2e1050;
@@ -774,7 +793,8 @@ body.light .fx-meter-val{color:#006090}
   text-shadow:0 0 8px rgba(216,200,255,.35);
   white-space:nowrap;overflow:hidden;line-height:1.5;
 }
-#nav-col{display:flex;flex-direction:column;align-items:center;gap:5px}
+/* oled-nav: OLED block + D-pad row below, centered */
+#oled-nav{display:flex;flex-direction:column;align-items:center;gap:5px}
 #enc9{
   width:56px;height:56px;border-radius:50%;
   background:radial-gradient(circle at 38% 32%,#2a1045,#0e0520);
@@ -790,9 +810,10 @@ body.light .fx-meter-val{color:#006090}
   color:#6040a0;font-size:10px;text-align:center;line-height:22px;cursor:default;
 }
 #mid-left{display:flex;flex-direction:column;gap:0}
-.slots{display:flex;gap:3px;margin-bottom:3px;flex-wrap:wrap}
+/* A–H slots: 4×2 grid */
+.slots{display:grid;grid-template-columns:repeat(4,42px);gap:3px;margin-bottom:3px}
 .slot-btn{
-  width:32px;height:28px;border-radius:3px;
+  width:42px;height:28px;border-radius:3px;
   background:#180830;border:1px solid #2e1050;
   color:#6040a0;font-size:8px;text-align:center;line-height:28px;
   cursor:default;transition:all .06s;
@@ -830,10 +851,11 @@ body.light .fx-meter-val{color:#006090}
   opacity:0;transition:left .04s,opacity .1s;
   box-shadow:0 0 8px rgba(255,62,160,.6);
 }
+/* D-pad: 2-row (↓ in center of row 2) */
 #nav-cross{
   display:grid;
   grid-template-columns:repeat(3,28px);
-  grid-template-rows:repeat(3,28px);
+  grid-template-rows:repeat(2,28px);
   gap:3px;
 }
 .nav-btn{
@@ -842,20 +864,20 @@ body.light .fx-meter-val{color:#006090}
   color:#7040a0;font-size:11px;text-align:center;line-height:28px;cursor:default;
 }
 #btn-shift{
-  width:64px;height:28px;border-radius:4px;
+  width:90px;height:28px;border-radius:4px;
   background:#ff3ea0;border:1px solid #cc1070;
   color:#1a0030;font-size:8px;font-family:inherit;
   text-transform:uppercase;font-weight:bold;letter-spacing:.5px;
-  cursor:default;transition:all .06s;margin-top:5px;
+  cursor:default;transition:all .06s;
   box-shadow:0 0 8px rgba(255,62,160,.45);
 }
 #btn-shift.held{
   background:#ffcc00;border-color:#c89000;color:#1a1000;
   box-shadow:0 0 12px rgba(255,204,0,.75),0 0 24px rgba(255,204,0,.25);
 }
-.pad-row{display:flex;gap:3px;margin-bottom:4px}
-.pad-row:last-child{margin-bottom:0}
-#pr-top{padding-left:30px}
+.pad-row{display:flex;gap:3px}
+#pr-top{margin-bottom:4px;margin-left:33px}
+#pr-bot-row{display:flex;align-items:center;gap:3px}
 .pad{
   width:58px;height:46px;border-radius:5px;
   background:#0e0424;border:1px solid #2a0a45;
@@ -1129,6 +1151,15 @@ body.light #ctrl{
 }
 body.light #pads{background:#f0e8ff;box-shadow:inset 0 0 12px rgba(180,140,240,.15)}
 body.light #logo{color:#7050a0}
+body.light .enc-gauge::before{
+  background:conic-gradient(
+    from -135deg,
+    #d0005a calc(var(--val,0) * 270deg),
+    rgba(200,50,120,.15) calc(var(--val,0) * 270deg) 270deg,
+    transparent 270deg 360deg
+  );
+}
+body.light .enc-gauge::after{background:#f7f2ff}
 body.light .enc{
   background:radial-gradient(circle at 38% 32%,#e4d4f8,#c8b4e8);
   border-color:#b090d8;
@@ -1282,21 +1313,16 @@ body.light #status{color:#8060b0}
     <div id="logo">AT<span class="o">O</span>M&nbsp;SQ<small>Eden M5</small></div>
     <div id="encs">
       <div class="enc-row">
-        <div class="enc-spacer"></div>
-        <div class="enc" id="enc1"><span class="enc-label" id="enc1l">ENC</span><span class="enc-val" id="enc1v">1</span></div>
-        <div class="enc" id="enc2"><span class="enc-label" id="enc2l">ENC</span><span class="enc-val" id="enc2v">2</span></div>
-        <div class="enc" id="enc3"><span class="enc-label" id="enc3l">ENC</span><span class="enc-val" id="enc3v">3</span></div>
-        <div class="enc" id="enc4"><span class="enc-label" id="enc4l">ENC</span><span class="enc-val" id="enc4v">4</span></div>
+        <div class="enc-gauge" id="enc-gauge-1"><div class="enc" id="enc1"><span class="enc-label" id="enc1l">ENC</span><span class="enc-val" id="enc1v">1</span></div></div>
+        <div class="enc-gauge" id="enc-gauge-2"><div class="enc" id="enc2"><span class="enc-label" id="enc2l">ENC</span><span class="enc-val" id="enc2v">2</span></div></div>
+        <div class="enc-gauge" id="enc-gauge-3"><div class="enc" id="enc3"><span class="enc-label" id="enc3l">ENC</span><span class="enc-val" id="enc3v">3</span></div></div>
+        <div class="enc-gauge" id="enc-gauge-4"><div class="enc" id="enc4"><span class="enc-label" id="enc4l">ENC</span><span class="enc-val" id="enc4v">4</span></div></div>
       </div>
       <div class="enc-row">
-        <div class="pm-pair">
-          <div class="pm-btn">+</div>
-          <div class="pm-btn">&#8722;</div>
-        </div>
-        <div class="enc" id="enc5"><span class="enc-label" id="enc5l">ENC</span><span class="enc-val" id="enc5v">5</span></div>
-        <div class="enc" id="enc6"><span class="enc-label" id="enc6l">ENC</span><span class="enc-val" id="enc6v">6</span></div>
-        <div class="enc" id="enc7"><span class="enc-label" id="enc7l">ENC</span><span class="enc-val" id="enc7v">7</span></div>
-        <div class="enc" id="enc8"><span class="enc-label" id="enc8l">ENC</span><span class="enc-val" id="enc8v">8</span></div>
+        <div class="enc-gauge" id="enc-gauge-5"><div class="enc" id="enc5"><span class="enc-label" id="enc5l">ENC</span><span class="enc-val" id="enc5v">5</span></div></div>
+        <div class="enc-gauge" id="enc-gauge-6"><div class="enc" id="enc6"><span class="enc-label" id="enc6l">ENC</span><span class="enc-val" id="enc6v">6</span></div></div>
+        <div class="enc-gauge" id="enc-gauge-7"><div class="enc" id="enc7"><span class="enc-label" id="enc7l">ENC</span><span class="enc-val" id="enc7v">7</span></div></div>
+        <div class="enc-gauge" id="enc-gauge-8"><div class="enc" id="enc8"><span class="enc-label" id="enc8l">ENC</span><span class="enc-val" id="enc8v">8</span></div></div>
       </div>
     </div>
     <div id="rpanel">
@@ -1306,27 +1332,29 @@ body.light #status{color:#8060b0}
         <button id="btn-edit" class="mode-btn">Edit</button>
         <button id="btn-user" class="mode-btn">User</button>
       </div>
-      <div id="oled-block">
-        <div class="sk-btn-row">
-          <div class="sk-btn" id="sk1"><div class="sk-btn-title" id="sk1t"></div><div class="sk-btn-val" id="sk1v"></div></div>
-          <div class="sk-btn" id="sk2"><div class="sk-btn-title" id="sk2t"></div><div class="sk-btn-val" id="sk2v"></div></div>
-          <div class="sk-btn" id="sk3"><div class="sk-btn-title" id="sk3t"></div><div class="sk-btn-val" id="sk3v"></div></div>
+      <div id="oled-nav">
+        <div id="oled-block">
+          <div class="sk-btn-row">
+            <div class="sk-btn" id="sk1"><div class="sk-btn-title" id="sk1t"></div><div class="sk-btn-val" id="sk1v"></div></div>
+            <div class="sk-btn" id="sk2"><div class="sk-btn-title" id="sk2t"></div><div class="sk-btn-val" id="sk2v"></div></div>
+            <div class="sk-btn" id="sk3"><div class="sk-btn-title" id="sk3t"></div><div class="sk-btn-val" id="sk3v"></div></div>
+          </div>
+          <div id="oled-screen">
+            <div class="main-line" id="main1">&nbsp;</div>
+            <div class="main-line" id="main2">&nbsp;</div>
+          </div>
+          <div class="sk-btn-row">
+            <div class="sk-btn" id="sk4"><div class="sk-btn-title" id="sk4t"></div><div class="sk-btn-val" id="sk4v"></div></div>
+            <div class="sk-btn" id="sk5"><div class="sk-btn-title" id="sk5t"></div><div class="sk-btn-val" id="sk5v"></div></div>
+            <div class="sk-btn" id="sk6"><div class="sk-btn-title" id="sk6t"></div><div class="sk-btn-val" id="sk6v"></div></div>
+          </div>
         </div>
-        <div id="oled-screen">
-          <div class="main-line" id="main1">&nbsp;</div>
-          <div class="main-line" id="main2">&nbsp;</div>
-        </div>
-        <div class="sk-btn-row">
-          <div class="sk-btn" id="sk4"><div class="sk-btn-title" id="sk4t"></div><div class="sk-btn-val" id="sk4v"></div></div>
-          <div class="sk-btn" id="sk5"><div class="sk-btn-title" id="sk5t"></div><div class="sk-btn-val" id="sk5v"></div></div>
-          <div class="sk-btn" id="sk6"><div class="sk-btn-title" id="sk6t"></div><div class="sk-btn-val" id="sk6v"></div></div>
-        </div>
-      </div>
-      <div id="nav-col">
-        <div id="enc9">NAV</div>
-        <div class="nav-pair">
-          <div class="nav-sm" title="Back">&#9664;</div>
-          <div class="nav-sm" title="Forward">&#9654;</div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <div id="enc9">NAV</div>
+          <div id="nav-cross">
+            <div></div><div class="nav-btn">&#9650;</div><div></div>
+            <div class="nav-btn">&#9664;</div><div class="nav-btn">&#9660;</div><div class="nav-btn">&#9654;</div>
+          </div>
         </div>
       </div>
     </div>
@@ -1352,19 +1380,18 @@ body.light #status{color:#8060b0}
       </div>
     </div>
     <div id="ts-wrap"><div id="ts-pos"></div></div>
-    <div style="display:flex;flex-direction:column;align-items:center;gap:5px;flex-shrink:0">
-      <div id="nav-cross">
-        <div></div><div class="nav-btn">&#9650;</div><div></div>
-        <div class="nav-btn">&#9664;</div><div></div><div class="nav-btn">&#9654;</div>
-        <div></div><div class="nav-btn">&#9660;</div><div></div>
-      </div>
-      <button id="btn-shift">SHIFT</button>
-    </div>
+    <button id="btn-shift">SHIFT</button>
   </div>
 
   <div id="pads">
     <div class="pad-row" id="pr-top"></div>
-    <div class="pad-row" id="pr-bot"></div>
+    <div id="pr-bot-row">
+      <div class="pm-pair">
+        <div class="pm-btn">+</div>
+        <div class="pm-btn">&#8722;</div>
+      </div>
+      <div class="pad-row" id="pr-bot"></div>
+    </div>
   </div>
 
   <div id="status">connecting&hellip;</div>
@@ -2006,7 +2033,7 @@ function update(s){
     wfTrackIdx=-1;
   }
 
-  // FX encoder knobs
+  // FX encoder knobs + gauges
   if(s.fx_knobs){
     for(let i=0;i<8;i++){
       const knob=s.fx_knobs[i];
@@ -2015,6 +2042,12 @@ function update(s){
       const vEl=document.getElementById('enc'+(i+1)+'v');
       if(lEl) lEl.textContent=knob.label;
       if(vEl) vEl.textContent=knob.value;
+    }
+  }
+  if(s.fx_knobs_raw){
+    for(let i=0;i<8;i++){
+      const g=document.getElementById('enc-gauge-'+(i+1));
+      if(g) g.style.setProperty('--val',s.fx_knobs_raw[i]??0);
     }
   }
 
