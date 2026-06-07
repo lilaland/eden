@@ -2372,8 +2372,12 @@ def _apply_auto_chop(state: AppState, event: AutoChop) -> AppState:
 
 
 def _load_sample(state: AppState, event: LoadSample) -> AppState:
-    """Assign a sample key to a SampleTrack or DrumTrack."""
-    from eden.state import DrumTrack
+    """Assign a sample key to a SampleTrack or DrumTrack.
+
+    If the slot is empty, creates a new track of the appropriate type based on
+    event.track_type ("drum" or "sample").
+    """
+    from eden.state import DrumTrack, default_track_loops
     ti = event.track_idx
     if ti < 0 or ti >= len(state.tracks):
         return state
@@ -2382,6 +2386,22 @@ def _load_sample(state: AppState, event: LoadSample) -> AppState:
         new_track = dataclasses.replace(track, sample_key=event.sample_key)
     elif isinstance(track, DrumTrack):
         new_track = dataclasses.replace(track, sample_name=event.sample_key)
+    elif track is None:
+        key = event.sample_key
+        # Derive a short display name: last segment, uppercased, max 5 chars
+        display = key.split("_")[-1].upper()[:5] if "_" in key else key.upper()[:5]
+        if event.track_type == "drum":
+            new_track = DrumTrack(
+                name=display,
+                sample_name=key,
+                loops=default_track_loops(),
+            )
+        else:
+            new_track = SampleTrack(
+                name=display,
+                sample_key=key,
+                loops=default_track_loops(),
+            )
     else:
         return state
     new_tracks = state.tracks[:ti] + (new_track,) + state.tracks[ti + 1:]

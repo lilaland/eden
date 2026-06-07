@@ -161,9 +161,15 @@ class NormalizeAction(Event):
 
 @dataclass(frozen=True)
 class LoadSample(Event):
-    """Assign a sample (by key) to a track's sample slot."""
+    """Assign a sample (by key) to a track's sample slot.
+
+    track_type is used only when the target slot is empty:
+      "drum"   → create a DrumTrack
+      "sample" → create a SampleTrack (default)
+    """
     track_idx: int
     sample_key: str
+    track_type: str = "sample"
 
 
 @dataclass(frozen=True)

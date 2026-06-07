@@ -263,12 +263,17 @@ def _handle_action(action: dict, state_ref, dispatch_fn, mixer=None) -> None:
     elif atype == "load_sample":
         track_idx = int(action["track_idx"])
         sample_key = str(action["sample_key"])
+        track_type = str(action.get("track_type", "sample"))
         if mixer is not None and sample_key not in mixer.loaded_names():
             import os
             path = os.path.join(mixer.sample_dir, sample_key + ".wav")
             if os.path.isfile(path):
                 mixer.load(sample_key, path)
-        dispatch_fn(LoadSample(track_idx=track_idx, sample_key=sample_key))
+        dispatch_fn(LoadSample(
+            track_idx=track_idx,
+            sample_key=sample_key,
+            track_type=track_type,
+        ))
 
     elif atype == "delete_sample":
         sample_key = str(action["sample_key"])
@@ -2161,7 +2166,7 @@ function renderDrumList(){
       btn.textContent=v.var;btn.title=v.key;
       btn.onclick=()=>{
         const curTrack=lastState?lastState.selected_track:-1;
-        post({type:'load_sample',track_idx:curTrack,sample_key:v.key});
+        post({type:'load_sample',track_idx:curTrack,sample_key:v.key,track_type:'drum'});
         setTimeout(()=>loadSampleList().then(renderDrumList),300);
       };
       row.appendChild(btn);
@@ -2205,7 +2210,7 @@ function renderSampleCatalog(){
       loadBtn.textContent='Load';
       loadBtn.onclick=async()=>{
         const curTrack=lastState?lastState.selected_track:-1;
-        await post({type:'load_sample',track_idx:curTrack,sample_key:entry.key});
+        await post({type:'load_sample',track_idx:curTrack,sample_key:entry.key,track_type:'sample'});
         slCurrentKey=entry.key;
         renderSampleCatalog();renderSampleSettings();
       };
