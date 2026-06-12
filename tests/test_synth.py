@@ -1178,3 +1178,60 @@ def test_free_stop_clears_recording_state():
     s2 = reduce(s, TransportPressed(button="STOP", pressed=True))
     assert s2.free_recording is False
     assert s2.free_record_pending is False
+
+
+# ── Layered-loop playback (scheduler) ─────────────────────────────────────────
+
+import types
+
+
+class _CaptureEngine:
+    def __init__(self):
+        self.calls = []
+    def note_on(self, p, a, g, t):
+        self.calls.append(p)
+    def release_all(self):
+        self.calls.append("REL")
+
+
+def _loop_with_note(pitch, step=0):
+    steps = [StepNote.off() for _ in range(16)]
+    steps[step] = StepNote(on=True, pitches=(pitch,), velocity=100)
+    return Loop(steps=tuple(steps))
+
+
+def _bare_scheduler():
+    from eden.audio import StepScheduler
+    sched = StepScheduler.__new__(StepScheduler)
+    sched._mixer = types.SimpleNamespace(_sr=44100)
+    sched._arp_tracks = {}
+    return sched
+
+
+def test_layered_loops_on_one_track_both_fire():
+    """Two playing loops on the same track must both trigger (loop layering)."""
+    loops = list(default_track_loops())
+    loops[0] = _loop_with_note(60)
+    loops[1] = _loop_with_note(72)
+    track = SynthTrack(name="S", loops=tuple(loops))
+    eng = _CaptureEngine()
+    _bare_scheduler()._trigger_loops(
+        loops={(0, 0), (0, 1)}, tracks=(track,), offsets={}, playhead=0,
+        muted=frozenset(), bpm=120.0, get_engine=lambda i: eng, apply_effects=True,
+    )
+    assert sorted(eng.calls) == [60, 72]
+
+
+def test_retrigger_releases_once_across_layered_loops():
+    """With retrigger on, layered loops share a single release_all so they don't cut each other."""
+    loops = list(default_track_loops())
+    loops[0] = _loop_with_note(60)
+    loops[1] = _loop_with_note(72)
+    track = SynthTrack(name="S", loops=tuple(loops), retrigger=True)
+    eng = _CaptureEngine()
+    _bare_scheduler()._trigger_loops(
+        loops={(0, 0), (0, 1)}, tracks=(track,), offsets={}, playhead=0,
+        muted=frozenset(), bpm=120.0, get_engine=lambda i: eng, apply_effects=True,
+    )
+    assert eng.calls.count("REL") == 1
+    assert sorted(p for p in eng.calls if p != "REL") == [60, 72]

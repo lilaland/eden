@@ -20,7 +20,9 @@ import eden.sessions as sessions
 # ── Catalog ───────────────────────────────────────────────────────────────────
 
 def test_catalog_sample_type_exists():
-    assert "SAMPLE" in catalog.INSTRUMENT_TYPES
+    # SAMPLE was split into 1-SHOT (type 2) and CHOPPED (type 3)
+    assert "1-SHOT" in catalog.INSTRUMENT_TYPES
+    assert "CHOPPED" in catalog.INSTRUMENT_TYPES
 
 def test_catalog_sample_categories():
     cats = catalog.get_categories(2)

@@ -43,7 +43,7 @@ from eden.scales import degree_to_pitch, white_idx_to_midi, black_key_at
 from eden.arp import expand_chord, compute_arp_sequence, arp_ticks_per_note
 from eden.state import default_state, AppState, DrumTrack, SynthTrack, SampleTrack, InstrumentSubmode, Mode, NoteEvent, default_track_loops
 from eden.fx import FXProcessor
-from eden.events import AftertouchChanged, ClockTicked, InstrumentReset, InstrumentUndo, PadPressed, PadReleased, PlusMinusPressed, SessionLoaded, SoftkeyPressed, SongSlotPressed, TapTempoPressed, TransportPressed, TouchbarMoved
+from eden.events import AftertouchChanged, ClockTicked, EnterSampleRecordFlow, InstrumentReset, InstrumentUndo, PadPressed, PadReleased, PlusMinusPressed, SessionLoaded, SoftkeyPressed, SongSlotPressed, TapChopMark, TapTempoPressed, TransportPressed, TouchbarMoved, WebDemoSample
 from eden.state import Mode
 import eden.catalog as catalog
 import eden.sessions as sessions
@@ -103,6 +103,9 @@ class EdenApp:
         self._free_pad_down_times: dict[int, float] = {}
         # FREE arp mode: held pads per track so multi-pad arps cycle all pitches
         self._held_arp_pitches: dict[int, dict[int, int]] = {}  # track_idx → {pad_idx → pitch}
+        # Retrigger mode: pads currently held per synth track. A new note cuts
+        # prior voices only when this set is empty (so pads held together chord).
+        self._held_synth_pads: dict[int, set[int]] = {}  # track_idx → {pad_idx}
         self._fx_processors: dict[int, FXProcessor] = {}
         self._master_fx: FXProcessor = FXProcessor(sample_rate=44100)
         # DEMO preview state (new-slot picker SK4 hold-to-audition)
@@ -164,6 +167,11 @@ class EdenApp:
                 self._trigger_demo_preview(self._state)
                 continue
 
+            # Web library DEMO button → preview a catalog entry by key.
+            if isinstance(event, WebDemoSample):
+                self._trigger_demo_from_key(event.sample_key, event.track_type)
+                continue
+
             # FREE piano mode: record pad-down timestamp; enrich PadReleased with hold time.
             if isinstance(event, PadPressed) and self._is_free_piano_mode():
                 self._free_pad_down_times[event.pad_index] = time.time()
@@ -171,6 +179,11 @@ class EdenApp:
                 down_time = self._free_pad_down_times.pop(event.pad_index, time.time())
                 event = PadReleased(pad_index=event.pad_index,
                                     hold_seconds=time.time() - down_time)
+
+            # SAMPLE_TAP_CHOP: intercept PadPressed and convert to TapChopMark with timestamp.
+            if (isinstance(event, PadPressed)
+                    and self._state.instrument_submode == InstrumentSubmode.SAMPLE_TAP_CHOP):
+                event = TapChopMark(timestamp=time.time(), pad_index=event.pad_index)
 
             # Shift+STOP in INSTRUMENT: undo.
             if (isinstance(event, TransportPressed) and event.button == "STOP"
@@ -223,6 +236,8 @@ class EdenApp:
             # Aftertouch note-off: release held preview note when pad is lifted.
             if isinstance(event, PadReleased) and self._state.mode == Mode.INSTRUMENT:
                 self._maybe_release_synth_preview(event)
+                for _held in self._held_synth_pads.values():
+                    _held.discard(event.pad_index)
 
             # Channel pressure → update gain on active synth voices.
             if isinstance(event, AftertouchChanged):
@@ -269,6 +284,47 @@ class EdenApp:
         self._demo_timer.daemon = True
         self._demo_timer.start()
 
+    def _trigger_demo_from_key(self, sample_key: str, track_type: str = "sample") -> None:
+        """Fire a one-shot preview for a specific sample key (web library DEMO button)."""
+        import os
+        pad = self._state.selected_track
+        if self._demo_timer is not None:
+            self._demo_timer.cancel()
+            self._demo_timer = None
+        if self._demo_track_idx is not None:
+            self._mixer.remove_engine(self._demo_track_idx)
+            self._demo_track_idx = None
+
+        # Ensure the sample is loaded in the mixer.
+        if sample_key not in self._mixer.loaded_names():
+            path = os.path.join(self._mixer.sample_dir, sample_key + ".wav")
+            if os.path.isfile(path):
+                self._mixer.load(sample_key, path)
+            else:
+                return  # sample file not found, nothing to play
+
+        sr = self._mixer._sr
+        gate = int(2.0 * sr)
+        if track_type == "drum":
+            preview_track = DrumTrack(name="DEMO", sample_name=sample_key, loops=default_track_loops())
+        else:
+            preview_track = SampleTrack(name="DEMO", sample_key=sample_key, loops=default_track_loops())
+
+        engine = self._mixer.create_engine_for(preview_track)
+        self._mixer.assign_engine(pad, engine)
+        self._demo_track_idx = pad
+        engine.note_on(60, 0.8, gate, preview_track)
+
+        def _cleanup() -> None:
+            if self._demo_track_idx == pad:
+                self._mixer.remove_engine(pad)
+                self._demo_track_idx = None
+            self._demo_timer = None
+
+        self._demo_timer = threading.Timer(2.5, _cleanup)
+        self._demo_timer.daemon = True
+        self._demo_timer.start()
+
     def _maybe_trigger_sample_scrub(self, event: PadPressed) -> None:
         """Play sample from pad position in SAMPLE_EDIT bottom row (pads 0-15)."""
         if not self._state.armed_tracks or event.pad_index >= 16:
@@ -305,15 +361,37 @@ class EdenApp:
             engine.note_on(0, 0.8, gate, modified_track)
 
     def _maybe_trigger_sample_chop_preview(self, event: PadPressed) -> None:
-        """In SAMPLE_EDIT top row: tap selects AND fires the chop for preview."""
-        if not self._state.armed_tracks or event.pad_index < 16:
+        """In SAMPLE_EDIT top row: tap selects AND fires the chop/note for preview.
+
+        For 1-shot pitched tracks, bottom row pads trigger notes relative to root_note.
+        """
+        if not self._state.armed_tracks:
+            return
+        track_idx = self._state.armed_tracks[0]
+        track = self._state.tracks[track_idx]
+        if not isinstance(track, SampleTrack):
+            return
+
+        # Pitched 1-shot: bottom row (0-15) = chromatic notes around root
+        if (track.sample_mode == "oneshot" and track.pitched
+                and self._state.instrument_submode == InstrumentSubmode.SAMPLE_EDIT
+                and event.pad_index < 16):
+            engine = self._mixer.get_engine(track_idx)
+            if engine is None:
+                return
+            midi_pitch = track.root_note + (event.pad_index - 8)
+            sr = self._mixer._sr
+            gate = int(1.5 * sr)
+            engine.note_on(midi_pitch, event.velocity / 127.0, gate, track)
+            return
+
+        # Chopped: top row selects and previews chop
+        if event.pad_index < 16:
             return
         if self._state.instrument_submode != InstrumentSubmode.SAMPLE_EDIT:
             return
         chop_idx = event.pad_index - 16
-        track_idx = self._state.armed_tracks[0]
-        track = self._state.tracks[track_idx]
-        if not isinstance(track, SampleTrack) or chop_idx >= len(track.chops):
+        if chop_idx >= len(track.chops):
             return
         engine = self._mixer.get_engine(track_idx)
         if engine is None:
@@ -323,11 +401,15 @@ class EdenApp:
         engine.note_on(chop_idx, event.velocity / 127.0, gate, track)
 
     def _is_free_piano_mode(self) -> bool:
-        """True when INSTRUMENT mode is active with an unquantized SynthTrack armed."""
+        """True when INSTRUMENT mode is active with an unquantized SynthTrack or 1-shot SampleTrack armed."""
         if self._state.mode != Mode.INSTRUMENT or not self._state.armed_tracks:
             return False
         track = self._state.tracks[self._state.armed_tracks[0]]
-        return isinstance(track, SynthTrack) and not track.quantized
+        if isinstance(track, SynthTrack) and not track.quantized:
+            return True
+        if (isinstance(track, SampleTrack) and track.sample_mode == "oneshot" and not track.quantized):
+            return True
+        return False
 
     def _maybe_trigger_synth_preview(self, event: PadPressed) -> None:
         """Fire a short preview note when recording a pitch in synth pad modes."""
@@ -335,6 +417,38 @@ class EdenApp:
             return
         track_idx = self._state.armed_tracks[0]
         track = self._state.tracks[track_idx]
+
+        # Handle 1-shot pitched SampleTrack preview
+        if isinstance(track, SampleTrack) and track.sample_mode == "oneshot" and track.pitched:
+            pad = event.pad_index
+            if not track.quantized:
+                offset = self._state.pitch_window_offset
+                if pad < 16:
+                    pitch = white_idx_to_midi(offset + pad)
+                    if pitch < 0 or pitch > 127:
+                        return
+                else:
+                    pitch = black_key_at(offset + (pad - 16))
+                    if pitch is None or pitch < 0 or pitch > 127:
+                        return
+            else:
+                submode = self._state.instrument_submode
+                if submode == InstrumentSubmode.PADS:
+                    degree = self._state.pitch_window_offset + pad
+                elif submode == InstrumentSubmode.STEPS and pad < 16:
+                    degree = self._state.pitch_window_offset + pad
+                else:
+                    return
+                pitch = degree_to_pitch(track.root_note, track.scale, degree)
+            pitch = max(0, min(127, pitch + self._state.octave_offset * 12))
+            engine = self._mixer.get_engine(track_idx)
+            if engine is None:
+                return
+            sr = self._mixer._sr
+            gate = int(0.25 * sr)
+            engine.note_on(pitch, event.velocity / 127.0, gate, track)
+            return
+
         if not isinstance(track, SynthTrack):
             return
         pad = event.pad_index
@@ -362,6 +476,13 @@ class EdenApp:
         engine = self._mixer.get_engine(track_idx)
         if engine is None:
             return
+        # Retrigger: cut prior voices when this press starts a fresh gesture
+        # (no pads currently held). Pads held together still layer as a chord.
+        if getattr(track, "retrigger", False):
+            held = self._held_synth_pads.setdefault(track_idx, set())
+            if not held:
+                engine.release_all()
+            held.add(event.pad_index)
         # FREE mode: gate is effectively ∞ — pad release triggers note_off regardless of aftertouch
         # STEPS/PADS mode: short preview so the note doesn't linger
         if not track.quantized:
@@ -420,7 +541,10 @@ class EdenApp:
             return
         track_idx = self._state.armed_tracks[0]
         track = self._state.tracks[track_idx]
-        if not isinstance(track, SynthTrack) or track.quantized:
+        is_free_synth = isinstance(track, SynthTrack) and not track.quantized
+        is_free_oneshot = (isinstance(track, SampleTrack)
+                           and track.sample_mode == "oneshot" and not track.quantized)
+        if not (is_free_synth or is_free_oneshot):
             return  # quantized modes use short gate, no note_off needed
         from eden.engines import SynthEngine
         engine = self._mixer.get_engine(track_idx)
@@ -610,6 +734,15 @@ class EdenApp:
                         self._mixer.assign_finishing_engine(i, old_engine)
 
             self._mixer.remove_engine(i)
+            # Cancel any pending demo-preview cleanup for this slot so the
+            # timer doesn't race ahead and remove the real engine we're about
+            # to create (demo is at state.selected_track; creation can be at
+            # the same slot when the user presses INST immediately after DEMO).
+            if i == self._demo_track_idx:
+                if self._demo_timer is not None:
+                    self._demo_timer.cancel()
+                    self._demo_timer = None
+                self._demo_track_idx = None
             if new_t is not None:
                 self._mixer.assign_engine(i, self._mixer.create_engine_for(new_t))
 

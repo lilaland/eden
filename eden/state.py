@@ -46,6 +46,7 @@ class InstrumentSubmode(Enum):
     SAMPLE_RECORD = auto() # input → trim → chop-detect (scaffold for now)
     SAMPLE_KEYS = auto()  # all pads = chromatic keyboard for selected chop
     SAMPLE_EDIT = auto()  # top row = chop selector, bottom row = waveform scrub/trim
+    SAMPLE_TAP_CHOP = auto()  # tap pads during playback to mark chop boundaries
 
 
 @dataclass(frozen=True)
@@ -131,6 +132,7 @@ class SynthTrack:
     scale: str = "chromatic"       # key in scales.SCALES
     quantized: bool = True         # True = scale-degree step editor; False = piano keyboard
     aftertouch: bool = True        # channel pressure enabled
+    retrigger: bool = False        # True = new notes cut prior voices (still allows chords)
     keep_empty: bool = False
     fx: FXChain = field(default_factory=FXChain)
 
@@ -153,6 +155,12 @@ class SampleTrack:
     keep_empty: bool = False
     stretch_mode: str = "off"    # "off" | "repitch" | "stretch"
     stretch_bars: int = 1        # target loop length in bars (used when stretch_mode != "off")
+    sample_mode: str = "chopped"  # "oneshot" | "chopped" — structural playback mode
+    pitched: bool = False         # oneshot only: pitch by MIDI note relative to root_note
+    root_note: int = 60           # MIDI root for pitched 1-shot pitch_rate computation
+    scale: str = "chromatic"      # scale for 1-shot pitched step recording
+    quantized: bool = True         # True=scale-degree pads, False=piano free mode
+    chop_clipboard: object = None  # ephemeral copy/paste buffer (not serialized)
     fx: FXChain = field(default_factory=FXChain)
 
 
@@ -214,6 +222,7 @@ class AppState:
     # Single-level undo for INSTRUMENT mode recording actions
     undo_snapshot: Optional[tuple] = None  # tracks tuple before last edit
     undo_cursor: int = 0                   # step_cursor at time of snapshot
+    sample_edit_snapshot: Optional[tuple] = None  # tracks snapshot taken when entering SAMPLE_EDIT for 1-shot
     # Session management (M2)
     active_session_slot: int = 0            # 0-7 → A-H, which slot is currently loaded
     active_loops: frozenset[tuple[int, int]] = frozenset()  # loops that auto-start on session load
@@ -251,6 +260,7 @@ class AppState:
     # SampleTrack ephemeral state
     sample_chop_cursor: int = 0      # selected chop index in SAMPLE_CHOPS / SAMPLE_KEYS
     sample_recording: bool = False   # True while audio input is being recorded
+    tap_chop_times: tuple = ()       # wall-clock timestamps collected during SAMPLE_TAP_CHOP
     # Available sample pool (populated from web Sample Manager or default set on startup)
     available_samples: tuple[str, ...] = ()
 

@@ -259,6 +259,13 @@ class AudioMixer:
     def get_engine(self, track_idx: int) -> Optional[TrackEngine]:
         return self._engines.get(track_idx)
 
+    def get_playback_cursor(self, track_idx: int) -> float:
+        """Return current sample read position (0–1) for the given track, or -1.0."""
+        engine = self._engines.get(track_idx)
+        if engine is not None and hasattr(engine, 'playback_cursor'):
+            return engine.playback_cursor
+        return -1.0
+
     def assign_finishing_engine(self, track_idx: int, engine: TrackEngine) -> None:
         self._finishing_engines[track_idx] = engine
         self._finishing_snapshot = list(self._finishing_engines.values())
@@ -444,6 +451,7 @@ class StepScheduler:
             if track is None or track_idx in muted:
                 continue
 
+            retrig_released = False  # retrigger releases prior voices once per track/tick
             for loop_idx, loop in enumerate(track.loops):
                 key = (track_idx, loop_idx)
                 if key not in loops:
@@ -469,7 +477,7 @@ class StepScheduler:
                         step = loop.steps[effective_step]
                         if step.on:
                             if step.probability < 100 and random.randint(1, 100) > step.probability:
-                                break
+                                continue
                             engine = get_engine(track_idx)
                             if engine is not None:
                                 gate_samples = max(1, int(step.gate * step_secs * sr))
@@ -477,8 +485,11 @@ class StepScheduler:
                                 pitches = step.pitches
                                 if isinstance(track, SampleTrack):
                                     engine.note_on(pitches[0] if pitches else 0, amplitude, gate_samples, track)
-                                    break
+                                    continue
                                 if apply_effects and isinstance(track, SynthTrack):
+                                    if getattr(track, "retrigger", False) and not retrig_released:
+                                        engine.release_all()
+                                        retrig_released = True
                                     if loop.chord_on:
                                         pitches = expand_chord(pitches, loop.chord_type)
                                     if loop.arp_on and loop.arp_mode != "chord":
@@ -496,12 +507,12 @@ class StepScheduler:
                                                 }
                                             else:
                                                 self._arp_tracks.pop(track_idx, None)
-                                        break
+                                        continue
                                     elif loop.arp_on and loop.arp_mode == "chord":
                                         pitches = compute_arp_sequence(pitches, "chord", loop.arp_octaves)
                                 for p in pitches:
                                     engine.note_on(p, amplitude, gate_samples, track)
-                                break  # step fired; don't check further loops for this track
+                                continue  # this loop fired; let sibling loops layer too
 
                 # ── Path B: free-events playback (unquantized timing) ────────
                 # Fires on every tick — each NoteEvent carries its exact raw tick position

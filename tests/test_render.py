@@ -698,9 +698,9 @@ def test_synth_oled_page2_chord_controls():
 
 
 def test_synth_oled_page2_has_vel_sk5():
-    """Page 2 shows VEL/MONO on SK5; SK4 is left empty."""
+    """Page 2 shows RETRIG on SK4 and VEL/MONO on SK5."""
     oled = render_oled(_synth_armed_state(page=2))
-    assert OLED_BTN4_TITLE not in oled
+    assert _t(oled, OLED_BTN4_TITLE) == "RETRIG"
     from controller_map import OLED_BTN5_TITLE as SK5T
     assert SK5T in oled
     assert oled[SK5T][0] in ("VEL", "MONO")

@@ -166,13 +166,56 @@ class LoadSample(Event):
     track_type is used only when the target slot is empty:
       "drum"   → create a DrumTrack
       "sample" → create a SampleTrack (default)
+    sample_mode / pitched are forwarded to the new SampleTrack when slot is empty.
     """
     track_idx: int
     sample_key: str
     track_type: str = "sample"
+    sample_mode: str = "chopped"   # "oneshot" | "chopped"
+    pitched: bool = False
 
 
 @dataclass(frozen=True)
 class SetAvailableSamples(Event):
     """Update the available sample pool (from web Sample Manager)."""
     keys: tuple  # tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WebDemoSample(Event):
+    """Trigger a short audio preview for a catalog entry from the web library."""
+    sample_key: str
+    track_type: str = "sample"  # "drum" | "sample"
+
+
+@dataclass(frozen=True)
+class RemoveTrack(Event):
+    """Remove a track from the session (set slot to None)."""
+    track_idx: int
+
+
+@dataclass(frozen=True)
+class TapChopMark(Event):
+    """One tap during SAMPLE_TAP_CHOP mode; app.py intercepts PadPressed to inject timestamp."""
+    timestamp: float
+    pad_index: int
+
+
+@dataclass(frozen=True)
+class CopyChop(Event):
+    """Copy a chop to the track's clipboard for later paste."""
+    track_idx: int
+    chop_idx: int
+
+
+@dataclass(frozen=True)
+class PasteChop(Event):
+    """Paste the clipboard chop over the target slot (replaces or appends)."""
+    track_idx: int
+    chop_idx: int
+
+
+@dataclass(frozen=True)
+class EnterSampleRecordFlow(Event):
+    """Begin a new-sample recording flow for the given track slot."""
+    track_idx: int

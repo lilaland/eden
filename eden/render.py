@@ -238,6 +238,93 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
                             else:
                                 pads[pad_idx] = _dim(PAD_INACTIVE)
 
+                elif (isinstance(track, SampleTrack)
+                      and track.sample_mode == "oneshot"
+                      and state.instrument_submode in (InstrumentSubmode.STEPS, InstrumentSubmode.PADS)):
+                    # ── 1-shot SampleTrack in STEPS/PADS: render like SynthTrack ────
+                    if not track.quantized:
+                        # FREE piano: pitch_window_offset = white key index of leftmost pad
+                        woff = state.pitch_window_offset
+                        for col in range(16):
+                            pitch = white_idx_to_midi(woff + col)
+                            if pitch < 0 or pitch > 127:
+                                pads[col] = PAD_OFF
+                                continue
+                            root_semi = pitch % 12
+                            in_scale = note_in_scale(pitch, track.root_note, track.scale)
+                            if root_semi == track.root_note % 12:
+                                pads[col] = ACCENT_GOLD
+                            elif in_scale:
+                                pads[col] = color
+                            else:
+                                pads[col] = _dim(PAD_INACTIVE)
+                        for col in range(16):
+                            pitch = black_key_at(woff + col)
+                            if pitch is None or pitch < 0 or pitch > 127:
+                                pads[col + 16] = PAD_OFF
+                            else:
+                                root_semi = pitch % 12
+                                in_scale = note_in_scale(pitch, track.root_note, track.scale)
+                                if root_semi == track.root_note % 12:
+                                    pads[col + 16] = _dim(ACCENT_GOLD)
+                                elif in_scale:
+                                    pads[col + 16] = _dim(color)
+                                else:
+                                    pads[col + 16] = PAD_INACTIVE
+                    elif state.instrument_submode == InstrumentSubmode.PADS:
+                        # PADS mode: all 32 pads = scale degrees (keyboard)
+                        for pad_idx in range(32):
+                            degree = state.pitch_window_offset + pad_idx
+                            pitch = degree_to_pitch(track.root_note, track.scale, degree)
+                            if is_root(track.root_note, pitch):
+                                pads[pad_idx] = _dim(ACCENT_GOLD)
+                            else:
+                                pads[pad_idx] = _dim(color)
+                    else:
+                        # STEPS mode: top row = steps, bottom row = pitch window
+                        loop = track.loops[state.selected_loop]
+                        key_pair = (track_idx, state.selected_loop)
+                        playing_measure = dict(state.loop_measure_offsets).get(key_pair, 0)
+                        is_playing_loop = key_pair in state.playing_loops
+                        spb = loop.steps_per_bar
+                        step_in_bar = state.playhead * spb // 32
+                        global_firing_step = step_in_bar + playing_measure * spb
+                        ph_step = global_firing_step
+
+                        for col in range(16):
+                            pad_idx = col + 16
+                            step_idx = view_m * 16 + col
+                            if step_idx >= loop.step_count:
+                                pads[pad_idx] = PAD_OFF
+                                continue
+                            is_cursor = step_idx == state.step_cursor
+                            is_ph = is_playing_loop and ph_step == step_idx
+                            step_on = loop.steps[step_idx].on
+                            if is_ph:
+                                pads[pad_idx] = PAD_PLAYHEAD
+                            elif is_cursor and step_on:
+                                pads[pad_idx] = _brighten(PAD_PINK)
+                            elif is_cursor:
+                                pads[pad_idx] = PAD_PINK
+                            elif step_on:
+                                pads[pad_idx] = color
+                            else:
+                                pads[pad_idx] = PAD_INACTIVE
+
+                        cursor_step = loop.steps[state.step_cursor] if state.step_cursor < loop.step_count else None
+                        cursor_pitches: set[int] = set()
+                        if cursor_step and cursor_step.on:
+                            cursor_pitches = set(cursor_step.pitches)
+                        for pad_idx in range(16):
+                            degree = state.pitch_window_offset + pad_idx
+                            pitch = degree_to_pitch(track.root_note, track.scale, degree)
+                            if pitch in cursor_pitches:
+                                pads[pad_idx] = color
+                            elif is_root(track.root_note, pitch):
+                                pads[pad_idx] = _dim(ACCENT_GOLD)
+                            else:
+                                pads[pad_idx] = _dim(PAD_INACTIVE)
+
                 elif isinstance(track, SampleTrack) and state.instrument_submode == InstrumentSubmode.SAMPLE_KEYS:
                     # ── SampleTrack SAMPLE_KEYS mode: chromatic keyboard ──────────
                     # Pad 15 = root (0 semitones), 16-31 = +1 to +16, 0-14 = -15 to -1
@@ -286,6 +373,23 @@ def render_pads(state: AppState) -> tuple[tuple[int, int, int], ...]:
                             pads[pad_idx] = PAD_ACTIVE
                         else:
                             pads[pad_idx] = PAD_INACTIVE
+
+                elif isinstance(track, SampleTrack) and state.instrument_submode == InstrumentSubmode.SAMPLE_TAP_CHOP:
+                    # ── SAMPLE_TAP_CHOP mode ──────────────────────────────────
+                    # All pads dim purple; bottom row lights up to show tap positions
+                    TAP_BASE = (60, 0, 80)
+                    TAP_MARK = (180, 0, 220)
+                    n_taps = len(state.tap_chop_times)
+                    for p in range(32):
+                        pads[p] = TAP_BASE
+                    if n_taps >= 2:
+                        times = sorted(state.tap_chop_times)
+                        t0, t_end = times[0], times[-1]
+                        span = t_end - t0
+                        if span > 0:
+                            for t in times:
+                                pad_idx = round((t - t0) / span * 15)
+                                pads[pad_idx] = TAP_MARK
 
                 elif isinstance(track, SampleTrack) and state.instrument_submode == InstrumentSubmode.SAMPLE_EDIT:
                     # ── SampleTrack SAMPLE_EDIT mode ──────────────────────────
@@ -484,12 +588,13 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
         if state.tracks[state.selected_track] is None:
             types = catalog.INSTRUMENT_TYPES
             type_name = types[state.new_slot_type_idx] if state.new_slot_type_idx < len(types) else "?"
-            cats = catalog.get_categories(state.new_slot_type_idx)
+            cats = catalog.get_categories(state.new_slot_type_idx, state.available_samples)
             cat_name = cats[state.new_slot_cat_idx] if cats and state.new_slot_cat_idx < len(cats) else "-"
             vars_ = catalog.get_variations(state.new_slot_type_idx, state.new_slot_cat_idx, state.available_samples)
             var_name = vars_[state.new_slot_var_idx] if vars_ and state.new_slot_var_idx < len(vars_) else "-"
             trk_name, _ = catalog.get_track_params(
-                state.new_slot_type_idx, state.new_slot_cat_idx, state.new_slot_var_idx
+                state.new_slot_type_idx, state.new_slot_cat_idx, state.new_slot_var_idx,
+                state.available_samples,
             )
             ctrl = state.new_slot_active_ctrl
             is_keys = state.new_slot_type_idx == 1
@@ -500,10 +605,16 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
             _set(OLED_MAIN_LINE2, f"{cat_name} / {var_name}")
             _set(OLED_BTN1_TITLE, "TYPE", type_color)
             _set(OLED_BTN1_VALUE, type_name)
+            is_sample = state.new_slot_type_idx in (2, 3)
             if is_keys:
                 _set(OLED_BTN2_TITLE, "FOLDER", cat_color)
                 _set(OLED_BTN2_VALUE, cat_name)
                 _set(OLED_BTN3_TITLE, "PRESET", var_color)
+                _set(OLED_BTN3_VALUE, var_name)
+            elif is_sample:
+                _set(OLED_BTN2_TITLE, "CATEG", cat_color)
+                _set(OLED_BTN2_VALUE, cat_name)
+                _set(OLED_BTN3_TITLE, "SMPL", var_color)
                 _set(OLED_BTN3_VALUE, var_name)
             else:
                 _set(OLED_BTN2_TITLE, "CATEG", cat_color)
@@ -617,6 +728,14 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
                 page_ind = "".join(dots)
                 rec_prefix = "● " if state.free_recording else ""
                 main_line1 = f"{rec_prefix}{t.name} {scale_short}/{pitch_name(t.root_note)} {page_ind}"
+            elif (isinstance(t, SampleTrack) and t.sample_mode == "oneshot"
+                  and state.instrument_submode in (InstrumentSubmode.STEPS, InstrumentSubmode.PADS)):
+                scale_short = SCALE_SHORT.get(t.scale, t.scale[:5].upper())
+                page = state.instrument_oled_page
+                dots = ["○", "○", "○", "○"]
+                dots[min(page, 3)] = "●"
+                page_ind = "".join(dots)
+                main_line1 = f"{t.name} 1-SHOT {scale_short}/{pitch_name(t.root_note)} {page_ind}"
             else:
                 main_line1 = t.name if t is not None else "EMPTY"
         else:
@@ -699,8 +818,117 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
 
         # ── SampleTrack OLED ──────────────────────────────────────────────────
         if isinstance(first_track, SampleTrack):
-            # SAMPLE_EDIT submode: chop waveform editor
+            # 1-shot in STEPS/PADS: show synth-style pages
+            if (first_track.sample_mode == "oneshot"
+                    and state.instrument_submode in (InstrumentSubmode.STEPS, InstrumentSubmode.PADS)):
+                scale_short = SCALE_SHORT.get(first_track.scale, first_track.scale[:5].upper())
+                page = state.instrument_oled_page
+                if page == 0:
+                    root_color_val = NOTE_COLORS.get(first_track.root_note % 12, _OLED_DIM)
+                    scale_color = _OLED_ACTIVE if ctrl == "SCALE" else _OLED_DIM
+                    root_color  = _OLED_ACTIVE if ctrl == "ROOT"  else root_color_val
+                    bars_color  = _OLED_ACTIVE if ctrl == "BARS"  else _OLED_DIM
+                    mode_label  = "FREE" if not first_track.quantized else "STEP"
+                    mode_color  = _OLED_ACTIVE if not first_track.quantized else _OLED_DIM
+                    loop_bars = first_track.loops[state.selected_loop].bars
+                    dots = ["○", "○", "○"]
+                    dots[min(page, 2)] = "●"
+                    _set(OLED_MAIN_LINE1, f"{first_track.name}  1-SHOT  {mode_label}  {''.join(dots)}")
+                    _set(OLED_MAIN_LINE2, f"root:{pitch_name(first_track.root_note)}  {first_track.scale[:4].upper()}")
+                    _set(OLED_BTN1_TITLE, "SCALE", scale_color)
+                    _set(OLED_BTN1_VALUE, scale_short)
+                    _set(OLED_BTN2_TITLE, "ROOT", root_color)
+                    _set(OLED_BTN2_VALUE, pitch_name(first_track.root_note))
+                    _set(OLED_BTN3_TITLE, "BARS", bars_color)
+                    _set(OLED_BTN3_VALUE, str(loop_bars))
+                    _set(OLED_BTN4_TITLE, mode_label, mode_color)
+                    _set(OLED_BTN5_TITLE, "EDIT", _OLED_DIM)
+                elif page == 1:
+                    # Arp: same as SynthTrack page 1
+                    dots = ["○", "○", "○"]
+                    dots[min(page, 2)] = "●"
+                    sel_loop = first_track.loops[state.selected_loop]
+                    arp_on_color = _OLED_ACTIVE if sel_loop.arp_on else _OLED_DIM
+                    mode_color   = _OLED_ACTIVE if ctrl == "ARP_MODE" else _OLED_DIM
+                    rate_color   = _OLED_ACTIVE if ctrl == "ARP_RATE" else _OLED_DIM
+                    oct_color    = _OLED_ACTIVE if ctrl == "ARP_OCT"  else _OLED_DIM
+                    _set(OLED_MAIN_LINE1, f"{first_track.name}  1-SHOT  {''.join(dots)}")
+                    _set(OLED_BTN1_TITLE, "ARP", arp_on_color)
+                    _set(OLED_BTN1_VALUE, "ON" if sel_loop.arp_on else "OFF")
+                    _set(OLED_BTN2_TITLE, "MODE", mode_color)
+                    _set(OLED_BTN2_VALUE, sel_loop.arp_mode.upper()[:5])
+                    _set(OLED_BTN3_TITLE, "CLEAR", _OLED_DIM)
+                    _set(OLED_BTN4_TITLE, "RATE", rate_color)
+                    _set(OLED_BTN4_VALUE, f"1/{sel_loop.arp_rate}")
+                    _set(OLED_BTN5_TITLE, "OCTAVES", oct_color)
+                    _set(OLED_BTN5_VALUE, str(sel_loop.arp_octaves))
+                elif page == 2:
+                    # Chord: same as SynthTrack page 2
+                    dots = ["○", "○", "○"]
+                    dots[min(page, 2)] = "●"
+                    sel_loop = first_track.loops[state.selected_loop]
+                    chord_on_color = _OLED_ACTIVE if sel_loop.chord_on else _OLED_DIM
+                    ctype_color    = _OLED_ACTIVE if ctrl == "CHORD_TYPE" else _OLED_DIM
+                    _set(OLED_MAIN_LINE1, f"{first_track.name}  1-SHOT  {''.join(dots)}")
+                    _set(OLED_BTN1_TITLE, "CHORD", chord_on_color)
+                    _set(OLED_BTN1_VALUE, "ON" if sel_loop.chord_on else "OFF")
+                    _set(OLED_BTN2_TITLE, "TYPE", ctype_color)
+                    _set(OLED_BTN2_VALUE, sel_loop.chord_type.upper()[:5])
+                return out
+
+            # SAMPLE_EDIT submode
             if state.instrument_submode == InstrumentSubmode.SAMPLE_EDIT:
+                if first_track.sample_mode == "oneshot":
+                    # 4-page sample edit submenu for 1-shot
+                    page = state.instrument_oled_page
+                    _set(OLED_BTN1_TITLE, "← BACK", _OLED_DIM)
+                    _set(OLED_BTN5_TITLE, "COMMIT", _OLED_DIM)
+                    if page == 0:  # Trim
+                        start_pct = f"{first_track.trim_start * 100:.1f}%"
+                        end_pct = f"{first_track.trim_end * 100:.1f}%"
+                        _set(OLED_MAIN_LINE1, f"{first_track.name}  TRIM ●○○○")
+                        _set(OLED_MAIN_LINE2, f"K1 start:{start_pct}  K2 end:{end_pct}")
+                        _set(OLED_BTN2_TITLE, "START", _OLED_DIM)
+                        _set(OLED_BTN2_VALUE, start_pct)
+                        _set(OLED_BTN3_TITLE, "END", _OLED_DIM)
+                        _set(OLED_BTN3_VALUE, end_pct)
+                        _set(OLED_BTN4_TITLE, "", _OLED_DIM)
+                    elif page == 1:  # Envelope
+                        atk = first_track.amp_attack
+                        atk_str = f"{round(atk * 1000)}ms" if atk < 1.0 else f"{atk:.2f}s"
+                        rel = first_track.amp_release
+                        rel_str = f"{round(rel * 1000)}ms" if rel < 1.0 else f"{rel:.2f}s"
+                        vol_str = f"{first_track.volume:.2f}"
+                        _set(OLED_MAIN_LINE1, f"{first_track.name}  ENV ○●○○")
+                        _set(OLED_MAIN_LINE2, f"atk:{atk_str}  rel:{rel_str}  vol:{vol_str}")
+                        _set(OLED_BTN2_TITLE, "ATK", _OLED_DIM)
+                        _set(OLED_BTN2_VALUE, atk_str)
+                        _set(OLED_BTN3_TITLE, "REL", _OLED_DIM)
+                        _set(OLED_BTN3_VALUE, rel_str)
+                        _set(OLED_BTN4_TITLE, "VOL", _OLED_DIM)
+                        _set(OLED_BTN4_VALUE, vol_str)
+                    elif page == 2:  # Stretch
+                        sm = first_track.stretch_mode
+                        sb = first_track.stretch_bars
+                        _set(OLED_MAIN_LINE1, f"{first_track.name}  STRETCH ○○●○")
+                        _set(OLED_MAIN_LINE2, f"K1 mode:{sm.upper()}  K2 bars:{sb}")
+                        _set(OLED_BTN2_TITLE, "MODE", _OLED_DIM)
+                        _set(OLED_BTN2_VALUE, sm.upper()[:6])
+                        _set(OLED_BTN3_TITLE, "BARS", _OLED_DIM)
+                        _set(OLED_BTN3_VALUE, str(sb))
+                        _set(OLED_BTN4_TITLE, "", _OLED_DIM)
+                    elif page == 3:  # Pan
+                        pan_str = f"{first_track.pan:+.2f}"
+                        mg = first_track.mute_group
+                        mg_str = str(mg) if mg > 0 else "off"
+                        _set(OLED_MAIN_LINE1, f"{first_track.name}  PAN ○○○●")
+                        _set(OLED_MAIN_LINE2, f"K1 pan:{pan_str}  mute:{mg_str}")
+                        _set(OLED_BTN2_TITLE, "PAN", _OLED_DIM)
+                        _set(OLED_BTN2_VALUE, pan_str)
+                        _set(OLED_BTN3_TITLE, "", _OLED_DIM)
+                        _set(OLED_BTN4_TITLE, "", _OLED_DIM)
+                    return out
+                # Chopped tracks: original waveform editor
                 n_chops = len(first_track.chops)
                 sel_chop = state.sample_chop_cursor
                 if n_chops > 0 and sel_chop < n_chops:
@@ -721,6 +949,18 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
                 _set(OLED_BTN4_TITLE, "SCRUB", _OLED_DIM)
                 _set(OLED_BTN4_VALUE, "PRESS")
                 _set(OLED_BTN5_TITLE, "", _OLED_DIM)
+                return out
+
+            # SAMPLE_TAP_CHOP submode: dedicated OLED layout
+            if state.instrument_submode == InstrumentSubmode.SAMPLE_TAP_CHOP:
+                n_taps = len(state.tap_chop_times)
+                _set(OLED_MAIN_LINE1, f"{first_track.name}  TAP CHOP")
+                _set(OLED_MAIN_LINE2, f"{n_taps} taps — tap pads to mark")
+                _set(OLED_BTN1_TITLE, "CANCEL", _OLED_DIM)
+                _set(OLED_BTN2_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN3_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN4_TITLE, "CLEAR", _OLED_DIM)
+                _set(OLED_BTN5_TITLE, "COMMIT", _OLED_DIM)
                 return out
 
             # SAMPLE_KEYS submode: dedicated OLED layout
@@ -760,7 +1000,7 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
                 sub_str = "CHOPS" if state.instrument_submode == InstrumentSubmode.SAMPLE_CHOPS else "STEPS"
                 _set(OLED_BTN1_TITLE, "EDIT", _OLED_DIM)
                 _set(OLED_BTN2_TITLE, "KEYS", _OLED_DIM)
-                _set(OLED_BTN3_TITLE, "", _OLED_DIM)
+                _set(OLED_BTN3_TITLE, "TAP", _OLED_DIM)
                 _set(OLED_BTN4_TITLE, "< BACK", _OLED_DIM)
                 _set(OLED_BTN5_TITLE, sub_str, _OLED_DIM)
             elif page == 1:
@@ -918,6 +1158,9 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
                 _set(OLED_BTN2_VALUE, sel_loop.chord_type.upper()[:5])
                 _set(OLED_BTN3_TITLE, "VOICES", voices_color)
                 _set(OLED_BTN3_VALUE, str(first_track.max_voices))
+                retrig_color = _OLED_ACTIVE if first_track.retrigger else _OLED_DIM
+                _set(OLED_BTN4_TITLE, "RETRIG", retrig_color)
+                _set(OLED_BTN4_VALUE, "ON" if first_track.retrigger else "OFF")
                 vel_color = _OLED_ACTIVE if state.vel_sensitive else _OLED_DIM
                 _set(OLED_BTN5_TITLE, "VEL" if state.vel_sensitive else "MONO", vel_color)
             elif page == 3:
@@ -969,8 +1212,10 @@ def render_oled(state: AppState) -> dict[int, tuple[str, int, int, int]]:
             elif state.instrument_oled_page == 1:
                 keep = getattr(first_track, 'keep_empty', False)
                 keep_color = _OLED_ACTIVE if keep else _OLED_DIM
+                vel_color  = _OLED_ACTIVE if state.vel_sensitive else _OLED_DIM
                 _set(OLED_BTN1_TITLE, "KEEP", keep_color)
                 _set(OLED_BTN1_VALUE, "YES" if keep else "NO")
+                _set(OLED_BTN3_TITLE, "VEL" if state.vel_sensitive else "MONO", vel_color)
                 _set(OLED_BTN5_TITLE, "DELETE", _OLED_DISABLED)
 
     return out

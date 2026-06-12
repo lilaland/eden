@@ -28,13 +28,16 @@ from eden.events import (
     ArrowPressed,
     AutoChop,
     ClockTicked,
+    CopyChop,
     EncoderTurned,
+    EnterSampleRecordFlow,
     Event,
     MetronomePressed,
     ModeButtonPressed,
     NormalizeAction,
     PadPressed,
     PadReleased,
+    PasteChop,
     PlusMinusPressed,
     SampleRecordStart,
     SampleRecordStop,
@@ -44,12 +47,14 @@ from eden.events import (
     ShiftChanged,
     SoftkeyPressed,
     SongSlotPressed,
+    TapChopMark,
     TapTempoPressed,
     TouchbarMoved,
     TransportPressed,
     InstrumentUndo,
     InstrumentReset,
     LoadSample,
+    RemoveTrack,
     SetAvailableSamples,
     WebSelectCell,
 )
@@ -98,6 +103,16 @@ def reduce(state: AppState, event: Event) -> AppState:
         return _load_sample(state, event)
     if isinstance(event, SetAvailableSamples):
         return dataclasses.replace(state, available_samples=tuple(event.keys))
+    if isinstance(event, RemoveTrack):
+        return _remove_track(state, event)
+    if isinstance(event, TapChopMark):
+        return _on_tap_chop_mark(state, event)
+    if isinstance(event, CopyChop):
+        return _copy_chop(state, event)
+    if isinstance(event, PasteChop):
+        return _paste_chop(state, event)
+    if isinstance(event, EnterSampleRecordFlow):
+        return _enter_sample_record_flow(state, event)
     if isinstance(event, WebSelectCell):
         t = max(0, min(15, event.track))
         lo = max(0, min(15, event.loop))
@@ -106,6 +121,14 @@ def reduce(state: AppState, event: Event) -> AppState:
     if isinstance(event, EncoderTurned) and state.metronome_held and event.encoder == 9:
         new_bpm = max(20.0, min(300.0, state.tempo_bpm + event.delta))
         return dataclasses.replace(state, tempo_bpm=float(new_bpm))
+    # SAMPLE_EDIT for 1-shot: knobs 1-4 override FX knobs
+    if (isinstance(event, EncoderTurned) and 1 <= event.encoder <= 4
+            and state.mode == Mode.INSTRUMENT
+            and state.instrument_submode == InstrumentSubmode.SAMPLE_EDIT
+            and state.armed_tracks):
+        _first = state.tracks[state.armed_tracks[0]]
+        if isinstance(_first, SampleTrack) and _first.sample_mode == "oneshot":
+            return _sample_edit_encoder(state, event)
     # EDIT mode: encoders 1-8 control FX params
     if isinstance(event, EncoderTurned) and state.edit_mode and 1 <= event.encoder <= 8:
         return _fx_encoder(state, event)
@@ -318,9 +341,13 @@ def _on_mode_button(state: AppState, event: ModeButtonPressed) -> AppState:
             # Empty slot — create track from picker and enter INSTRUMENT,
             # saving current arm state to restore when returning to SESSION.
             state = _create_new_slot_track(state)
-            sub = (InstrumentSubmode.SAMPLE_CHOPS
-                   if isinstance(state.tracks[state.selected_track], SampleTrack)
-                   else InstrumentSubmode.STEPS)
+            created = state.tracks[state.selected_track]
+            if isinstance(created, SampleTrack):
+                sub = (InstrumentSubmode.STEPS
+                       if created.sample_mode == "oneshot"
+                       else InstrumentSubmode.SAMPLE_CHOPS)
+            else:
+                sub = InstrumentSubmode.STEPS
             return dataclasses.replace(
                 state,
                 armed_tracks=(state.selected_track,),
@@ -333,9 +360,12 @@ def _on_mode_button(state: AppState, event: ModeButtonPressed) -> AppState:
             return dataclasses.replace(state, mode=Mode.INSTRUMENT)
         # Nothing armed yet — arm selected track and enter INSTRUMENT.
         sel_track = state.tracks[state.selected_track]
-        sub = (InstrumentSubmode.SAMPLE_CHOPS
-               if isinstance(sel_track, SampleTrack)
-               else InstrumentSubmode.STEPS)
+        if isinstance(sel_track, SampleTrack):
+            sub = (InstrumentSubmode.STEPS
+                   if sel_track.sample_mode == "oneshot"
+                   else InstrumentSubmode.SAMPLE_CHOPS)
+        else:
+            sub = InstrumentSubmode.STEPS
         new_offset = state.pitch_window_offset
         if isinstance(sel_track, SynthTrack) and not sel_track.quantized:
             # FREE piano mode: ensure offset is centred on root, not a stale degree index
@@ -538,7 +568,7 @@ def _new_slot_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
                                    new_slot_cat_idx=0, new_slot_var_idx=0, new_slot_mode_idx=0,
                                    new_slot_active_ctrl="TYPE")
     if event.key == 1:  # SK2: cycle CAT + activate
-        cats = catalog.get_categories(state.new_slot_type_idx)
+        cats = catalog.get_categories(state.new_slot_type_idx, state.available_samples)
         if cats:
             new_idx = (state.new_slot_cat_idx + 1) % len(cats)
             return dataclasses.replace(state, new_slot_cat_idx=new_idx,
@@ -573,7 +603,7 @@ def _create_new_slot_track(state: AppState) -> AppState:
     """Create a track at the selected empty slot using the current picker values."""
     pad = state.selected_track
     type_idx = state.new_slot_type_idx
-    name, param = catalog.get_track_params(type_idx, state.new_slot_cat_idx, state.new_slot_var_idx)
+    name, param = catalog.get_track_params(type_idx, state.new_slot_cat_idx, state.new_slot_var_idx, state.available_samples)
     if type_idx == 1:  # KEYS → SynthTrack
         extras = catalog.get_synth_preset_extras(state.new_slot_cat_idx, state.new_slot_var_idx)
         new_track = SynthTrack(name=name, loops=default_track_loops(), osc_type=param,
@@ -582,8 +612,14 @@ def _create_new_slot_track(state: AppState) -> AppState:
                                root_note=state.last_synth_root,
                                **extras)
         init_offset = _free_piano_init_offset((new_track,))
-    elif type_idx == 2:  # SAMPLE → SampleTrack
-        new_track = SampleTrack(name=name, sample_key=param, loops=default_track_loops())
+    elif type_idx in (2, 3):  # 1-SHOT or CHOPPED → SampleTrack
+        if param == catalog._RECORD_SENTINEL:
+            # User chose "record new" — mark slot as active without creating a real track;
+            # app.py will fire EnterSampleRecordFlow after seeing new_slot_active_ctrl="".
+            return dataclasses.replace(state, new_slot_active_ctrl="")
+        mode = "oneshot" if type_idx == 2 else "chopped"
+        new_track = SampleTrack(name=name, sample_key=param, loops=default_track_loops(),
+                                sample_mode=mode, pitched=(mode == "oneshot"))
         init_offset = state.pitch_window_offset
     else:  # DRUMS → DrumTrack
         new_track = DrumTrack(name=name, sample_name=param, loops=default_track_loops())
@@ -711,7 +747,7 @@ def _new_slot_encoder(state: AppState, event: EncoderTurned) -> AppState:
                                    new_slot_type_idx=new_idx,
                                    new_slot_cat_idx=0, new_slot_var_idx=0, new_slot_mode_idx=0)
     if ctrl == "CAT":
-        cats = catalog.get_categories(state.new_slot_type_idx)
+        cats = catalog.get_categories(state.new_slot_type_idx, state.available_samples)
         if cats:
             new_idx = (state.new_slot_cat_idx + delta) % len(cats)
             return dataclasses.replace(state, new_slot_cat_idx=new_idx, new_slot_var_idx=0)
@@ -1027,7 +1063,9 @@ def _reduce_instrument(state: AppState, event: Event) -> AppState:
         # Only FREE piano mode cares about pad release (hold-based duration)
         if state.armed_tracks:
             track = state.tracks[state.armed_tracks[0]]
-            if isinstance(track, SynthTrack) and not track.quantized:
+            is_free = ((isinstance(track, SynthTrack) and not track.quantized)
+                       or (isinstance(track, SampleTrack) and track.sample_mode == "oneshot" and not track.quantized))
+            if is_free:
                 return _piano_pad_released(state, event, state.armed_tracks[0])
         return state
     if isinstance(event, TransportPressed):
@@ -1303,13 +1341,20 @@ def _instrument_pad_pressed(state: AppState, event: PadPressed) -> AppState:
         affected_track = state.armed_tracks[0]
         track = state.tracks[affected_track]
 
-        # Route SampleTrack SAMPLE_CHOPS / SAMPLE_KEYS / SAMPLE_EDIT mode to its own handler
+        # Route SampleTrack based on mode
         if isinstance(track, SampleTrack):
+            # 1-shot: behave like SynthTrack for pad input
+            if track.sample_mode == "oneshot":
+                if not track.quantized:
+                    return _piano_pad_pressed(state, event, affected_track)
+                if state.instrument_submode == InstrumentSubmode.STEPS:
+                    return _synth_steps_pad_pressed(state, event, affected_track)
+                if state.instrument_submode == InstrumentSubmode.PADS:
+                    return _synth_pads_pad_pressed(state, event, affected_track)
+            # Chopped: existing chop handlers
             if state.instrument_submode == InstrumentSubmode.SAMPLE_CHOPS:
                 return _sample_chops_pad_pressed(state, event, affected_track)
             if state.instrument_submode == InstrumentSubmode.SAMPLE_KEYS:
-                # Pad presses in KEYS mode are handled by app.py for audio triggering;
-                # the reducer just tracks which pad is held (no-op for state).
                 return state
             if state.instrument_submode == InstrumentSubmode.SAMPLE_EDIT:
                 return _sample_edit_pad_pressed(state, event, affected_track)
@@ -1710,6 +1755,12 @@ def _instrument_mode_button(state: AppState, event: ModeButtonPressed) -> AppSta
         max_page = 4
     elif isinstance(first_track, DrumTrack) and state.instrument_submode == InstrumentSubmode.STEPS:
         max_page = 1
+    elif (isinstance(first_track, SampleTrack) and first_track.sample_mode == "oneshot"
+          and state.instrument_submode in (InstrumentSubmode.STEPS, InstrumentSubmode.PADS)):
+        max_page = 2
+    elif (isinstance(first_track, SampleTrack) and first_track.sample_mode == "oneshot"
+          and state.instrument_submode == InstrumentSubmode.SAMPLE_EDIT):
+        max_page = 3
     else:
         return state
     if event.button == "FORWARD":
@@ -1724,21 +1775,107 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
     synth = isinstance(first_track, SynthTrack)
 
     if isinstance(first_track, SampleTrack):
+        # SAMPLE_TAP_CHOP submode: SK1=CANCEL, SK4=CLEAR, SK5=COMMIT
+        if state.instrument_submode == InstrumentSubmode.SAMPLE_TAP_CHOP:
+            if event.key == 0:   # SK1: cancel — return to SAMPLE_CHOPS, discard taps
+                return dataclasses.replace(state,
+                                           instrument_submode=InstrumentSubmode.SAMPLE_CHOPS,
+                                           tap_chop_times=())
+            if event.key == 3:   # SK4: clear all taps so far
+                return dataclasses.replace(state, tap_chop_times=())
+            if event.key == 4:   # SK5: commit taps as chop points
+                return _commit_tap_chops(state)
+            return state
         # SAMPLE_KEYS submode: SK1=CHOPS (back), SK2=BACK
         if state.instrument_submode == InstrumentSubmode.SAMPLE_KEYS:
             if event.key == 0:   # SK1: back to SAMPLE_CHOPS
                 return dataclasses.replace(state, instrument_submode=InstrumentSubmode.SAMPLE_CHOPS)
             return state
-        # SAMPLE_EDIT submode: SK1=BACK to SAMPLE_CHOPS
+        # SAMPLE_EDIT submode: SK1=BACK (1-shot) or SK1=BACK (chopped)
         if state.instrument_submode == InstrumentSubmode.SAMPLE_EDIT:
-            if event.key == 0:   # SK1: back to SAMPLE_CHOPS
-                return dataclasses.replace(state, instrument_submode=InstrumentSubmode.SAMPLE_CHOPS)
+            if first_track.sample_mode == "oneshot":
+                if event.key == 0:   # SK1: BACK — restore snapshot, exit to STEPS
+                    snap = state.sample_edit_snapshot
+                    if snap is not None:
+                        return dataclasses.replace(state,
+                            tracks=snap, instrument_submode=InstrumentSubmode.STEPS,
+                            instrument_oled_page=0, sample_edit_snapshot=None)
+                    return dataclasses.replace(state, instrument_submode=InstrumentSubmode.STEPS,
+                                               instrument_oled_page=0)
+                if event.key == 4:   # SK5: COMMIT — keep changes, exit to STEPS
+                    return dataclasses.replace(state, instrument_submode=InstrumentSubmode.STEPS,
+                                               instrument_oled_page=0, sample_edit_snapshot=None)
+                return state
+            else:  # chopped
+                if event.key == 0:
+                    return dataclasses.replace(state, instrument_submode=InstrumentSubmode.SAMPLE_CHOPS)
+                return state
+        # 1-shot tracks in STEPS/PADS: SK5 on page 0 → enter SAMPLE_EDIT; pages 1-3 mirror synth
+        if (first_track.sample_mode == "oneshot"
+                and state.instrument_submode in (InstrumentSubmode.STEPS, InstrumentSubmode.PADS)):
+            page = state.instrument_oled_page
+            if page == 0:
+                if event.key == 0:   # SK1: SCALE
+                    ctrl = "" if state.instrument_active_ctrl == "SCALE" else "SCALE"
+                    return dataclasses.replace(state, instrument_active_ctrl=ctrl)
+                if event.key == 1:   # SK2: ROOT
+                    ctrl = "" if state.instrument_active_ctrl == "ROOT" else "ROOT"
+                    return dataclasses.replace(state, instrument_active_ctrl=ctrl)
+                if event.key == 2:   # SK3: BARS
+                    ctrl = "" if state.instrument_active_ctrl == "BARS" else "BARS"
+                    return dataclasses.replace(state, instrument_active_ctrl=ctrl)
+                if event.key == 3:   # SK4: toggle STEP/FREE
+                    if first_track.quantized:
+                        new_state = _adjust_sample_param(state, lambda t: dataclasses.replace(t, quantized=False))
+                        return dataclasses.replace(new_state, instrument_submode=InstrumentSubmode.PADS)
+                    else:
+                        new_state = _adjust_sample_param(state, lambda t: dataclasses.replace(t, quantized=True))
+                        return dataclasses.replace(new_state, instrument_submode=InstrumentSubmode.STEPS)
+                if event.key == 4:   # SK5: Edit Sample (snapshot for undo-on-back)
+                    return dataclasses.replace(state, instrument_submode=InstrumentSubmode.SAMPLE_EDIT,
+                                               instrument_oled_page=0,
+                                               sample_edit_snapshot=state.tracks)
+            elif page == 1:
+                # Arp (reuse synth arp softkeys)
+                if event.key == 0:
+                    return _adjust_loop_param(
+                        state, lambda lp: dataclasses.replace(lp, arp_on=not lp.arp_on)
+                    )
+                if event.key == 1:
+                    new_ctrl = "" if state.instrument_active_ctrl == "ARP_MODE" else "ARP_MODE"
+                    return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+                if event.key == 2:
+                    return state  # CLEAR placeholder
+                if event.key == 3:
+                    new_ctrl = "" if state.instrument_active_ctrl == "ARP_RATE" else "ARP_RATE"
+                    return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+                if event.key == 4:
+                    new_ctrl = "" if state.instrument_active_ctrl == "ARP_OCT" else "ARP_OCT"
+                    return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+            elif page == 2:
+                # Chord (reuse synth chord softkeys)
+                if event.key == 0:
+                    return _adjust_loop_param(
+                        state, lambda lp: dataclasses.replace(lp, chord_on=not lp.chord_on)
+                    )
+                if event.key == 1:
+                    new_ctrl = "" if state.instrument_active_ctrl == "CHORD_TYPE" else "CHORD_TYPE"
+                    return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+                if event.key == 2:
+                    new_ctrl = "" if state.instrument_active_ctrl == "VOICES" else "VOICES"
+                    return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
             return state
         page = state.instrument_oled_page
         if page == 0:
             # CHOPS page: navigate chop grid
             if event.key == 0:   # SK1: enter SAMPLE_EDIT mode
                 return dataclasses.replace(state, instrument_submode=InstrumentSubmode.SAMPLE_EDIT)
+            if event.key == 1:   # SK2: enter SAMPLE_KEYS mode
+                return dataclasses.replace(state, instrument_submode=InstrumentSubmode.SAMPLE_KEYS)
+            if event.key == 2:   # SK3: enter TAP-CHOP mode
+                return dataclasses.replace(state,
+                                           instrument_submode=InstrumentSubmode.SAMPLE_TAP_CHOP,
+                                           tap_chop_times=())
             if event.key == 3:   # SK4: BACK
                 state_out = _drop_fully_empty_tracks(state, state.armed_tracks, skip_armed=False)
                 saved = state_out.saved_armed_tracks if state_out.saved_armed_tracks is not None else state.armed_tracks
@@ -1749,8 +1886,6 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
                            if state.instrument_submode == InstrumentSubmode.SAMPLE_CHOPS
                            else InstrumentSubmode.SAMPLE_CHOPS)
                 return dataclasses.replace(state, instrument_submode=new_sub)
-            if event.key == 1:   # SK2: enter SAMPLE_KEYS mode
-                return dataclasses.replace(state, instrument_submode=InstrumentSubmode.SAMPLE_KEYS)
         elif page == 1:
             # Sample settings (play mode, envelope, bars, pan)
             if event.key == 0:   # SK1: cycle play_mode
@@ -1878,6 +2013,10 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
             if event.key == 2:
                 new_ctrl = "" if state.instrument_active_ctrl == "VOICES" else "VOICES"
                 return dataclasses.replace(state, instrument_active_ctrl=new_ctrl)
+            if event.key == 3:
+                return _adjust_synth_param(
+                    state, lambda t: dataclasses.replace(t, retrigger=not t.retrigger)
+                )
         elif page == 3:
             # Page 3 (quantize): GRID / — / STRENGTH / — / QUANTIZE
             if event.key == 0:
@@ -1959,6 +2098,8 @@ def _instrument_softkey(state: AppState, event: SoftkeyPressed) -> AppState:
             elif page == 1:
                 if event.key == 0:   # SK1: KEEP
                     return _set_keep_empty(state)
+                if event.key == 2:   # SK3: VEL/MONO toggle
+                    return dataclasses.replace(state, vel_sensitive=not state.vel_sensitive)
                 if event.key == 4:   # SK5: DELETE
                     return _delete_armed_track(state)
     return state
@@ -2006,13 +2147,29 @@ def _adjust_synth_param(state: AppState, fn) -> AppState:
     return new_state
 
 
+def _adjust_sample_param(state: AppState, fn) -> AppState:
+    """Apply fn(SampleTrack) → SampleTrack for all armed SampleTracks."""
+    new_state = state
+    for idx in state.armed_tracks:
+        track = new_state.tracks[idx]
+        if not isinstance(track, SampleTrack):
+            continue
+        new_track = fn(track)
+        if new_track is track:
+            continue
+        new_tracks = new_state.tracks[:idx] + (new_track,) + new_state.tracks[idx + 1:]
+        new_state = dataclasses.replace(new_state, tracks=new_tracks)
+    return new_state
+
+
 def _adjust_loop_param(state: AppState, fn) -> AppState:
-    """Apply fn(Loop) → Loop to the selected loop of every armed SynthTrack."""
+    """Apply fn(Loop) → Loop to the selected loop of every armed SynthTrack or 1-shot SampleTrack."""
     new_state = state
     loop_idx = state.selected_loop
     for idx in state.armed_tracks:
         track = new_state.tracks[idx]
-        if not isinstance(track, SynthTrack):
+        is_oneshot = isinstance(track, SampleTrack) and track.sample_mode == "oneshot"
+        if not isinstance(track, SynthTrack) and not is_oneshot:
             continue
         loop = track.loops[loop_idx]
         new_loop = fn(loop)
@@ -2050,26 +2207,34 @@ def _adjust_synth_reso(state: AppState, delta: int) -> AppState:
 
 
 def _adjust_synth_scale(state: AppState, delta: int) -> AppState:
-    def cycle(track: SynthTrack) -> SynthTrack:
+    def cycle_synth(track: SynthTrack) -> SynthTrack:
         idx = list(SCALE_NAMES).index(track.scale) if track.scale in SCALE_NAMES else 0
         new_idx = (idx + (1 if delta > 0 else -1)) % len(SCALE_NAMES)
         return dataclasses.replace(track, scale=SCALE_NAMES[new_idx])
-    new_state = _adjust_synth_param(state, cycle)
+    def cycle_sample(track: SampleTrack) -> SampleTrack:
+        idx = list(SCALE_NAMES).index(track.scale) if track.scale in SCALE_NAMES else 0
+        new_idx = (idx + (1 if delta > 0 else -1)) % len(SCALE_NAMES)
+        return dataclasses.replace(track, scale=SCALE_NAMES[new_idx])
+    new_state = _adjust_synth_param(state, cycle_synth)
+    new_state = _adjust_sample_param(new_state, cycle_sample)
     for idx in new_state.armed_tracks:
         track = new_state.tracks[idx]
-        if isinstance(track, SynthTrack):
+        if isinstance(track, (SynthTrack, SampleTrack)):
             return dataclasses.replace(new_state, last_synth_scale=track.scale)
     return new_state
 
 
 def _adjust_synth_root(state: AppState, delta: int) -> AppState:
     step = 1 if delta > 0 else -1
-    def adjust(track: SynthTrack) -> SynthTrack:
+    def adjust_synth(track: SynthTrack) -> SynthTrack:
         return dataclasses.replace(track, root_note=max(0, min(127, track.root_note + step)))
-    new_state = _adjust_synth_param(state, adjust)
+    def adjust_sample(track: SampleTrack) -> SampleTrack:
+        return dataclasses.replace(track, root_note=max(0, min(127, track.root_note + step)))
+    new_state = _adjust_synth_param(state, adjust_synth)
+    new_state = _adjust_sample_param(new_state, adjust_sample)
     for idx in new_state.armed_tracks:
         track = new_state.tracks[idx]
-        if isinstance(track, SynthTrack):
+        if isinstance(track, (SynthTrack, SampleTrack)):
             return dataclasses.replace(new_state, last_synth_root=track.root_note)
     return new_state
 
@@ -2246,6 +2411,55 @@ def _set_edit_fx(state: AppState, new_chain, track_idx) -> AppState:
     return dataclasses.replace(state, global_fx=new_chain)
 
 
+def _sample_edit_encoder(state: AppState, event: EncoderTurned) -> AppState:
+    """Knobs 1-4 control per-page sample edit params while SAMPLE_EDIT is open for a 1-shot track."""
+    page = state.instrument_oled_page
+    knob = event.encoder  # 1-4
+    delta = event.delta
+
+    def apply(fn) -> AppState:
+        return _adjust_sample_param(state, fn)
+
+    if page == 0:  # Trim
+        if knob == 1:
+            step = delta / 500.0
+            return apply(lambda t: dataclasses.replace(
+                t, trim_start=round(max(0.0, min(t.trim_end - 0.001, t.trim_start + step)), 4)))
+        if knob == 2:
+            step = delta / 500.0
+            return apply(lambda t: dataclasses.replace(
+                t, trim_end=round(max(t.trim_start + 0.001, min(1.0, t.trim_end + step)), 4)))
+    elif page == 1:  # Envelope
+        if knob == 1:  # attack
+            factor = 1.15 if delta > 0 else 1.0 / 1.15
+            return apply(lambda t: dataclasses.replace(
+                t, amp_attack=round(max(0.0, min(10.0, (t.amp_attack or 0.001) * factor)), 4)))
+        if knob == 2:  # release
+            factor = 1.15 if delta > 0 else 1.0 / 1.15
+            return apply(lambda t: dataclasses.replace(
+                t, amp_release=round(max(0.001, min(10.0, t.amp_release * factor)), 4)))
+        if knob == 3:  # volume
+            step = delta / 100.0
+            return apply(lambda t: dataclasses.replace(
+                t, volume=round(max(0.0, min(2.0, t.volume + step)), 3)))
+    elif page == 2:  # Stretch
+        if knob == 1:  # stretch_mode cycle
+            _STRETCH_MODES = ("off", "repitch", "stretch")
+            def _cycle_stretch(t: SampleTrack) -> SampleTrack:
+                idx = _STRETCH_MODES.index(t.stretch_mode) if t.stretch_mode in _STRETCH_MODES else 0
+                return dataclasses.replace(t, stretch_mode=_STRETCH_MODES[(idx + (1 if delta > 0 else -1)) % len(_STRETCH_MODES)])
+            return apply(_cycle_stretch)
+        if knob == 2:  # stretch_bars
+            step = 1 if delta > 0 else -1
+            return apply(lambda t: dataclasses.replace(t, stretch_bars=max(1, min(16, t.stretch_bars + step))))
+    elif page == 3:  # Pan
+        if knob == 1:  # pan
+            step = delta / 50.0
+            return apply(lambda t: dataclasses.replace(
+                t, pan=round(max(-1.0, min(1.0, t.pan + step)), 3)))
+    return state
+
+
 def _fx_encoder(state: AppState, event) -> AppState:
     """Encoder 1-8 adjusts FX param. One revolution (24 detents) = full 0→1 range."""
     fx_idx = event.encoder - 1
@@ -2401,11 +2615,124 @@ def _load_sample(state: AppState, event: LoadSample) -> AppState:
                 name=display,
                 sample_key=key,
                 loops=default_track_loops(),
+                sample_mode=event.sample_mode,
+                pitched=event.pitched,
             )
     else:
         return state
     new_tracks = state.tracks[:ti] + (new_track,) + state.tracks[ti + 1:]
     return dataclasses.replace(state, tracks=new_tracks)
+
+
+def _remove_track(state: AppState, event: RemoveTrack) -> AppState:
+    ti = event.track_idx
+    if ti < 0 or ti >= len(state.tracks):
+        return state
+    new_tracks = state.tracks[:ti] + (None,) + state.tracks[ti + 1:]
+    new_armed = tuple(t for t in state.armed_tracks if t != ti)
+    new_muted = state.muted_tracks - {ti}
+    new_soloed = state.soloed_tracks - {ti}
+    new_active = frozenset(k for k in state.active_loops if k[0] != ti)
+    new_playing = frozenset(k for k in state.playing_loops if k[0] != ti)
+    return dataclasses.replace(
+        state,
+        tracks=new_tracks,
+        armed_tracks=new_armed,
+        muted_tracks=new_muted,
+        soloed_tracks=new_soloed,
+        active_loops=new_active,
+        playing_loops=new_playing,
+    )
+
+
+def _on_tap_chop_mark(state: AppState, event: TapChopMark) -> AppState:
+    """Append a tap timestamp during SAMPLE_TAP_CHOP mode."""
+    return dataclasses.replace(state, tap_chop_times=state.tap_chop_times + (event.timestamp,))
+
+
+def _commit_tap_chops(state: AppState) -> AppState:
+    """Convert accumulated tap timestamps to ChopPoints on the armed track."""
+    if not state.armed_tracks:
+        return dataclasses.replace(state, tap_chop_times=(),
+                                   instrument_submode=InstrumentSubmode.SAMPLE_CHOPS)
+    track_idx = state.armed_tracks[0]
+    track = state.tracks[track_idx]
+    if not isinstance(track, SampleTrack) or len(state.tap_chop_times) < 2:
+        return dataclasses.replace(state, tap_chop_times=(),
+                                   instrument_submode=InstrumentSubmode.SAMPLE_CHOPS)
+    times = sorted(state.tap_chop_times)
+    t0, t_end = times[0], times[-1]
+    span = t_end - t0
+    if span <= 0:
+        return dataclasses.replace(state, tap_chop_times=(),
+                                   instrument_submode=InstrumentSubmode.SAMPLE_CHOPS)
+    # Normalise taps to 0-1; each tap starts a new chop (last tap = end of last chop)
+    boundaries = [(t - t0) / span for t in times]
+    n_chops = min(16, len(boundaries) - 1)
+    new_chops = tuple(
+        ChopPoint(start_offset=boundaries[i], end_offset=boundaries[i + 1])
+        for i in range(n_chops)
+    )
+    new_track = dataclasses.replace(track, chops=new_chops)
+    new_tracks = state.tracks[:track_idx] + (new_track,) + state.tracks[track_idx + 1:]
+    return dataclasses.replace(state, tracks=new_tracks, tap_chop_times=(),
+                               instrument_submode=InstrumentSubmode.SAMPLE_CHOPS,
+                               sample_chop_cursor=0)
+
+
+def _copy_chop(state: AppState, event: CopyChop) -> AppState:
+    """Copy a ChopPoint to the track's chop_clipboard."""
+    ti = event.track_idx
+    if ti < 0 or ti >= len(state.tracks):
+        return state
+    track = state.tracks[ti]
+    if not isinstance(track, SampleTrack) or event.chop_idx >= len(track.chops):
+        return state
+    chop = track.chops[event.chop_idx]
+    new_track = dataclasses.replace(track, chop_clipboard=chop)
+    new_tracks = state.tracks[:ti] + (new_track,) + state.tracks[ti + 1:]
+    return dataclasses.replace(state, tracks=new_tracks)
+
+
+def _paste_chop(state: AppState, event: PasteChop) -> AppState:
+    """Paste the chop_clipboard over the target chop slot (extend if out of range)."""
+    ti = event.track_idx
+    if ti < 0 or ti >= len(state.tracks):
+        return state
+    track = state.tracks[ti]
+    if not isinstance(track, SampleTrack) or track.chop_clipboard is None:
+        return state
+    clipboard = track.chop_clipboard
+    idx = event.chop_idx
+    chops = track.chops
+    if idx < len(chops):
+        new_chops = chops[:idx] + (clipboard,) + chops[idx + 1:]
+    else:
+        # Extend to fill any gap with empty chops, then append
+        padding = tuple(ChopPoint(start_offset=0.0, end_offset=1.0) for _ in range(idx - len(chops)))
+        new_chops = chops + padding + (clipboard,)
+    new_chops = new_chops[:16]  # cap at 16
+    new_track = dataclasses.replace(track, chops=new_chops)
+    new_tracks = state.tracks[:ti] + (new_track,) + state.tracks[ti + 1:]
+    return dataclasses.replace(state, tracks=new_tracks)
+
+
+def _enter_sample_record_flow(state: AppState, event: EnterSampleRecordFlow) -> AppState:
+    """Create a blank SampleTrack placeholder and enter SAMPLE_RECORD submode."""
+    ti = event.track_idx
+    if ti < 0 or ti >= len(state.tracks):
+        return state
+    track = state.tracks[ti]
+    if track is None:
+        blank = SampleTrack(name="NEW", sample_key="", loops=default_track_loops(),
+                            keep_empty=True)
+        new_tracks = state.tracks[:ti] + (blank,) + state.tracks[ti + 1:]
+        state = dataclasses.replace(state, tracks=new_tracks)
+    return dataclasses.replace(state,
+                               armed_tracks=(ti,),
+                               mode=Mode.INSTRUMENT,
+                               instrument_submode=InstrumentSubmode.SAMPLE_RECORD,
+                               sample_recording=True)
 
 
 def _on_sample_record_stop(state: AppState, event: SampleRecordStop) -> AppState:

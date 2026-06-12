@@ -12,7 +12,7 @@ from eden.state import (
     FXChain, default_loop, default_track_loops,
 )
 
-SESSION_VERSION = 2
+SESSION_VERSION = 3
 
 _SLOT_LETTERS = "ABCDEFGH"
 
@@ -205,6 +205,7 @@ def _track_to_dict(track) -> Optional[dict]:
             "scale": track.scale,
             "quantized": track.quantized,
             "aftertouch": track.aftertouch,
+            "retrigger": track.retrigger,
             "fx": _fxchain_to_dict(track.fx),
             "loops": [_loop_to_dict(lp) for lp in track.loops],
         }
@@ -224,6 +225,12 @@ def _track_to_dict(track) -> Optional[dict]:
             "keep_empty": track.keep_empty,
             "stretch_mode": track.stretch_mode,
             "stretch_bars": track.stretch_bars,
+            "sample_mode": track.sample_mode,
+            "pitched": track.pitched,
+            "root_note": track.root_note,
+            "scale": track.scale,
+            "quantized": track.quantized,
+            # chop_clipboard intentionally omitted (ephemeral)
             "fx": _fxchain_to_dict(track.fx),
             "chops": [
                 {
@@ -238,6 +245,16 @@ def _track_to_dict(track) -> Optional[dict]:
             "loops": [_loop_to_dict(lp) for lp in track.loops],
         }
     return None
+
+
+def _infer_sample_mode(d: dict) -> str:
+    """Heuristic for v2 sessions that lack a sample_mode field."""
+    if d.get("chops"):
+        return "chopped"
+    key = d.get("sample_key", "")
+    if key in ("eden_riser", "eden_vocal_hey") or key.endswith(("_riser", "_hit", "_fx")):
+        return "oneshot"
+    return "chopped"
 
 
 def _dict_to_track(d: Optional[dict]):
@@ -276,6 +293,7 @@ def _dict_to_track(d: Optional[dict]):
             scale=d.get("scale", "chromatic"),
             quantized=d.get("quantized", True),
             aftertouch=d.get("aftertouch", True),
+            retrigger=d.get("retrigger", False),
             fx=_dict_to_fxchain(d.get("fx")),
         )
     if t == "sample":
@@ -299,6 +317,7 @@ def _dict_to_track(d: Optional[dict]):
             play_mode = "oneshot" if d["one_shot"] else "gate"
         else:
             play_mode = d.get("play_mode", "oneshot")
+        sample_mode = d.get("sample_mode") or _infer_sample_mode(d)
         return SampleTrack(
             name=d["name"],
             sample_key=d.get("sample_key", ""),
@@ -315,6 +334,11 @@ def _dict_to_track(d: Optional[dict]):
             keep_empty=bool(d.get("keep_empty", False)),
             stretch_mode=d.get("stretch_mode", "off"),
             stretch_bars=int(d.get("stretch_bars", 1)),
+            sample_mode=sample_mode,
+            pitched=bool(d.get("pitched", False)),
+            root_note=int(d.get("root_note", 60)),
+            scale=d.get("scale", "chromatic"),
+            quantized=bool(d.get("quantized", True)),
             fx=_dict_to_fxchain(d.get("fx")),
         )
     return None

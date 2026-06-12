@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from eden.engines import DrumEngine, SynthEngine, SynthVoice, midi_to_hz
+from eden.engines import _SampleVoice
 
 
 # ── midi_to_hz ────────────────────────────────────────────────────────────────
@@ -236,3 +237,129 @@ def test_synth_engine_not_silent_while_releasing():
     engine.fill_block(buf, 256)
     # After one block, voice is in release but not done yet (release=0.1s)
     assert not engine.is_silent
+
+
+def test_synth_engine_release_all_sends_voices_to_release():
+    """release_all() drives every gated voice into its release phase."""
+    from eden.engines import _ENV_RELEASE
+    engine = SynthEngine(44100)
+    track = _FakeTrack()
+    engine.note_on(60, 1.0, 44100, track)
+    engine.note_on(64, 1.0, 44100, track)
+    buf = np.zeros((256, 2), dtype=np.float64)
+    engine.fill_block(buf, 256)
+    assert all(v._env_stage < _ENV_RELEASE for v in engine._voices)
+    engine.release_all()
+    engine.fill_block(buf, 256)
+    assert all(v._env_stage >= _ENV_RELEASE for v in engine._voices)
+
+
+def test_synth_engine_retrigger_layers_new_chord():
+    """A note_on after release_all still plays — prior voices release, new ones layer."""
+    engine = SynthEngine(44100)
+    track = _FakeTrack()
+    engine.note_on(60, 1.0, 44100, track)
+    buf = np.zeros((256, 2), dtype=np.float64)
+    engine.fill_block(buf, 256)
+    # Retrigger: release prior voice, then fire a two-note chord in one batch.
+    engine.release_all()
+    engine.note_on(64, 1.0, 44100, track)
+    engine.note_on(67, 1.0, 44100, track)
+    engine.fill_block(buf, 256)
+    # Old voice (releasing) + two fresh chord voices all coexist.
+    assert len(engine._voices) == 3
+
+
+# ── _SampleVoice vectorized fill ──────────────────────────────────────────────
+
+
+def _make_sample_data(n, seed):
+    """Deterministic float64 stereo sample data with distinct L/R content."""
+    rng = np.random.default_rng(seed)
+    left = rng.standard_normal(n)
+    right = rng.standard_normal(n)
+    return np.stack([left, right], axis=1).astype(np.float64)
+
+
+def _run_voice(voice, n_blocks, block, note_off_block=None):
+    """Render a voice across blocks via its public fill(); return concatenated output."""
+    out = []
+    for b in range(n_blocks):
+        if note_off_block is not None and b == note_off_block:
+            voice.note_off()
+        buf = np.zeros((block, 2), dtype=np.float64)
+        voice.fill(buf, block)
+        out.append(buf.copy())
+    return np.concatenate(out, axis=0)
+
+
+def _run_voice_slow(voice, n_blocks, block, note_off_block=None):
+    """Same as _run_voice but forcing the reference per-sample path every block."""
+    out = []
+    for b in range(n_blocks):
+        if note_off_block is not None and b == note_off_block:
+            voice.note_off()
+        buf = np.zeros((block, 2), dtype=np.float64)
+        voice._fill_slow(buf, block)
+        out.append(buf.copy())
+    return np.concatenate(out, axis=0)
+
+
+_VOICE_CASES = [
+    # (n, pitch_rate, attack, release, gate, play_mode, note_off_block)
+    (8000, 1.0, 0, 2205, 4410, "gate", None),       # unity pitch, gate→release
+    (8000, 2.0, 0, 2205, 4410, "gate", None),       # octave up (skips samples)
+    (8000, 0.5, 0, 2205, 4410, "gate", None),       # octave down (interpolates)
+    (8000, 1.5, 441, 2205, 6000, "gate", None),     # short attack + gate
+    (8000, 1.0, 0, 1, 0, "oneshot", None),          # oneshot, plays to end
+    (8000, 1.0, 0, 4410, 0, "oneshot", 3),          # oneshot, explicit note_off
+    (8000, 1.0, 0, 4410, 0, "legato", 2),           # legato, note_off mid-flight
+    (3000, 1.0, 0, 2205, 1000, "gate", None),       # release outlives source
+    (8000, 1.0, 100, 88200, 512, "gate", None),     # release longer than source
+    (500, 3.0, 0, 2205, 0, "oneshot", None),        # tiny source, fast read
+    (8000, 0.75, 0, 2205, 300, "gate", 0),          # note_off on first block
+]
+
+
+@pytest.mark.parametrize("case", _VOICE_CASES)
+def test_sample_voice_vectorized_matches_slow(case):
+    n, rate, attack, release, gate, play_mode, noff = case
+    data = _make_sample_data(n, seed=hash(case) & 0xFFFF)
+    block = 256
+    n_blocks = (n + block) // block + 4
+
+    def mk():
+        v = _SampleVoice(
+            data, gain=0.8, pan_l=0.9, pan_r=0.6, pitch_rate=rate,
+            attack_samples=attack, release_samples=release,
+            gate_samples=gate, play_mode=play_mode,
+        )
+        return v
+
+    fast = _run_voice(mk(), n_blocks, block, note_off_block=noff)
+    slow = _run_voice_slow(mk(), n_blocks, block, note_off_block=noff)
+    assert fast.shape == slow.shape
+    assert np.allclose(fast, slow, atol=1e-9), (
+        f"max diff {np.abs(fast - slow).max():.2e} for {case}"
+    )
+
+
+def test_sample_voice_done_state_matches_slow():
+    """The vectorized path must reach `done` on the same block as the slow path."""
+    data = _make_sample_data(5000, seed=7)
+    block = 256
+
+    def done_block(use_slow):
+        v = _SampleVoice(
+            data, gain=1.0, pan_l=1.0, pan_r=1.0, pitch_rate=1.0,
+            attack_samples=0, release_samples=2205, gate_samples=2000,
+            play_mode="gate",
+        )
+        buf = np.zeros((block, 2), dtype=np.float64)
+        for b in range(100):
+            (v._fill_slow if use_slow else v.fill)(buf, block)
+            if v.done:
+                return b
+        return -1
+
+    assert done_block(False) == done_block(True)

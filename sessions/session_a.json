@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "name": "session_a",
   "tempo_bpm": 120.0,
   "swing": 0.0,
@@ -110,92 +110,7 @@
     },
     null,
     null,
-    {
-      "type": "drum",
-      "name": "KICK",
-      "sample_name": "kick_techno",
-      "volume": 1.0,
-      "fx": {
-        "page1": [
-          0.5,
-          0.5,
-          0.5,
-          0.0,
-          0.0,
-          0.0,
-          0.0,
-          0.0
-        ],
-        "page2": [
-          0.0,
-          0.0,
-          0.0,
-          0.5,
-          0.0,
-          0.0,
-          0.0,
-          0.0
-        ]
-      },
-      "loops": [
-        null,
-        null,
-        null,
-        {
-          "steps": "00000000000010000010000000010000",
-          "bars": 2,
-          "numerator": 4,
-          "step_size": 16,
-          "loop_count": 0,
-          "velocities": [
-            100,
-            100,
-            100,
-            100,
-            100,
-            100,
-            100,
-            100,
-            100,
-            100,
-            100,
-            100,
-            8,
-            100,
-            100,
-            100,
-            100,
-            100,
-            8,
-            100,
-            100,
-            100,
-            100,
-            100,
-            100,
-            100,
-            100,
-            5,
-            100,
-            100,
-            100,
-            100
-          ]
-        },
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null
-      ]
-    },
+    null,
     null,
     null,
     null,
@@ -218,8 +133,8 @@
       0
     ],
     [
-      4,
-      3
+      2,
+      0
     ]
   ],
   "muted_tracks": [],
@@ -245,5 +160,16 @@
       0.0,
       0.0
     ]
-  }
+  },
+  "scenes": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "active_scene": 0
 }

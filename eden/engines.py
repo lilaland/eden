@@ -139,10 +139,11 @@ class _SampleVoice:
     __slots__ = ('data', 'pos', 'gain', 'pan_l', 'pan_r', 'pitch_rate',
                  'attack_inc', 'release_dec', 'env', 'attacking',
                  'gate_remaining', 'releasing', 'release_from',
-                 'play_mode', 'done')
+                 'play_mode', 'done', 'abs_start', 'abs_end')
 
     def __init__(self, data, gain, pan_l, pan_r, pitch_rate,
-                 attack_samples, release_samples, gate_samples, play_mode):
+                 attack_samples, release_samples, gate_samples, play_mode,
+                 abs_start=0.0, abs_end=1.0):
         self.data = data
         self.pos = 0.0
         self.gain = gain
@@ -158,6 +159,8 @@ class _SampleVoice:
         self.release_from = 1.0
         self.play_mode = play_mode
         self.done = False
+        self.abs_start = abs_start
+        self.abs_end = abs_end
 
     def note_off(self):
         if not self.releasing:
@@ -165,6 +168,85 @@ class _SampleVoice:
             self.release_from = self.env
 
     def fill(self, buf, n_frames):
+        """Render n_frames of this voice into buf (additive).
+
+        Fast paths (numpy-vectorized) cover the two states that dominate a
+        voice's lifetime — flat sustain (env == 1) and a linear release ramp —
+        where there are no per-sample feedback transitions. Attack ramps and the
+        gate→release boundary fall through to the per-sample loop (_fill_slow),
+        which remains the reference implementation for those blocks.
+        """
+        if self.done:
+            return
+        # Flat sustain: not attacking, not releasing, and the gate won't expire
+        # within this block (so env stays a constant 1.0 the whole time).
+        if (not self.attacking and not self.releasing
+                and (self.gate_remaining == 0 or self.gate_remaining > n_frames)):
+            self._fill_vec(buf, n_frames, env_release=False)
+            return
+        # Linear release ramp: already releasing and past the attack phase.
+        if self.releasing and not self.attacking:
+            self._fill_vec(buf, n_frames, env_release=True)
+            return
+        self._fill_slow(buf, n_frames)
+
+    def _fill_vec(self, buf, n_frames, env_release):
+        """Vectorized render for constant-sustain or linear-release blocks."""
+        data = self.data
+        data_len = len(data)
+        rate = self.pitch_rate
+        pos0 = self.pos
+        i = np.arange(n_frames)
+        positions = pos0 + i * rate
+        idx = positions.astype(np.int64)
+        # idx is non-decreasing (rate > 0); first index needing data[idx+1] OOB.
+        k_src = int(np.searchsorted(idx, data_len - 1, side="left"))
+
+        if env_release:
+            step = self.release_from * self.release_dec
+            env_used = self.env - (i + 1) * step  # post-update env per sample
+            below = env_used <= 0.0
+            k_env = int(np.argmax(below)) if below.any() else n_frames
+            k = min(k_src, k_env)
+        else:
+            env_used = None
+            k_env = n_frames
+            k = k_src
+
+        if k > 0:
+            si = idx[:k]
+            fr = (positions[:k] - si)[:, np.newaxis]
+            seg = data[si] * (1.0 - fr) + data[si + 1] * fr
+            if env_release:
+                g = self.gain * env_used[:k]
+                buf[:k, 0] += seg[:, 0] * g * self.pan_l
+                buf[:k, 1] += seg[:, 1] * g * self.pan_r
+            else:
+                buf[:k, 0] += seg[:, 0] * (self.gain * self.pan_l)
+                buf[:k, 1] += seg[:, 1] * (self.gain * self.pan_r)
+
+        # Envelope reaching zero is checked before source exhaustion in the
+        # per-sample loop, so it wins ties here too.
+        if env_release and k_env <= k_src and k_env < n_frames:
+            self.env = 0.0
+            self.done = True
+            self.pos = pos0 + k * rate
+            return
+        if k_src < n_frames:
+            self.done = True
+            self.pos = pos0 + k * rate
+            return
+
+        # Whole block consumed.
+        self.pos = pos0 + n_frames * rate
+        if env_release:
+            self.env = self.env - n_frames * (self.release_from * self.release_dec)
+        else:
+            self.env = 1.0
+        if self.gate_remaining > 0:
+            self.gate_remaining = max(0, self.gate_remaining - n_frames)
+
+    def _fill_slow(self, buf, n_frames):
         """Sample-by-sample: advance pos by pitch_rate, interpolate, apply envelope and pan."""
         i = 0
         data = self.data
@@ -251,7 +333,16 @@ class SampleEngine(TrackEngine):
         t_end = int(trim_end * n)
         effective = sample[t_start:t_end]
 
-        if chops and 0 <= pitch < len(chops):
+        sample_mode = getattr(track_state, 'sample_mode', 'chopped')
+        if sample_mode == 'oneshot':
+            slice_data = effective
+            is_pitched = getattr(track_state, 'pitched', False)
+            root_note = getattr(track_state, 'root_note', 60)
+            tune = float(pitch - root_note) if is_pitched else 0.0
+            reverse = False
+            abs_start = trim_start
+            abs_end = trim_end
+        elif chops and 0 <= pitch < len(chops):
             chop = chops[pitch]
             m = len(effective)
             c_start = int(chop.start_offset * m)
@@ -259,10 +350,15 @@ class SampleEngine(TrackEngine):
             slice_data = effective[c_start:c_end]
             tune = getattr(chop, 'tune', 0.0)
             reverse = getattr(chop, 'reverse', False)
+            trim_span = trim_end - trim_start
+            abs_start = trim_start + chop.start_offset * trim_span
+            abs_end   = trim_start + chop.end_offset   * trim_span
         else:
             slice_data = effective
             tune = 0.0
             reverse = False
+            abs_start = trim_start
+            abs_end = trim_end
 
         if reverse:
             slice_data = slice_data[::-1]
@@ -276,6 +372,7 @@ class SampleEngine(TrackEngine):
         voice = _SampleVoice(
             slice_data, gain, pan_l, pan_r, pitch_rate,
             attack_samps, release_samps, gate_samples, play_mode,
+            abs_start=abs_start, abs_end=abs_end,
         )
         self._trigger_queue.append(('on', pitch, voice, play_mode))
 
@@ -345,6 +442,15 @@ class SampleEngine(TrackEngine):
     @property
     def is_silent(self) -> bool:
         return len(self._voices) == 0 and len(self._trigger_queue) == 0
+
+    @property
+    def playback_cursor(self) -> float:
+        """0.0–1.0 position in full sample of newest active voice, or -1.0 if silent."""
+        for v in reversed(self._voices):
+            if not v.done:
+                ratio = v.pos / max(1, len(v.data) - 1)
+                return v.abs_start + ratio * (v.abs_end - v.abs_start)
+        return -1.0
 
 
 # ── SynthVoice ────────────────────────────────────────────────────────────────
@@ -546,6 +652,14 @@ class SynthEngine(TrackEngine):
         """Trigger release for all voices at the given pitch."""
         self._trigger_queue.append(("off", pitch))
 
+    def release_all(self) -> None:
+        """Send every currently-sounding voice into its release phase.
+
+        Used by retrigger mode: queued before a new note/chord so prior
+        voices fade out while the incoming notes layer in together.
+        """
+        self._trigger_queue.append(("rel", None))
+
     def set_aftertouch(self, value: float) -> None:
         """Update channel pressure gain (0.0-1.0) for all active voices."""
         self._trigger_queue.append(("at", value))
@@ -565,6 +679,10 @@ class SynthEngine(TrackEngine):
                 if kind == "off":
                     for v in self._voices:
                         if v._freq == midi_to_hz(payload) and v._gate_remaining > 1:
+                            v._gate_remaining = 1
+                elif kind == "rel":
+                    for v in self._voices:
+                        if v._gate_remaining > 1:
                             v._gate_remaining = 1
                 elif kind == "at":
                     self._aftertouch_target = float(payload)

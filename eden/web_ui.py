@@ -32,7 +32,7 @@ _SLOT_LETTERS = "ABCDEFGH"
 
 # ── State serializer ──────────────────────────────────────────────────────────
 
-def _to_json(state, sessions_dir: str = "") -> str:
+def _to_json(state, sessions_dir: str = "", mixer=None) -> str:
     from eden.state import DrumTrack, SynthTrack, SampleTrack, Mode
     from eden.fx import FX_LABELS, fmt_fx_val
 
@@ -88,6 +88,9 @@ def _to_json(state, sessions_dir: str = "") -> str:
     pan = 0.0
     stretch_mode = "off"
     stretch_bars = 1
+    sample_mode = None
+    sample_pitched = None
+    sample_root_note = 60
     sample_chop_cursor = state.sample_chop_cursor
     sel_track = state.tracks[state.selected_track] if state.selected_track < len(state.tracks) else None
     if isinstance(sel_track, SampleTrack):
@@ -102,6 +105,9 @@ def _to_json(state, sessions_dir: str = "") -> str:
         pan = sel_track.pan
         stretch_mode = sel_track.stretch_mode
         stretch_bars = sel_track.stretch_bars
+        sample_mode = getattr(sel_track, 'sample_mode', 'chopped')
+        sample_pitched = getattr(sel_track, 'pitched', False)
+        sample_root_note = getattr(sel_track, 'root_note', 60)
 
     # Which AppState scene slots are occupied
     scenes_saved = [s is not None for s in state.scenes]
@@ -126,6 +132,11 @@ def _to_json(state, sessions_dir: str = "") -> str:
         _abbr = _lbl.split()[0][:4]  # "LOW EQ" → "LOW", "CHORUS" → "CHOR", etc.
         fx_knobs.append({"label": _abbr, "value": fmt_fx_val(_fx_page, _i, _fx_vals[_i])})
 
+    # Real-time sample playback cursor (0-1 absolute position in full sample)
+    sample_cursor = -1.0
+    if mixer is not None:
+        sample_cursor = mixer.get_playback_cursor(state.selected_track)
+
     # Step data for selected track + loop (for timeline view)
     step_data = None
     if sel_track_obj is not None and not isinstance(sel_track_obj, SampleTrack):
@@ -143,6 +154,35 @@ def _to_json(state, sessions_dir: str = "") -> str:
                 "bars": sel_loop.bars,
                 "step_count": sel_loop.step_count,
             }
+
+    # Picker state (new-instrument selector on empty slot)
+    selected_track_empty = state.tracks[state.selected_track] is None if state.selected_track < len(state.tracks) else False
+    picker_sample_key = None
+    picker_track_type = None
+    if selected_track_empty:
+        if state.new_slot_type_idx == 0:
+            picker_track_type = "drum"
+            import eden.catalog as _cat
+            cats = _cat.DRUM_CATEGORIES
+            vars_ = _cat.DRUM_VARIATIONS
+            if state.new_slot_cat_idx < len(cats) and state.new_slot_var_idx < len(vars_):
+                cat_key = _cat._DRUM_SAMPLE_KEYS[cats[state.new_slot_cat_idx]]
+                var_key = _cat._VARIATION_KEYS[vars_[state.new_slot_var_idx]]
+                picker_sample_key = f"{cat_key}_{var_key}"
+        elif state.new_slot_type_idx in (2, 3):
+            picker_track_type = "sample"
+            import eden.catalog as _cat
+            cats = _cat.get_categories(state.new_slot_type_idx, state.available_samples)
+            if state.new_slot_cat_idx < len(cats):
+                vars_ = _cat.get_variations(state.new_slot_type_idx, state.new_slot_cat_idx,
+                                             state.available_samples)
+                if state.new_slot_var_idx < len(vars_):
+                    _cat_name = cats[state.new_slot_cat_idx]
+                    _, _, key = _cat._sample_variations(
+                        state.new_slot_type_idx, _cat_name, state.available_samples
+                    )[state.new_slot_var_idx]
+                    if key != _cat._RECORD_SENTINEL:
+                        picker_sample_key = key
 
     return json.dumps({
         "pads":           pad_data,
@@ -174,6 +214,7 @@ def _to_json(state, sessions_dir: str = "") -> str:
         "amp_release":         amp_release,
         "pan":                 pan,
         "sample_chop_cursor":  sample_chop_cursor,
+        "sample_cursor":       sample_cursor,
         "scenes_saved":        scenes_saved,
         "disk_slots":          disk_slots,
         "selected_track":      state.selected_track,
@@ -185,7 +226,21 @@ def _to_json(state, sessions_dir: str = "") -> str:
         "edit_mode":           state.edit_mode,
         "stretch_mode":        stretch_mode,
         "stretch_bars":        stretch_bars,
+        "sample_mode":         sample_mode,
+        "sample_pitched":      sample_pitched,
+        "sample_root_note":    sample_root_note,
         "available_samples":   list(state.available_samples),
+        "selected_track_empty": selected_track_empty,
+        "picker_sample_key":   picker_sample_key,
+        "picker_track_type":   picker_track_type,
+        "new_slot_type_idx":   state.new_slot_type_idx,
+        "new_slot_cat_idx":    state.new_slot_cat_idx,
+        "new_slot_var_idx":    state.new_slot_var_idx,
+        "root_note":           state.last_synth_root,
+        "scale":               state.last_synth_scale,
+        "pitch_window_offset": state.pitch_window_offset,
+        "octave_offset":       state.octave_offset,
+        "volume":              getattr(sel_track_obj, "volume", 1.0) if sel_track_obj is not None else 1.0,
     })
 
 
@@ -195,6 +250,7 @@ def _handle_action(action: dict, state_ref, dispatch_fn, mixer=None) -> None:
     from eden.events import (
         SongSlotPressed, SetChops, WebSelectCell,
         SetTrim, AutoChop, NormalizeAction, LoadSample,
+        WebDemoSample, RemoveTrack,
     )
     from eden.state import ChopPoint
 
@@ -260,10 +316,32 @@ def _handle_action(action: dict, state_ref, dispatch_fn, mixer=None) -> None:
         # SK1 (key=0) in SAMPLE_CHOPS page 1 cycles play_mode
         dispatch_fn(SoftkeyPressed(key=0))
 
+    elif atype == "add_to_library":
+        from eden.events import SetAvailableSamples
+        sample_key = str(action["sample_key"])
+        if mixer is not None and sample_key not in mixer.loaded_names():
+            import os
+            path = os.path.join(mixer.sample_dir, sample_key + ".wav")
+            if os.path.isfile(path):
+                mixer.load(sample_key, path)
+        current_available = set(state_ref.get().available_samples)
+        current_available.add(sample_key)
+        dispatch_fn(SetAvailableSamples(keys=tuple(sorted(current_available))))
+
+    elif atype == "remove_from_library":
+        from eden.events import SetAvailableSamples
+        sample_key = str(action["sample_key"])
+        current_available = set(state_ref.get().available_samples)
+        current_available.discard(sample_key)
+        dispatch_fn(SetAvailableSamples(keys=tuple(sorted(current_available))))
+
     elif atype == "load_sample":
         track_idx = int(action["track_idx"])
         sample_key = str(action["sample_key"])
         track_type = str(action.get("track_type", "sample"))
+        sample_mode = str(action.get("sample_mode", "chopped"))
+        pitched = bool(action.get("pitched", False))
+        enter_inst = bool(action.get("enter_inst", False))
         if mixer is not None and sample_key not in mixer.loaded_names():
             import os
             path = os.path.join(mixer.sample_dir, sample_key + ".wav")
@@ -273,7 +351,26 @@ def _handle_action(action: dict, state_ref, dispatch_fn, mixer=None) -> None:
             track_idx=track_idx,
             sample_key=sample_key,
             track_type=track_type,
+            sample_mode=sample_mode,
+            pitched=pitched,
         ))
+        if enter_inst:
+            from eden.events import ModeButtonPressed
+            dispatch_fn(ModeButtonPressed(button="INST", pressed=True))
+
+    elif atype == "demo_sample":
+        sample_key = str(action["sample_key"])
+        track_type = str(action.get("track_type", "sample"))
+        if mixer is not None and sample_key not in mixer.loaded_names():
+            import os
+            path = os.path.join(mixer.sample_dir, sample_key + ".wav")
+            if os.path.isfile(path):
+                mixer.load(sample_key, path)
+        dispatch_fn(WebDemoSample(sample_key=sample_key, track_type=track_type))
+
+    elif atype == "remove_track":
+        track_idx = int(action["track_idx"])
+        dispatch_fn(RemoveTrack(track_idx=track_idx))
 
     elif atype == "delete_sample":
         sample_key = str(action["sample_key"])
@@ -311,7 +408,7 @@ def _make_handler(state_ref: StateRef, dispatch_fn, sessions_dir: str, get_peaks
                 self.end_headers()
                 try:
                     while True:
-                        data = _to_json(state_ref.get(), sessions_dir)
+                        data = _to_json(state_ref.get(), sessions_dir, mixer)
                         self.wfile.write(f"data: {data}\n\n".encode())
                         self.wfile.flush()
                         time.sleep(1 / 30)
@@ -321,7 +418,9 @@ def _make_handler(state_ref: StateRef, dispatch_fn, sessions_dir: str, get_peaks
             elif parsed.path == "/waveform":
                 qs = parse_qs(parsed.query)
                 key = (qs.get("key") or [None])[0]
-                peaks = get_peaks_fn(key) if key and get_peaks_fn else None
+                n_raw = (qs.get("n") or [None])[0]
+                n_pts = max(100, min(4000, int(n_raw))) if n_raw and n_raw.isdigit() else 1200
+                peaks = get_peaks_fn(key, n_pts) if key and get_peaks_fn else None
                 if peaks is not None:
                     body = json.dumps({"peaks": peaks}).encode()
                     self.send_response(200)
@@ -343,10 +442,12 @@ def _make_handler(state_ref: StateRef, dispatch_fn, sessions_dir: str, get_peaks
                 self.wfile.write(body)
 
             elif parsed.path == "/catalog":
+                import eden.catalog as catalog
                 from eden.catalog import (
                     DRUM_CATEGORIES, DRUM_VARIATIONS,
                     _DRUM_SAMPLE_KEYS, _VARIATION_KEYS,
                     SAMPLE_CATEGORIES, _SAMPLE_CATALOG,
+                    _BUNDLED_ONESHOT, _BUNDLED_CHOPPED,
                 )
                 drum_sets = []
                 for cat in DRUM_CATEGORIES:
@@ -363,9 +464,37 @@ def _make_handler(state_ref: StateRef, dispatch_fn, sessions_dir: str, get_peaks
                         for e in _SAMPLE_CATALOG.get(cat, ())
                     ]
                     sample_catalog.append({"cat": cat, "entries": entries})
+                # Structured sample modes for 1-SHOT/CHOPPED sub-tabs
+                def _make_entry(name, key, bundled):
+                    e = {"name": name, "key": key, "bundled": bundled}
+                    tags = catalog.SAMPLE_TAGS.get(key)
+                    if tags:
+                        e["tags"] = list(tags)
+                    return e
+                oneshot_catalog = {}
+                for cat in SAMPLE_CATEGORIES:
+                    bundled = [_make_entry(e[0], e[2], True)
+                               for e in _BUNDLED_ONESHOT.get(cat, ())]
+                    catalog_entries = [_make_entry(e[0], e[2], False)
+                                       for e in _SAMPLE_CATALOG.get(cat, ())]
+                    if bundled or catalog_entries:
+                        oneshot_catalog[cat] = bundled + catalog_entries
+                chopped_catalog = {}
+                for cat in SAMPLE_CATEGORIES:
+                    bundled = [_make_entry(e[0], e[2], True)
+                               for e in _BUNDLED_CHOPPED.get(cat, ())]
+                    catalog_entries = [_make_entry(e[0], e[2], False)
+                                       for e in _SAMPLE_CATALOG.get(cat, ())]
+                    if bundled or catalog_entries:
+                        chopped_catalog[cat] = bundled + catalog_entries
                 body = json.dumps({
                     "drum_sets": drum_sets,
                     "sample_catalog": sample_catalog,
+                    "sample_modes": {
+                        "1shot": oneshot_catalog,
+                        "chopped": chopped_catalog,
+                    },
+                    "sample_tags": catalog.SAMPLE_TAGS,
                 }).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -446,8 +575,8 @@ class WebUI:
         self._sessions_dir = sessions_dir
         self._mixer = mixer
 
-    def _get_peaks(self, key: str):
-        return self._mixer.get_peaks(key) if self._mixer is not None else None
+    def _get_peaks(self, key: str, n_points: int = 1200):
+        return self._mixer.get_peaks(key, n_points) if self._mixer is not None else None
 
     def run_blocking(self) -> None:
         handler_cls = _make_handler(
@@ -457,6 +586,7 @@ class WebUI:
             self._get_peaks,
             self._mixer,
         )
+        ThreadingHTTPServer.allow_reuse_address = True
         server = ThreadingHTTPServer(("127.0.0.1", self._port), handler_cls)
         url = f"http://localhost:{self._port}"
         print(f"[UI] Controller mirror -> {url}")
@@ -616,10 +746,10 @@ h1{font-size:10px;color:#5a3878;letter-spacing:3px;text-transform:uppercase}
   box-shadow:0 0 8px rgba(255,62,160,.3);
 }
 #wform-canvas-wrap{
-  position:relative;height:120px;cursor:crosshair;
+  position:relative;height:160px;cursor:crosshair;
   background:#060112;
 }
-#wform-canvas{display:block;width:100%;height:120px}
+#wform-canvas{display:block;width:100%;height:160px}
 .chop-handle{
   position:absolute;top:0;bottom:0;width:2px;
   background:#ff3ea0;cursor:col-resize;z-index:10;
@@ -656,6 +786,12 @@ h1{font-size:10px;color:#5a3878;letter-spacing:3px;text-transform:uppercase}
   content:'▶';position:absolute;top:14px;right:2px;
   font-size:7px;color:#00e5ff;text-shadow:0 0 4px rgba(0,229,255,.8);
 }
+#wform-config{background:#070115;border-radius:0 0 6px 6px}
+.wfc-group{background:#0e0224;border-radius:4px;padding:4px 6px}
+.wfc-label{font-size:6px;color:#5030a0;text-transform:uppercase;letter-spacing:.8px;margin-bottom:3px}
+.wfc-row{display:flex;justify-content:space-between;margin-bottom:1px}
+.wfc-key{font-size:7px;color:#4a2870}
+.wfc-val{font-size:7px;color:#c080ff;font-weight:bold}
 
 /* ── Instrument timeline ────────────────────────────────────────────── */
 #inst-timeline{
@@ -670,8 +806,8 @@ h1{font-size:10px;color:#5a3878;letter-spacing:3px;text-transform:uppercase}
 #tl-header{display:flex;align-items:center;gap:10px;margin-bottom:8px}
 #tl-title{font-size:9px;color:#4090b0;letter-spacing:2px;text-transform:uppercase;flex:1}
 #tl-info{font-size:9px;color:#306080;letter-spacing:.5px}
-#tl-canvas-wrap{position:relative;height:60px;background:#060112;border-radius:4px;overflow:hidden}
-#tl-canvas{display:block;width:100%;height:60px}
+#tl-canvas-wrap{position:relative;height:140px;background:#060112;border-radius:4px;overflow:hidden}
+#tl-canvas{display:block;width:100%;height:140px}
 /* FX meters strip */
 #fx-strip{
   display:flex;gap:6px;margin-top:8px;
@@ -939,6 +1075,21 @@ body.light .fx-meter-val{color:#006090}
 }
 .drum-var-btn:hover{border-color:#6030a0;color:#c080ff;background:#1a0838}
 .drum-var-btn.loaded{border-color:#ff3ea0;color:#ff90c0;background:#1e0838}
+.drum-demo-btn{
+  padding:1px 4px;border-radius:2px;font-size:8px;font-family:inherit;
+  border:1px solid #2a0e50;background:#0a021a;color:#00e5ff;
+  cursor:pointer;transition:all .07s;
+}
+.drum-demo-btn:hover{border-color:#00e5ff;background:#0e1828}
+/* ── Tag filter row ── */
+.tag-filter-row{display:flex;flex-wrap:wrap;gap:3px;margin:4px 0 6px;min-height:0}
+.tag-pill{
+  padding:2px 7px;border-radius:10px;font-size:7px;font-family:inherit;
+  border:1px solid #3a1860;background:#0e0424;color:#7040a0;
+  cursor:pointer;letter-spacing:.2px;transition:all .07s;
+}
+.tag-pill:hover{border-color:#9060c0;color:#c080ff;background:#180830}
+.tag-pill.active{border-color:#ff3ea0;background:#1e0838;color:#ff3ea0}
 /* ── Samples tab ── */
 #samples-filter-row{margin-bottom:6px}
 #samples-search{
@@ -1207,6 +1358,7 @@ body.light #status{color:#8060b0}
   <div id="wform-top">
     <div id="wform-title">Sample</div>
     <div id="wform-sample-name">—</div>
+    <div id="wform-mode-badge" style="font-size:8px;padding:2px 5px;border-radius:3px;display:none"></div>
     <div id="wform-chop-count"></div>
     <div id="wform-play-mode" title="Click to cycle play mode" style="padding:2px 8px;border-radius:3px;border:1px solid rgba(176,64,255,.35);background:rgba(80,20,120,.4);color:#d080ff;font-size:8px;font-family:inherit;cursor:pointer;text-transform:uppercase;letter-spacing:.5px;transition:all .08s"></div>
     <div style="width:1px;background:rgba(176,64,255,.2);height:16px;margin:0 2px"></div>
@@ -1219,6 +1371,31 @@ body.light #status{color:#8060b0}
   </div>
   <div id="wform-canvas-wrap">
     <canvas id="wform-canvas"></canvas>
+  </div>
+  <div id="wform-config" style="display:none;padding:6px 8px 4px;border-top:1px solid #1e0840;margin-top:2px;">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;">
+      <div class="wfc-group">
+        <div class="wfc-label">TRIM</div>
+        <div class="wfc-row"><span class="wfc-key">Start</span><span class="wfc-val" id="wfc-trim-start">0%</span></div>
+        <div class="wfc-row"><span class="wfc-key">End</span><span class="wfc-val" id="wfc-trim-end">100%</span></div>
+      </div>
+      <div class="wfc-group">
+        <div class="wfc-label">ENVELOPE</div>
+        <div class="wfc-row"><span class="wfc-key">Atk</span><span class="wfc-val" id="wfc-attack">0ms</span></div>
+        <div class="wfc-row"><span class="wfc-key">Rel</span><span class="wfc-val" id="wfc-release">50ms</span></div>
+        <div class="wfc-row"><span class="wfc-key">Vol</span><span class="wfc-val" id="wfc-volume">1.00</span></div>
+      </div>
+      <div class="wfc-group">
+        <div class="wfc-label">STRETCH</div>
+        <div class="wfc-row"><span class="wfc-key">Mode</span><span class="wfc-val" id="wfc-stretch-mode">off</span></div>
+        <div class="wfc-row"><span class="wfc-key">Bars</span><span class="wfc-val" id="wfc-stretch-bars">1</span></div>
+      </div>
+      <div class="wfc-group">
+        <div class="wfc-label">PAN / MISC</div>
+        <div class="wfc-row"><span class="wfc-key">Pan</span><span class="wfc-val" id="wfc-pan">C</span></div>
+        <div class="wfc-row"><span class="wfc-key">Play</span><span class="wfc-val" id="wfc-play-mode">1-shot</span></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1248,8 +1425,10 @@ body.light #status{color:#8060b0}
   </div>
   <div id="sample-lib-body">
     <div id="sl-tabs">
+      <input id="lib-search" type="text" placeholder="search all…" oninput="renderAll()" style="flex:1;min-width:60px;font-size:9px;padding:2px 4px;background:#12051f;border:1px solid #3a1860;color:#c080ff;border-radius:2px;">
       <button id="sl-tab-drums" class="sl-tab active" onclick="switchTab('drums')">Drums</button>
-      <button id="sl-tab-samples" class="sl-tab" onclick="switchTab('samples')">Samples</button>
+      <button id="sl-tab-1shots" class="sl-tab" onclick="switchTab('1shots')">1-Shots</button>
+      <button id="sl-tab-chops" class="sl-tab" onclick="switchTab('chops')">Chops</button>
       <button id="sample-upload-btn" onclick="document.getElementById('sample-upload-input').click()">⬆ Upload .wav</button>
       <input id="sample-upload-input" type="file" accept=".wav" multiple onchange="uploadSamples(this)">
     </div>
@@ -1260,7 +1439,17 @@ body.light #status{color:#8060b0}
       </div>
       <div id="drum-list"></div>
     </div>
-    <!-- Samples pane -->
+    <!-- 1-Shots pane -->
+    <div id="sl-1shots-pane" class="sl-pane">
+      <div id="oneshot-tag-row" class="tag-filter-row"></div>
+      <div id="oneshot-list"></div>
+    </div>
+    <!-- Chops pane -->
+    <div id="sl-chops-pane" class="sl-pane">
+      <div id="chops-tag-row" class="tag-filter-row"></div>
+      <div id="chops-list"></div>
+    </div>
+    <!-- Samples pane (legacy, kept for settings) -->
     <div id="sl-samples-pane" class="sl-pane">
       <div id="samples-filter-row">
         <input id="samples-search" type="text" placeholder="filter samples…" oninput="renderSampleCatalog()">
@@ -1403,6 +1592,9 @@ const SK_TEXT={
 const SK_BORDER={'0':'sk1','1':'sk2','2':'sk3','8':'sk4','9':'sk5','10':'sk6'};
 const rgb=(r,g,b)=>`rgb(${r},${g},${b})`;
 const setLit=(id,on)=>{const e=document.getElementById(id);if(e)e.classList.toggle('lit',!!on);};
+
+// Declared here so drawWaveform() (called by resizeCanvas at module load) can reference it safely.
+let lastState=null;
 
 // ── Session view builder ────────────────────────────────────────────────────
 const SLOTS='ABCDEFGH';
@@ -1556,7 +1748,7 @@ function drawWaveform(){
 
   if(wfPeaks && wfPeaks.length>0){
     const centerY=H/2;
-    const barW=Math.max(1,W/wfPeaks.length);
+    const barW=W/wfPeaks.length;
     // Waveform body
     for(let i=0;i<wfPeaks.length;i++){
       const x=(i/wfPeaks.length)*W;
@@ -1614,18 +1806,38 @@ function drawWaveform(){
     ctx.fillText(String(i),x0+3,14);
   }
 
-  // Trim handles (cyan, drawn on top)
-  const drawTrimHandle=(x,hot)=>{
-    ctx.strokeStyle=hot?'#80f4ff':'#00b8d4';
-    ctx.lineWidth=hot?4:3;
+  // Trim handles — Ableton-style triangular flags
+  const drawTrimHandle=(x,hot,isEnd)=>{
+    const color=hot?'#80ffff':'#00e5ff';
+    ctx.save();
+    ctx.strokeStyle=color;
+    ctx.lineWidth=hot?2.5:1.5;
+    if(hot){ctx.shadowColor=color;ctx.shadowBlur=6;}
     ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();
-    ctx.fillStyle=hot?'#80f4ff':'#00e5ff';
-    ctx.fillRect(x-5,0,11,14);
-    ctx.fillStyle='#010c10';ctx.font='bold 8px monospace';
-    ctx.textAlign='center';ctx.fillText('T',x,11);ctx.textAlign='left';
+    ctx.fillStyle=color;
+    ctx.beginPath();
+    if(!isEnd){
+      ctx.moveTo(x,0);ctx.lineTo(x+12,0);ctx.lineTo(x,10);ctx.closePath();
+    } else {
+      ctx.moveTo(x,0);ctx.lineTo(x-12,0);ctx.lineTo(x,10);ctx.closePath();
+    }
+    ctx.fill();
+    ctx.restore();
   };
-  drawTrimHandle(tsX,wfDragIdx===-10);
-  drawTrimHandle(teX,wfDragIdx===-11);
+  drawTrimHandle(tsX,wfDragIdx===-10,false);
+  drawTrimHandle(teX,wfDragIdx===-11,true);
+
+  // Real-time sample playback cursor (white solid line with glow)
+  if(lastState&&lastState.sample_cursor>=0){
+    const cX=lastState.sample_cursor*W;
+    ctx.save();
+    ctx.strokeStyle='#ffffff';
+    ctx.lineWidth=1.5;
+    ctx.shadowColor='rgba(255,255,255,0.6)';
+    ctx.shadowBlur=4;
+    ctx.beginPath();ctx.moveTo(cX,0);ctx.lineTo(cX,H);ctx.stroke();
+    ctx.restore();
+  }
 }
 
 function posToRatio(clientX){
@@ -1785,6 +1997,7 @@ document.getElementById('wform-play-mode').addEventListener('click',()=>{
 });
 
 let _lastSampleKey=null;
+let _lastSampleCursor=-1;
 
 const PM_LABELS={'oneshot':'One-shot','gate':'Gate','legato':'Legato'};
 const PM_COLORS={'oneshot':'#ff3ea0','gate':'#00e5ff','legato':'#b040ff'};
@@ -1800,9 +2013,12 @@ function updatePlayModeDisplay(){
 }
 
 function resizeCanvas(){
-  const w=canvasWrap.getBoundingClientRect().width;
-  canvas.width=Math.floor(w)||1086;
-  canvas.height=120;
+  const dpr=window.devicePixelRatio||1;
+  const w=canvasWrap.getBoundingClientRect().width||1086;
+  canvas.width=Math.round(w*dpr);
+  canvas.height=Math.round(160*dpr);
+  canvas.style.width=w+'px';
+  canvas.style.height='160px';
   drawWaveform();
 }
 window.addEventListener('resize',resizeCanvas);
@@ -1810,7 +2026,8 @@ resizeCanvas();
 
 async function fetchWaveform(key){
   try{
-    const r=await fetch('/waveform?key='+encodeURIComponent(key));
+    const n=canvas.width;
+    const r=await fetch('/waveform?key='+encodeURIComponent(key)+'&n='+n);
     if(!r.ok){wfPeaks=null;}
     else{const j=await r.json();wfPeaks=j.peaks;}
   }catch(e){wfPeaks=null;}
@@ -1835,7 +2052,7 @@ const tlWrap=document.getElementById('tl-canvas-wrap');
 function resizeTlCanvas(){
   const w=tlWrap.getBoundingClientRect().width;
   tlCanvas.width=Math.floor(w)||1086;
-  tlCanvas.height=60;
+  tlCanvas.height=140;
 }
 window.addEventListener('resize',resizeTlCanvas);
 resizeTlCanvas();
@@ -1926,31 +2143,158 @@ function drawTimeline(stepData, trackType, playhead){
   }
 }
 
+function drawPianoRoll(stepData, playhead, state){
+  const tlCanvas=document.getElementById('tl-canvas');
+  const W=tlCanvas.width, H=tlCanvas.height;
+  const ctx=tlCanvas.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+
+  const KEYS_W=28; // width of piano keyboard area
+  const steps=stepData.steps;
+  const N=steps.length;
+  const stepW=(W-KEYS_W)/N;
+
+  // Determine visible note range: show 2 octaves (24 semitones) centered on root+offset
+  const rootNote=(state.root_note||60)+(state.octave_offset||0)*12;
+  const winOff=state.pitch_window_offset||0;
+  const baseNote=rootNote+winOff-12; // start of visible range
+  const NUM_ROWS=24;
+  const rowH=H/NUM_ROWS;
+
+  // Draw piano keys on left
+  for(let i=0;i<NUM_ROWS;i++){
+    const midi=baseNote+(NUM_ROWS-1-i); // top = highest note
+    const y=i*rowH;
+    const noteInOct=((midi%12)+12)%12;
+    const isBlack=[1,3,6,8,10].includes(noteInOct);
+    ctx.fillStyle=isBlack?'#0a0118':'#180530';
+    ctx.fillRect(0,y,KEYS_W-1,rowH);
+    // Note name label on C notes
+    if(noteInOct===0){
+      ctx.fillStyle='#6030a0'; ctx.font='6px monospace';
+      ctx.fillText('C'+Math.floor(midi/12-1),1,y+rowH-2);
+    }
+    // Root note highlight
+    if(midi===rootNote){
+      ctx.fillStyle='rgba(255,62,160,0.3)';
+      ctx.fillRect(0,y,KEYS_W-1,rowH);
+    }
+  }
+
+  // Draw step grid
+  for(let col=0;col<N;col++){
+    const x=KEYS_W+col*stepW;
+    // Bar separator
+    if(col%(stepData.step_count/(stepData.bars||1))===0){
+      ctx.fillStyle='rgba(80,40,120,0.3)';
+      ctx.fillRect(x,0,1,H);
+    }
+    // Background alternating
+    ctx.fillStyle=col%2===0?'#08011a':'#0a0120';
+    ctx.fillRect(x,0,stepW,H);
+  }
+
+  // Draw notes
+  for(let col=0;col<N;col++){
+    const st=steps[col];
+    if(!st.on) continue;
+    const x=KEYS_W+col*stepW+1;
+    const pitches=st.pitches||[60];
+    for(const midi of pitches){
+      const row=(NUM_ROWS-1)-(midi-baseNote);
+      if(row<0||row>=NUM_ROWS) continue;
+      const y=row*rowH+1;
+      const vel=(st.velocity||100)/127;
+      ctx.fillStyle=`rgba(255,62,160,${0.4+vel*0.5})`;
+      ctx.fillRect(x,y,stepW-2,rowH-1);
+    }
+  }
+
+  // Playhead line
+  if(playhead>=0&&playhead<N){
+    const px=KEYS_W+(playhead+0.5)*stepW;
+    ctx.strokeStyle='rgba(255,220,0,0.8)'; ctx.lineWidth=2;
+    ctx.setLineDash([3,2]);
+    ctx.beginPath(); ctx.moveTo(px,0); ctx.lineTo(px,H); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Piano key border
+  ctx.strokeStyle='#2a0850'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(KEYS_W-1,0); ctx.lineTo(KEYS_W-1,H); ctx.stroke();
+}
+
 // ── Main update ─────────────────────────────────────────────────────────────
 let _firstUpdate=true;
+let _lastSelectedTrackEmpty=false;
+let _lastPickerSampleKey=null;
+let _lastPlayhead=-1;
+let _lastMode='';
 
 function update(s){
   lastState=s;
+
+  // Auto-close sample library when leaving instrument mode (unless still picking)
+  if(_lastMode==='INSTRUMENT' && s.mode==='SESSION' && !s.selected_track_empty){
+    const body=document.getElementById('sample-lib-body');
+    const tog=document.getElementById('sample-lib-toggle');
+    if(body.classList.contains('open')){
+      body.classList.remove('open');
+      tog.textContent='▼';
+    }
+  }
+  _lastMode = s.mode;
+
   const isSession=s.mode==='SESSION';
   const isSampleInst=s.mode==='INSTRUMENT'&&s.sample_key!=null;
   const isDrumSynthInst=s.mode==='INSTRUMENT'&&s.sample_key==null&&s.step_data!=null;
+  // Show waveform panel also when picker has a sample key selected
+  const isPickerSample=s.selected_track_empty&&s.picker_sample_key&&s.picker_track_type!=='drum';
+  const showWaveform=isSampleInst||isPickerSample;
 
   // Track active sample key and available samples for library
   if(s.available_samples) slAvailableSamples=s.available_samples;
-  if(s.sample_key&&s.sample_key!==slCurrentKey){
-    slCurrentKey=s.sample_key;
+  const activeKey=s.sample_key||s.picker_sample_key||null;
+  if(activeKey&&activeKey!==slCurrentKey){
+    slCurrentKey=activeKey;
     if(document.getElementById('sample-lib-body').classList.contains('open')){
-      if(slActiveTab==='drums') renderDrumList();
-      else{renderSampleCatalog();renderSampleSettings();}
+      renderAll();
+      if(slActiveTab==='samples') renderSampleSettings();
     }
   }
   if(document.getElementById('sample-lib-body').classList.contains('open')&&slActiveTab==='samples'){
     renderSampleSettings();
   }
 
+  // Auto-open library when picker becomes active on empty slot
+  if(s.selected_track_empty&&!_lastSelectedTrackEmpty){
+    const body=document.getElementById('sample-lib-body');
+    const tog=document.getElementById('sample-lib-toggle');
+    if(!body.classList.contains('open')){
+      body.classList.add('open');
+      tog.textContent='▲';
+      if(!slCatalog) loadCatalog().then(()=>{renderDrumList();renderOneshotList();renderChopsList();});
+      if(!slLoadedNames.length) loadSampleList().then(renderDrumList);
+    }
+    // Navigate to appropriate tab based on picker type
+    if(s.picker_track_type==='drum'&&slActiveTab!=='drums') switchTab('drums');
+    else if(s.picker_track_type==='sample'&&s.new_slot_type_idx===2&&slActiveTab!=='1shots') switchTab('1shots');
+    else if(s.picker_track_type==='sample'&&s.new_slot_type_idx===3&&slActiveTab!=='chops') switchTab('chops');
+  }
+  _lastSelectedTrackEmpty=!!s.selected_track_empty;
+
+  // Navigate library to matching section when picker changes
+  if(s.picker_sample_key&&s.picker_sample_key!==_lastPickerSampleKey){
+    _lastPickerSampleKey=s.picker_sample_key;
+    if(document.getElementById('sample-lib-body').classList.contains('open')){
+      if(s.picker_track_type==='drums') renderDrumList();
+      else{renderAll();if(slActiveTab==='samples') renderSampleSettings();}
+    }
+  }
+
   // Panel visibility
   document.getElementById('session-panel').classList.toggle('hidden',!isSession);
-  document.getElementById('waveform-panel').classList.toggle('hidden',!isSampleInst);
+  document.getElementById('waveform-panel').classList.toggle('hidden',!showWaveform);
   document.getElementById('inst-timeline').classList.toggle('hidden',!isDrumSynthInst);
 
   // Session view
@@ -1971,24 +2315,23 @@ function update(s){
     }
   }
 
-  // Waveform editor
-  if(isSampleInst){
-    const key=s.sample_key;
+  // Waveform editor (INSTRUMENT mode sample OR picker preview)
+  if(showWaveform){
+    const key=isSampleInst?s.sample_key:s.picker_sample_key;
     const ti=s.selected_track;
     if(key!==_lastSampleKey){
       _lastSampleKey=key;
       wfSampleKey=key;
-      wfTrackIdx=ti;
+      wfTrackIdx=isSampleInst?ti:-1; // -1 = read-only preview, no chop editing
       document.getElementById('wform-sample-name').textContent=key||'—';
       wfPeaks=null;
-      // Reset trim to state values when sample changes
-      wfTrimStart=s.trim_start??0;
-      wfTrimEnd=s.trim_end??1;
+      wfTrimStart=isSampleInst?(s.trim_start??0):0;
+      wfTrimEnd=isSampleInst?(s.trim_end??1):1;
       fetchWaveform(key);
     }
-    wfTrackIdx=ti;
-    // Sync from state while not dragging
-    if(wfDragIdx===-1||wfDragIdx===undefined){
+    if(isSampleInst) wfTrackIdx=ti;
+    // Sync from state while not dragging (only in INSTRUMENT mode)
+    if(isSampleInst&&(wfDragIdx===-1||wfDragIdx===undefined)){
       const newDiv=chopsToDiv(s.chops);
       if(JSON.stringify(newDiv)!==JSON.stringify(wfDividers)){
         wfDividers=newDiv;
@@ -2005,10 +2348,56 @@ function update(s){
       wfPlayMode=s.play_mode;
       updatePlayModeDisplay();
     }
+    // Sync sample_mode / pitched badge
+    const badge=document.getElementById('wform-mode-badge');
+    if(badge&&isSampleInst){
+      const sm=s.sample_mode||'chopped';
+      const pt=s.sample_pitched;
+      badge.style.display='';
+      if(sm==='oneshot'){
+        badge.textContent=pt?'1-SHOT  Pitched':'1-SHOT  Mono';
+        badge.style.cssText='font-size:8px;padding:2px 5px;border-radius:3px;background:rgba(0,200,120,.15);color:#00e58a;border:1px solid rgba(0,200,120,.3);';
+      } else {
+        badge.textContent='CHOPPED';
+        badge.style.cssText='font-size:8px;padding:2px 5px;border-radius:3px;background:rgba(255,80,160,.1);color:#ff50a0;border:1px solid rgba(255,80,160,.3);';
+      }
+    } else if(badge){
+      badge.style.display='none';
+    }
     updateChopCount();
+    // Show/hide edit controls based on whether we're in read-only picker preview
+    const editControls=['btn-normalize','btn-auto-detect','btn-auto4','btn-auto8','btn-auto16','btn-chop-clear','wform-play-mode'];
+    editControls.forEach(id=>{
+      const el=document.getElementById(id);
+      if(el) el.style.visibility=isSampleInst?'':'hidden';
+    });
+    // Waveform config panel
+    const wfConfig=document.getElementById('wform-config');
+    if(isSampleInst && s.sample_mode){
+      wfConfig.style.display='';
+      const ms=v=>v<1.0?Math.round(v*1000)+'ms':v.toFixed(2)+'s';
+      document.getElementById('wfc-trim-start').textContent=((s.trim_start||0)*100).toFixed(1)+'%';
+      document.getElementById('wfc-trim-end').textContent=((s.trim_end??1)*100).toFixed(1)+'%';
+      document.getElementById('wfc-attack').textContent=ms(s.amp_attack||0);
+      document.getElementById('wfc-release').textContent=ms(s.amp_release??0.05);
+      document.getElementById('wfc-volume').textContent=(s.volume??1).toFixed(2);
+      document.getElementById('wfc-stretch-mode').textContent=(s.stretch_mode||'off').toUpperCase();
+      document.getElementById('wfc-stretch-bars').textContent=s.stretch_bars||1;
+      const pan=s.pan||0;
+      document.getElementById('wfc-pan').textContent=pan===0?'C':pan>0?'R'+pan.toFixed(2):'L'+Math.abs(pan).toFixed(2);
+      document.getElementById('wfc-play-mode').textContent=(s.play_mode||'oneshot').toUpperCase();
+    } else {
+      wfConfig.style.display='none';
+    }
+    // Redraw waveform when sample playback cursor changes
+    if(s.sample_cursor!==_lastSampleCursor){
+      _lastSampleCursor=s.sample_cursor;
+      drawWaveform();
+    }
   } else {
     _lastSampleKey=null;
     wfTrackIdx=-1;
+    document.getElementById('wform-config').style.display='none';
   }
 
   // FX encoder knobs
@@ -2030,7 +2419,11 @@ function update(s){
     document.getElementById('tl-info').textContent=
       (td?td.name:'—')+' · L'+(s.selected_loop+1)+
       ' · '+s.step_data.step_count+' steps / '+s.step_data.bars+' bar'+(s.step_data.bars!==1?'s':'');
-    drawTimeline(s.step_data, ttype, s.playhead);
+    if(ttype==='synth'||ttype==='1shot'){
+      drawPianoRoll(s.step_data, s.playhead, s);
+    } else {
+      drawTimeline(s.step_data, ttype, s.playhead);
+    }
   }
 
   // FX meters (first 4 knobs of page 0, always shown in inst-timeline)
@@ -2134,12 +2527,225 @@ async function loadSampleList(){
 
 function switchTab(tab){
   slActiveTab=tab;
-  document.getElementById('sl-tab-drums').classList.toggle('active',tab==='drums');
-  document.getElementById('sl-tab-samples').classList.toggle('active',tab==='samples');
-  document.getElementById('sl-drums-pane').classList.toggle('active',tab==='drums');
-  document.getElementById('sl-samples-pane').classList.toggle('active',tab==='samples');
+  ['drums','1shots','chops'].forEach(t=>{
+    const tabEl=document.getElementById('sl-tab-'+t);
+    if(tabEl) tabEl.classList.toggle('active',t===tab);
+    const pane=document.getElementById('sl-'+t+'-pane');
+    if(pane) pane.classList.toggle('active',t===tab);
+  });
+  // also hide old samples pane
+  const sp=document.getElementById('sl-samples-pane');
+  if(sp) sp.classList.toggle('active',false);
   if(tab==='drums') renderDrumList();
-  else{renderSampleCatalog();renderSampleSettings();}
+  else if(tab==='1shots') renderOneshotList();
+  else if(tab==='chops') renderChopsList();
+}
+
+function renderAll(){
+  const q=(document.getElementById('lib-search').value||'').toLowerCase();
+  if(q){
+    // When searching, render all tabs and show all panes
+    renderDrumList();renderOneshotList();renderChopsList();
+    ['drums','1shots','chops'].forEach(t=>{
+      const pane=document.getElementById('sl-'+t+'-pane');
+      if(pane) pane.classList.add('active');
+    });
+  } else {
+    // Restore only the active tab
+    ['drums','1shots','chops'].forEach(t=>{
+      const pane=document.getElementById('sl-'+t+'-pane');
+      if(pane){if(t===slActiveTab) pane.classList.add('active'); else pane.classList.remove('active');}
+    });
+    if(slActiveTab==='drums') renderDrumList();
+    else if(slActiveTab==='1shots') renderOneshotList();
+    else if(slActiveTab==='chops') renderChopsList();
+  }
+}
+
+function _renderSampleSection(el, cat, entries, curTrackIdx, activeMatchKey, sampleMode, isPitched){
+  const sec=document.createElement('div');sec.className='scat-section';
+  const hdr=document.createElement('div');hdr.className='scat-header';
+  const tog=document.createElement('span');tog.className='scat-toggle';
+  const body=document.createElement('div');body.className='scat-body';
+  const q=(document.getElementById('lib-search').value||'').toLowerCase();
+  const hasActive=entries.some(e=>e.key===activeMatchKey);
+  if(hasActive||!!q){body.classList.add('open');tog.textContent='▼';}
+  else tog.textContent='▶';
+  hdr.innerHTML=`<span class="scat-name">${cat}</span>`;
+  hdr.appendChild(tog);
+  hdr.onclick=()=>{body.classList.toggle('open');tog.textContent=body.classList.contains('open')?'▼':'▶';};
+
+  for(const entry of entries){
+    const isActive=entry.key===activeMatchKey;
+    const isInLib=slAvailableSamples.includes(entry.key)||slLoadedNames.includes(entry.key);
+    const isBundled=entry.bundled;
+    const isAvail=isBundled||isInLib;
+    const item=document.createElement('div');
+    item.className='sc-item'+(isActive?' sc-active':'');
+
+    const nm=document.createElement('span');nm.className='sc-name';
+    nm.textContent=entry.name+(isBundled?' ✶':'');
+    nm.title=entry.key;
+    if(isBundled) nm.style.color='#9060d0';
+
+    // Demo button
+    const demoBtn=document.createElement('button');demoBtn.className='sc-load';
+    demoBtn.textContent='▶';demoBtn.title='Preview';
+    demoBtn.style.cssText='color:#00e5ff;border-color:#00e5ff55;margin-right:2px;';
+    demoBtn.onclick=(e)=>{e.stopPropagation();post({type:'demo_sample',sample_key:entry.key,track_type:'sample'});};
+
+    // Add/Remove library button
+    const libBtn=document.createElement('button');libBtn.className='sc-load';
+    if(isInLib&&!isBundled){
+      libBtn.textContent='− Lib';libBtn.title='Remove from library';
+      libBtn.style.cssText='color:#ff6060;border-color:#ff606055;';
+      libBtn.onclick=async()=>{
+        await post({type:'remove_from_library',sample_key:entry.key});
+        await loadSampleList();
+        renderAll();
+      };
+    } else if(!isBundled){
+      libBtn.textContent='+ Lib';libBtn.title='Add to library';
+      libBtn.style.opacity='0.5';
+      libBtn.onclick=async()=>{
+        await post({type:'add_to_library',sample_key:entry.key});
+        await loadSampleList();
+        renderAll();
+      };
+    } else {
+      libBtn.style.display='none';
+    }
+
+    // Select button (load to slot + enter INST)
+    const selBtn=document.createElement('button');selBtn.className='sc-load';
+    selBtn.textContent='Select';
+    selBtn.title=isAvail?'Load to session and edit':'Load file first';
+    if(!isAvail) selBtn.style.opacity='0.4';
+    selBtn.style.background='rgba(80,20,120,.5)';
+    selBtn.style.color='#d080ff';
+    selBtn.style.borderColor='#9060d055';
+    selBtn.onclick=async()=>{
+      if(!isAvail){
+        await post({type:'add_to_library',sample_key:entry.key});
+      }
+      await post({type:'load_sample',track_idx:curTrackIdx,sample_key:entry.key,
+                  track_type:'sample',sample_mode:sampleMode,pitched:isPitched,enter_inst:true});
+      slCurrentKey=entry.key;
+      renderAll();
+    };
+
+    // Tag pills (inline, click to filter)
+    if(entry.tags&&entry.tags.length){
+      const tagWrap=document.createElement('span');
+      tagWrap.style.cssText='display:inline-flex;gap:2px;margin-left:4px;flex-shrink:0;';
+      const tabKey=sampleMode==='oneshot'?'oneshot':'chopped';
+      for(const tag of entry.tags){
+        const tp=document.createElement('span');
+        tp.textContent='#'+tag;
+        const isActiveTag=_activeTagFilter[tabKey]===tag;
+        tp.style.cssText=`font-size:6px;padding:1px 4px;border-radius:8px;cursor:pointer;
+          background:${isActiveTag?'#1e0838':'#0e0424'};
+          color:${isActiveTag?'#ff3ea0':'#5030a0'};
+          border:1px solid ${isActiveTag?'#ff3ea055':'#2a0e50'};`;
+        tp.onclick=(e)=>{e.stopPropagation();
+          _activeTagFilter[tabKey]=(_activeTagFilter[tabKey]===tag)?null:tag;
+          if(tabKey==='oneshot') renderOneshotList();
+          else renderChopsList();
+        };
+        tagWrap.appendChild(tp);
+      }
+      item.append(nm,demoBtn,libBtn,selBtn,tagWrap);
+    } else {
+      item.append(nm,demoBtn,libBtn,selBtn);
+    }
+    body.appendChild(item);
+  }
+  sec.append(hdr,body);el.appendChild(sec);
+}
+
+let _activeTagFilter={oneshot:null,chopped:null};
+
+function _buildTagRow(rowId, modeMap, tabKey){
+  const row=document.getElementById(rowId);
+  if(!row) return;
+  // Collect all unique tags across all entries
+  const tagSet=new Set();
+  for(const entries of Object.values(modeMap)){
+    for(const e of entries){if(e.tags) e.tags.forEach(t=>tagSet.add(t));}
+  }
+  const tags=[...tagSet].sort();
+  row.innerHTML='';
+  if(!tags.length) return;
+  for(const tag of tags){
+    const pill=document.createElement('button');
+    pill.className='tag-pill'+(_activeTagFilter[tabKey]===tag?' active':'');
+    pill.textContent='#'+tag;
+    pill.onclick=()=>{
+      _activeTagFilter[tabKey]=(_activeTagFilter[tabKey]===tag)?null:tag;
+      if(tabKey==='oneshot') renderOneshotList();
+      else renderChopsList();
+    };
+    row.appendChild(pill);
+  }
+}
+
+function _entryMatchesSearch(e, cat, q){
+  if(!q) return true;
+  if(e.name.toLowerCase().includes(q)) return true;
+  if(e.key.includes(q)) return true;
+  if(cat.toLowerCase().includes(q)) return true;
+  if(e.tags && e.tags.some(t=>t.includes(q))) return true;
+  return false;
+}
+
+function renderOneshotList(){
+  if(!slCatalog) return;
+  const q=(document.getElementById('lib-search').value||'').toLowerCase();
+  const el=document.getElementById('oneshot-list');
+  if(!el) return;
+  el.innerHTML='';
+  const modeMap=(slCatalog.sample_modes||{})['1shot']||{};
+  _buildTagRow('oneshot-tag-row', modeMap, 'oneshot');
+  const activeTag=_activeTagFilter['oneshot'];
+  const pickerKey=lastState&&lastState.selected_track_empty?lastState.picker_sample_key:null;
+  const activeMatchKey=slCurrentKey||pickerKey;
+  const curTrackIdx=lastState?lastState.selected_track:-1;
+
+  for(const [cat, allEntries] of Object.entries(modeMap)){
+    const entries=allEntries.filter(e=>{
+      if(!_entryMatchesSearch(e,cat,q)) return false;
+      if(activeTag && !(e.tags&&e.tags.includes(activeTag))) return false;
+      return true;
+    });
+    if(!entries.length) continue;
+    _renderSampleSection(el, cat, entries, curTrackIdx, activeMatchKey, 'oneshot', true);
+  }
+  _renderLibrarySlotActions('sample');
+}
+
+function renderChopsList(){
+  if(!slCatalog) return;
+  const q=(document.getElementById('lib-search').value||'').toLowerCase();
+  const el=document.getElementById('chops-list');
+  if(!el) return;
+  el.innerHTML='';
+  const modeMap=(slCatalog.sample_modes||{})['chopped']||{};
+  _buildTagRow('chops-tag-row', modeMap, 'chopped');
+  const activeTag=_activeTagFilter['chopped'];
+  const pickerKey=lastState&&lastState.selected_track_empty?lastState.picker_sample_key:null;
+  const activeMatchKey=slCurrentKey||pickerKey;
+  const curTrackIdx=lastState?lastState.selected_track:-1;
+
+  for(const [cat, allEntries] of Object.entries(modeMap)){
+    const entries=allEntries.filter(e=>{
+      if(!_entryMatchesSearch(e,cat,q)) return false;
+      if(activeTag && !(e.tags&&e.tags.includes(activeTag))) return false;
+      return true;
+    });
+    if(!entries.length) continue;
+    _renderSampleSection(el, cat, entries, curTrackIdx, activeMatchKey, 'chopped', false);
+  }
+  _renderLibrarySlotActions('sample');
 }
 
 function renderDrumList(){
@@ -2147,6 +2753,10 @@ function renderDrumList(){
   const q=(document.getElementById('drum-search').value||'').toLowerCase();
   const el=document.getElementById('drum-list');
   el.innerHTML='';
+  const pickerKey=lastState&&lastState.selected_track_empty?lastState.picker_sample_key:null;
+  const curTrackIdx=lastState?lastState.selected_track:-1;
+  const curTrackType=lastState&&lastState.track_data&&lastState.track_data[curTrackIdx]?
+    lastState.track_data[curTrackIdx].type:null;
   for(const catSet of slCatalog.drum_sets){
     const catLow=catSet.cat.toLowerCase();
     const vars=catSet.variations.filter(v=>
@@ -2160,28 +2770,81 @@ function renderDrumList(){
     const row=document.createElement('div');
     row.className='drum-var-row';
     for(const v of vars){
-      const btn=document.createElement('button');
+      // Wrapper for button + demo
+      const wrap=document.createElement('span');
+      wrap.style.cssText='display:inline-flex;gap:1px;margin:1px';
+      const isAvail=slAvailableSamples.includes(v.key)||slLoadedNames.includes(v.key);
+      const isPicker=v.key===pickerKey;
       const isLoaded=slLoadedNames.includes(v.key);
-      btn.className='drum-var-btn'+(isLoaded?' loaded':'');
-      btn.textContent=v.var;btn.title=v.key;
+      const btn=document.createElement('button');
+      btn.className='drum-var-btn'+(isLoaded?' loaded':'')+(isPicker?' picker-active':'');
+      if(isPicker) btn.style.cssText='border-color:#ffcc00;color:#ffcc00;background:#1a1200';
+      btn.textContent=v.var;btn.title=v.key+(isAvail?'':' (not in samples/)');
       btn.onclick=()=>{
-        const curTrack=lastState?lastState.selected_track:-1;
-        post({type:'load_sample',track_idx:curTrack,sample_key:v.key,track_type:'drum'});
+        post({type:'load_sample',track_idx:curTrackIdx,sample_key:v.key,track_type:'drum'});
         setTimeout(()=>loadSampleList().then(renderDrumList),300);
       };
-      row.appendChild(btn);
+      // Demo button
+      const demoBtn=document.createElement('button');
+      demoBtn.className='drum-demo-btn';
+      demoBtn.textContent='▶';demoBtn.title='Preview '+v.key;
+      if(!isAvail) demoBtn.style.opacity='0.35';
+      demoBtn.onclick=(e)=>{
+        e.stopPropagation();
+        post({type:'demo_sample',sample_key:v.key,track_type:'drum'});
+      };
+      wrap.append(demoBtn,btn);
+      row.appendChild(wrap);
     }
     sec.append(lbl,row);el.appendChild(sec);
   }
+  // Add Remove button when current track slot is occupied by a drum
+  _renderLibrarySlotActions('drum');
 }
+
+let _sampleSubTab='1shot'; // '1shot' | 'chopped'
 
 function renderSampleCatalog(){
   if(!slCatalog) return;
   const q=(document.getElementById('samples-search').value||'').toLowerCase();
   const el=document.getElementById('sample-catalog-list');
   el.innerHTML='';
-  for(const catGroup of slCatalog.sample_catalog){
-    const entries=catGroup.entries.filter(e=>
+  const pickerKey=lastState&&lastState.selected_track_empty?lastState.picker_sample_key:null;
+  const activeMatchKey=slCurrentKey||pickerKey;
+  const curTrackIdx=lastState?lastState.selected_track:-1;
+
+  // Sub-tab switcher
+  const tabBar=document.createElement('div');
+  tabBar.style.cssText='display:flex;gap:4px;margin-bottom:6px;';
+  for(const [label,key] of [['1-SHOT','1shot'],['CHOPPED','chopped']]){
+    const tb=document.createElement('button');
+    tb.textContent=label;
+    tb.style.cssText='flex:1;padding:3px 6px;font-size:10px;cursor:pointer;border-radius:3px;'+
+      (_sampleSubTab===key
+        ?'background:#3a1860;color:#e0c8ff;border:1px solid #9060d0;'
+        :'background:#12051f;color:#7060a0;border:1px solid #3a1860;');
+    tb.onclick=()=>{_sampleSubTab=key;renderSampleCatalog();};
+    tabBar.appendChild(tb);
+  }
+  el.appendChild(tabBar);
+
+  const modeMap=(slCatalog.sample_modes||{})[_sampleSubTab]||{};
+  const isShotMode=_sampleSubTab==='1shot';
+  const sampleMode=isShotMode?'oneshot':'chopped';
+
+  const cats=Object.keys(modeMap);
+  if(!cats.length){
+    const empty=document.createElement('div');
+    empty.style.cssText='color:#504060;font-size:10px;padding:8px 0;text-align:center;';
+    empty.textContent='No samples loaded';
+    el.appendChild(empty);
+    _renderLibrarySlotActions('sample');
+    return;
+  }
+
+  for(const cat of cats){
+    const allEntries=modeMap[cat];
+    const entries=allEntries.filter(e=>
       !q||e.name.toLowerCase().includes(q)||e.key.includes(q)
     );
     if(!entries.length) continue;
@@ -2189,35 +2852,78 @@ function renderSampleCatalog(){
     const hdr=document.createElement('div');hdr.className='scat-header';
     const tog=document.createElement('span');tog.className='scat-toggle';
     const body=document.createElement('div');body.className='scat-body';
-    const hasActive=entries.some(e=>e.key===slCurrentKey);
+    const hasActive=entries.some(e=>e.key===activeMatchKey);
     const autoOpen=!!q||hasActive;
     if(autoOpen){body.classList.add('open');tog.textContent='▼';}
     else tog.textContent='▶';
-    hdr.innerHTML=`<span class="scat-name">${catGroup.cat}</span>`;
+    hdr.innerHTML=`<span class="scat-name">${cat}</span>`;
     hdr.appendChild(tog);
     hdr.onclick=()=>{
       body.classList.toggle('open');
       tog.textContent=body.classList.contains('open')?'▼':'▶';
     };
     for(const entry of entries){
-      const isActive=entry.key===slCurrentKey;
-      const isAvail=slAvailableSamples.includes(entry.key)||slLoadedNames.includes(entry.key);
+      const isActive=entry.key===activeMatchKey;
+      const isAvail=entry.bundled||slAvailableSamples.includes(entry.key)||slLoadedNames.includes(entry.key);
       const item=document.createElement('div');
       item.className='sc-item'+(isActive?' sc-active':'')+(isAvail?'':' sc-unavail');
       const nm=document.createElement('span');nm.className='sc-name';
-      nm.textContent=entry.name;nm.title=entry.key;
+      nm.textContent=entry.name+(entry.bundled?' [default]':'');
+      nm.title=entry.key+(isAvail?'':' (not in samples/)');
+      if(entry.bundled) nm.style.cssText='color:#9060d0;';
+      // Demo button
+      const demoBtn=document.createElement('button');demoBtn.className='sc-load';
+      demoBtn.textContent='▶';demoBtn.title='Preview';
+      demoBtn.style.cssText='color:#00e5ff;border-color:#00e5ff55;margin-right:2px;';
+      if(!isAvail) demoBtn.style.opacity='0.35';
+      demoBtn.onclick=(e)=>{
+        e.stopPropagation();
+        post({type:'demo_sample',sample_key:entry.key,track_type:'sample'});
+      };
+      // Load button
       const loadBtn=document.createElement('button');loadBtn.className='sc-load';
-      loadBtn.textContent='Load';
+      loadBtn.textContent=isShotMode?'Load 1-shot':'Load chopped';
+      loadBtn.title=isAvail?`Load as ${_sampleSubTab}`:'Not found in samples/';
+      if(!isAvail) loadBtn.style.opacity='0.4';
       loadBtn.onclick=async()=>{
-        const curTrack=lastState?lastState.selected_track:-1;
-        await post({type:'load_sample',track_idx:curTrack,sample_key:entry.key,track_type:'sample'});
+        await post({type:'load_sample',track_idx:curTrackIdx,sample_key:entry.key,
+                    track_type:'sample',sample_mode:sampleMode,pitched:isShotMode});
         slCurrentKey=entry.key;
         renderSampleCatalog();renderSampleSettings();
       };
-      item.append(nm,loadBtn);body.appendChild(item);
+      item.append(nm,demoBtn,loadBtn);body.appendChild(item);
     }
     sec.append(hdr,body);el.appendChild(sec);
   }
+  _renderLibrarySlotActions('sample');
+}
+
+function _renderLibrarySlotActions(expectedType){
+  // Append a "Remove from session" row if the selected track slot is occupied
+  if(!lastState) return;
+  const ti=lastState.selected_track;
+  const td=lastState.track_data&&lastState.track_data[ti];
+  if(!td) return; // empty slot — no remove needed
+  if(expectedType==='drum'&&td.type!=='drum') return;
+  if(expectedType==='sample'&&td.type!=='sample') return;
+  const target=expectedType==='drum'?
+    document.getElementById('drum-list'):
+    document.getElementById('sample-catalog-list');
+  if(!target) return;
+  const row=document.createElement('div');
+  row.style.cssText='display:flex;align-items:center;gap:8px;padding:6px 4px;border-top:1px solid rgba(176,64,255,.15);margin-top:6px';
+  const info=document.createElement('span');
+  info.style.cssText='flex:1;font-size:8px;color:#6040a0';
+  info.textContent=`T${ti+1}: ${td.name} (${td.type})`;
+  const removeBtn=document.createElement('button');
+  removeBtn.className='sc-load';
+  removeBtn.textContent='Remove from session';
+  removeBtn.style.cssText='color:#ff6060;border-color:#ff606055;';
+  removeBtn.onclick=()=>{
+    post({type:'remove_track',track_idx:ti});
+  };
+  row.append(info,removeBtn);
+  target.appendChild(row);
 }
 
 function renderSampleSettings(){
@@ -2242,7 +2948,7 @@ function toggleSampleLib(){
   const open=body.classList.toggle('open');
   tog.textContent=open?'▲':'▼';
   if(open){
-    if(!slCatalog) loadCatalog().then(()=>{renderDrumList();renderSampleCatalog();});
+    if(!slCatalog) loadCatalog().then(()=>{renderDrumList();renderOneshotList();renderChopsList();});
     if(!slLoadedNames.length) loadSampleList().then(renderDrumList);
   }
 }
@@ -2263,8 +2969,6 @@ async function uploadSamples(input){
   }catch(e){console.error('upload failed',e);}
   input.value='';
 }
-
-let lastState=null;
 
 // ── Theme toggle ──────────────────────────────────────────────────────
 const themeBtn=document.getElementById('theme-toggle');
